@@ -11,7 +11,7 @@ use hao::{
     dotnet::entries::Version,
     dotnet::{
         entries::{Entry, Field, Method, Param, TypeDef},
-        il::{Emitter, Instruction, MemberToken, MethodBody, OpCode, Operand},
+        il::{EmitLabel, Emitter, Instruction, MemberToken, MethodBody, OpCode, Operand},
         md::streams::tables_stream::{FieldFlags, MethodFlags, TypeAttributes},
         module::{ModuleKind, TargetRuntime},
         signature::{FieldSig, MethodSig, TypeSig},
@@ -153,6 +153,8 @@ enum Stmt {
     },
     Empty,
     Block(Block),
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -189,6 +191,11 @@ enum Expr {
     Assign {
         name: String,
         value: Box<Expr>,
+    },
+    Increment {
+        name: String,
+        delta: i32,
+        prefix: bool,
     },
 }
 
@@ -644,9 +651,18 @@ impl<'a> Parser<'a> {
                 self.expect(";")?;
                 return Ok(Stmt::Return(Some(value)));
             }
-            "break" | "continue" | "throw" | "try" | "foreach" | "switch" | "do" | "case"
-            | "default" | "goto" | "lock" | "using" | "yield" | "checked" | "unchecked"
-            | "fixed" | "unsafe" => {
+            "break" => {
+                self.bump();
+                self.expect(";")?;
+                return Ok(Stmt::Break);
+            }
+            "continue" => {
+                self.bump();
+                self.expect(";")?;
+                return Ok(Stmt::Continue);
+            }
+            "throw" | "try" | "foreach" | "switch" | "do" | "case" | "default" | "goto"
+            | "lock" | "using" | "yield" | "checked" | "unchecked" | "fixed" | "unsafe" => {
                 return Err(self.error(format!(
                     "'{}' statements are not supported by the bounded core yet",
                     self.text()
@@ -798,6 +814,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, CompileError> {
+        if (self.check("++") || self.check("--"))
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|token| token.kind == syntax::TokenKind::Identifier)
+        {
+            let delta = if self.check("++") { 1 } else { -1 };
+            self.bump();
+            let name = self.identifier()?;
+            return Ok(Expr::Increment {
+                name,
+                delta,
+                prefix: true,
+            });
+        }
         match self.text() {
             "-" => {
                 self.bump();
@@ -819,6 +850,18 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self) -> Result<Expr, CompileError> {
         let mut expression = self.parse_primary()?;
+        if let Expr::Name(name) = &expression
+            && (self.check("++") || self.check("--"))
+        {
+            let delta = if self.check("++") { 1 } else { -1 };
+            let name = name.clone();
+            self.bump();
+            return Ok(Expr::Increment {
+                name,
+                delta,
+                prefix: false,
+            });
+        }
         loop {
             if self.check("(") {
                 let args = self.parse_arguments()?;
@@ -1264,6 +1307,7 @@ fn emit_body(
         return_ty: Ty::Void,
         locals: HashMap::new(),
         params: Vec::new(),
+        loops: Vec::new(),
         emitter: Emitter::new(),
         file: decl.file.clone(),
         source,
@@ -1348,6 +1392,7 @@ struct FnEmitter<'a> {
     return_ty: Ty,
     locals: HashMap<String, (u16, Ty)>,
     params: Vec<(String, Ty)>,
+    loops: Vec<(EmitLabel, EmitLabel)>,
     emitter: Emitter,
     file: String,
     source: String,
@@ -1365,6 +1410,34 @@ impl<'a> FnEmitter<'a> {
         } else {
             position as u16 + 1
         }
+    }
+
+    fn store_top(&mut self, name: &str) -> Result<(), CompileError> {
+        if let Some((index, _)) = self.locals.get(name).cloned() {
+            self.emitter.stloc(index);
+            return Ok(());
+        }
+        if let Some(position) = self
+            .params
+            .iter()
+            .position(|(parameter, _)| parameter == name)
+        {
+            self.emitter.starg(self.argument_index(position));
+            return Ok(());
+        }
+        let Some(field) = self.field_symbol(name) else {
+            return Err(self.error(format!("undefined identifier '{name}'")));
+        };
+        if !field.is_static {
+            return Err(self.error(format!(
+                "incrementing instance field '{name}' is not supported yet"
+            )));
+        }
+        self.emitter.emit(Instruction::new(
+            OpCode::Stsfld,
+            Operand::Token(MemberToken::Field(field.entry)),
+        ));
+        Ok(())
     }
 
     fn field_symbol(&self, name: &str) -> Option<FieldSymbol> {
@@ -1399,6 +1472,20 @@ impl<'a> FnEmitter<'a> {
         match statement {
             Stmt::Block(block) => self.block(block),
             Stmt::Empty => Ok(()),
+            Stmt::Break => {
+                let Some((end, _)) = self.loops.last().copied() else {
+                    return Err(self.error("'break' outside of a loop"));
+                };
+                self.emitter.branch(OpCode::Br, end);
+                Ok(())
+            }
+            Stmt::Continue => {
+                let Some((_, next)) = self.loops.last().copied() else {
+                    return Err(self.error("'continue' outside of a loop"));
+                };
+                self.emitter.branch(OpCode::Br, next);
+                Ok(())
+            }
             Stmt::Local { ty, name, init } => {
                 if matches!(ty, Ty::Named(_)) {
                     return Err(self.error(format!("local '{name}' has an unsupported type")));
@@ -1465,7 +1552,9 @@ impl<'a> FnEmitter<'a> {
                 Self::require(&actual, &Ty::Bool, "while condition")
                     .map_err(|message| self.error(message))?;
                 self.emitter.branch(OpCode::Brfalse, end);
+                self.loops.push((end, top));
                 self.block(body)?;
+                self.loops.pop();
                 self.emitter.branch(OpCode::Br, top);
                 self.emitter.mark(end);
                 Ok(())
@@ -1488,7 +1577,11 @@ impl<'a> FnEmitter<'a> {
                         .map_err(|message| self.error(message))?;
                     self.emitter.branch(OpCode::Brfalse, end);
                 }
+                let step_label = self.emitter.label();
+                self.loops.push((end, step_label));
                 self.block(body)?;
+                self.loops.pop();
+                self.emitter.mark(step_label);
                 if let Some(step) = step {
                     let ty = self.expr(step)?;
                     if ty != Ty::Void {
@@ -1624,6 +1717,28 @@ impl<'a> FnEmitter<'a> {
                 args,
             } => self.call(receiver.as_deref(), name, args),
             Expr::Assign { name, value } => self.assign_expression(name, value),
+            Expr::Increment {
+                name,
+                delta,
+                prefix,
+            } => {
+                let ty = self.load(name)?;
+                Self::require(&ty, &Ty::Int, "increment").map_err(|message| self.error(message))?;
+                if *prefix {
+                    self.emitter.ldc_i4(delta.abs());
+                    self.emitter
+                        .op(if *delta > 0 { OpCode::Add } else { OpCode::Sub });
+                    self.emitter.dup();
+                    self.store_top(name)?;
+                } else {
+                    self.emitter.dup();
+                    self.emitter.ldc_i4(delta.abs());
+                    self.emitter
+                        .op(if *delta > 0 { OpCode::Add } else { OpCode::Sub });
+                    self.store_top(name)?;
+                }
+                Ok(Ty::Int)
+            }
         }
     }
 
@@ -1658,6 +1773,34 @@ impl<'a> FnEmitter<'a> {
 
         let left_ty = self.expr(left)?;
         let right_ty = self.expr(right)?;
+        if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && left_ty == Ty::String
+            && right_ty == Ty::String
+        {
+            let method = self.import_bcl_method(
+                "System.Runtime",
+                "System.String",
+                if matches!(op, BinaryOp::Equal) {
+                    "op_Equality"
+                } else {
+                    "op_Inequality"
+                },
+                MethodSig::new_static(TypeSig::BOOL, vec![TypeSig::STRING, TypeSig::STRING]),
+            )?;
+            self.emitter.call(method);
+            return Ok(Ty::Bool);
+        }
+        if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && left_ty == Ty::Bool
+            && right_ty == Ty::Bool
+        {
+            self.emitter.op(OpCode::Ceq);
+            if matches!(op, BinaryOp::NotEqual) {
+                self.emitter.ldc_i4(0);
+                self.emitter.op(OpCode::Ceq);
+            }
+            return Ok(Ty::Bool);
+        }
         if matches!(op, BinaryOp::Add) && left_ty == Ty::String && right_ty == Ty::String {
             let concat = self
                 .module

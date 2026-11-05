@@ -17,6 +17,21 @@ namespace Demo
             }
             total = total + Counter.Add(2);
             total = total + Counter.Add(3);
+
+            int skipped = 0;
+            for (i = 0; i < 6; i++)
+            {
+                if (i == 2) { continue; }
+                if (i == 5) { break; }
+                skipped = skipped + i;
+            }
+            total = total + skipped;
+
+            string label = "compiler233";
+            if (label == "compiler233" && label != "roslyn")
+            {
+                total = total + 1;
+            }
             return total;
         }
     }

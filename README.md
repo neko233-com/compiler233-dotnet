@@ -110,8 +110,8 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 - 命名空间（块式与文件级）、类（含静态类）、静态/实例字段与初始化器（实例初始化器在构造函数，静态初始化器在 `.cctor`）
 - 静态/实例方法、参数，重载按参数个数解析
-- 语句：局部声明、赋值、`if/else`、`while`、`for`、`return`、块
-- 表达式：`int/bool/string` 字面量、标识符、算术、比较、`&&/||` 短路、`!`、字符串 `+` 拼接、赋值表达式
+- 语句：局部声明、赋值、`if/else`、`while`、`for`、`return`、`break`/`continue`、块
+- 表达式：`int/bool/string` 字面量、标识符、算术、比较（含字符串/布尔相等）、`&&/||` 短路、`!`、`++`/`--`、字符串 `+` 拼接、赋值表达式
 - 调用：本程序集的静态/实例方法；BCL 的 `System.Math.Max/Min/Abs`、`System.Convert.ToString`、`System.String.Concat`、`System.Console.Write/WriteLine`（按需添加 `System.Console` 程序集引用）
 
 尚未支持、会被明确拒绝而不是静默降级：`new`/对象、数组、泛型、接口与继承、属性、lambda、`try`/`async`/`foreach`/`switch`、第三方程序集引用。
