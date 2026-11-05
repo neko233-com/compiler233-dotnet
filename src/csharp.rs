@@ -12,7 +12,7 @@ use hao::{
     dotnet::{
         entries::{
             Entry, Field, InterfaceImpl, Method, MethodDefOrRef, MethodSpec, Param, TypeDef,
-            TypeDefOrRef,
+            TypeDefOrRef, TypeSpec,
         },
         il::{EmitLabel, Emitter, Instruction, MemberToken, MethodBody, OpCode, Operand},
         md::streams::tables_stream::{FieldFlags, MethodFlags, TypeAttributes},
@@ -78,6 +78,7 @@ enum Ty {
     Null,
     Class(String),
     Array(Box<Ty>),
+    Generic(String, Vec<Ty>),
     Named(String),
 }
 
@@ -239,7 +240,7 @@ enum Expr {
         name: String,
     },
     New {
-        type_name: String,
+        ty: Ty,
         args: Vec<Expr>,
     },
     NewArray {
@@ -341,6 +342,16 @@ impl Externals {
             by_short_name,
             methods,
         })
+    }
+
+    /// Finds the open generic definition `Name\`arity` in the reference set.
+    fn find_generic(&self, name: &str, arity: usize) -> Option<&(usize, Entry<TypeDef>)> {
+        let short_name = name.rsplit('.').next().unwrap_or(name);
+        let wanted = format!("{short_name}`{arity}");
+        self.types
+            .iter()
+            .find(|(full_name, _)| full_name.rsplit('.').next() == Some(wanted.as_str()))
+            .map(|(_, entry)| entry)
     }
 
     fn find(&self, full_name: &str) -> Option<&(usize, Entry<TypeDef>)> {
@@ -545,6 +556,18 @@ impl<'a> Parser<'a> {
 
     fn parse_new_type(&mut self) -> Result<Ty, CompileError> {
         let name = self.parse_qualified_name()?;
+        if self.check("<") {
+            self.bump();
+            let mut args = Vec::new();
+            loop {
+                args.push(self.parse_type_reference()?);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(">")?;
+            return Ok(Ty::Generic(name, args));
+        }
         Ok(match name.as_str() {
             "int" => Ty::Int,
             "float" => Ty::Float,
@@ -851,11 +874,17 @@ impl<'a> Parser<'a> {
             other if self.enums.contains_key(other) => Ty::Int,
             other => Ty::Class(other.to_string()),
         };
-        // Generic/array suffixes are accepted for signature compatibility but
-        // the bounded core only supports the scalar types above.
         if self.check("<") {
-            self.skip_balanced("<", ">")?;
-            ty = Ty::Named(format!("{name}[]"));
+            self.bump();
+            let mut args = Vec::new();
+            loop {
+                args.push(self.parse_type_reference()?);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(">")?;
+            ty = Ty::Generic(name.clone(), args);
         }
         while self.eat("[") {
             self.expect("]")?;
@@ -1357,11 +1386,11 @@ impl<'a> Parser<'a> {
                     size: Box::new(size),
                 });
             }
-            let Ty::Class(type_name) = element else {
+            if !matches!(element, Ty::Class(_) | Ty::Generic(_, _)) {
                 return Err(self.error("only classes can be constructed with 'new Type(...)'"));
-            };
+            }
             let args = self.parse_arguments()?;
-            return Ok(Expr::New { type_name, args });
+            return Ok(Expr::New { ty: element, args });
         }
         if self.check("this") {
             self.bump();
@@ -1562,7 +1591,10 @@ fn type_error(
 }
 
 fn is_reference(ty: &Ty) -> bool {
-    matches!(ty, Ty::String | Ty::Class(_) | Ty::Array(_))
+    matches!(
+        ty,
+        Ty::String | Ty::Class(_) | Ty::Array(_) | Ty::Generic(_, _)
+    )
 }
 
 fn external_ty(sig: &TypeSig) -> Ty {
@@ -1581,7 +1613,7 @@ fn external_ty(sig: &TypeSig) -> Ty {
 /// Replaces `MVar` placeholders with the supplied instantiation.
 fn substitute(sig: &TypeSig, instantiation: &[TypeSig]) -> Ty {
     match sig {
-        TypeSig::MVar(index) => instantiation
+        TypeSig::Var(index) | TypeSig::MVar(index) => instantiation
             .get(*index as usize)
             .map(external_ty)
             .unwrap_or(Ty::Named("generic argument".to_string())),
@@ -1619,6 +1651,25 @@ fn resolve_type(
             },
         },
         Ty::Array(element) => TypeSig::sz_array(resolve_type(element, types, externals, module)?),
+        Ty::Generic(name, args) => {
+            let Some((index, entry)) = externals.find_generic(name, args.len()) else {
+                return Err(format!("unknown generic type '{name}'"));
+            };
+            let open = module
+                .import_foreign_type(
+                    &TypeDefOrRef::TypeDef(entry.clone()),
+                    &externals.modules[*index],
+                )
+                .map_err(|error| error.to_string())?;
+            let mut signatures = Vec::with_capacity(args.len());
+            for argument in args {
+                signatures.push(resolve_type(argument, types, externals, module)?);
+            }
+            TypeSig::GenericInst {
+                generic: Box::new(TypeSig::Class(open)),
+                args: signatures,
+            }
+        }
         Ty::Named(name) => return Err(format!("type '{name}' is not supported yet")),
     })
 }
@@ -3085,17 +3136,27 @@ impl<'a> FnEmitter<'a> {
                 }
                 Ok(Ty::Int)
             }
-            Expr::New { type_name, args } => {
-                let Some(constructor) = self.constructor(type_name, args.len()) else {
-                    return Err(self.error(format!(
-                        "no constructor for '{type_name}' taking {} argument(s)",
-                        args.len()
-                    )));
-                };
-                self.push_arguments(args, &constructor.params, "argument")?;
-                self.emitter.newobj(constructor.entry);
-                Ok(Ty::Class(type_name.clone()))
-            }
+            Expr::New { ty, args } => match ty {
+                Ty::Class(type_name) => {
+                    let Some(constructor) = self.constructor(type_name, args.len()) else {
+                        return Err(self.error(format!(
+                            "no constructor for '{type_name}' taking {} argument(s)",
+                            args.len()
+                        )));
+                    };
+                    self.push_arguments(args, &constructor.params, "argument")?;
+                    self.emitter.newobj(constructor.entry);
+                    Ok(Ty::Class(type_name.clone()))
+                }
+                Ty::Generic(type_name, type_args) => {
+                    let (token, params, _) =
+                        self.generic_member(type_name, type_args, ".ctor", args.len())?;
+                    self.push_arguments(args, &params, "argument")?;
+                    self.emitter.newobj(token);
+                    Ok(ty.clone())
+                }
+                other => Err(self.error(format!("'new {other:?}' is not supported"))),
+            },
             Expr::Member { target, name } => self.member_read(target, name),
             Expr::Call {
                 receiver,
@@ -3237,6 +3298,13 @@ impl<'a> FnEmitter<'a> {
                 return Ok(Ty::Int);
             }
             return Err(self.error(format!("arrays have no member '{name}'")));
+        }
+        if let Ty::Generic(type_name, type_args) = &target_type {
+            let (token, params, ret) =
+                self.generic_member(type_name, type_args, &format!("get_{name}"), 0)?;
+            debug_assert!(params.is_empty());
+            self.emitter.callvirt(token);
+            return Ok(ret);
         }
         let Ty::Class(type_name) = target_type else {
             return Err(self.error(format!("type {target_type:?} has no members")));
@@ -3491,6 +3559,13 @@ impl<'a> FnEmitter<'a> {
                 }
             }
             let receiver_type = self.expr(receiver)?;
+            if let Ty::Generic(type_name, type_args) = &receiver_type {
+                let (token, params, ret) =
+                    self.generic_member(type_name, type_args, name, args.len())?;
+                self.push_arguments(args, &params, "argument")?;
+                self.emitter.callvirt(token);
+                return Ok(ret);
+            }
             let Ty::Class(type_name) = receiver_type else {
                 return Err(self.error(format!("type {receiver_type:?} has no methods")));
             };
@@ -3578,6 +3653,76 @@ impl<'a> FnEmitter<'a> {
             "no static method '{name}' with {} parameter(s) on '{type_name}'",
             args.len()
         )))
+    }
+
+    /// Resolves a member of a generic *type instance*: the MemberRef is parented
+    /// at a TypeSpec so the runtime binds the type arguments.
+    fn generic_member(
+        &mut self,
+        type_name: &str,
+        type_args: &[Ty],
+        member: &str,
+        arity: usize,
+    ) -> Result<(MemberToken, Vec<Ty>, Ty), CompileError> {
+        let Some((index, entry)) = self
+            .externals
+            .find_generic(type_name, type_args.len())
+            .map(|(index, entry)| (*index, entry.clone()))
+        else {
+            return Err(self.error(format!("unknown generic type (member) '{type_name}'")));
+        };
+        let full_name = entry.get().full_name();
+        let Some((_, method_entry)) = self.externals.method(&full_name, member, arity) else {
+            return Err(self.error(format!(
+                "no member '{member}' with {arity} parameter(s) on '{full_name}'"
+            )));
+        };
+        let signature = {
+            let guard = method_entry.get();
+            guard.signature.clone()
+        };
+        let mut instantiation = Vec::with_capacity(type_args.len());
+        for argument in type_args {
+            instantiation.push(
+                resolve_type(argument, self.types, self.externals, &mut *self.module)
+                    .map_err(|message| self.error(message))?,
+            );
+        }
+        let open = {
+            let module = &mut *self.module;
+            let foreign = &self.externals.modules[index];
+            module
+                .import_foreign_type(&TypeDefOrRef::TypeDef(entry.clone()), foreign)
+                .map_err(|error| self.error(error.to_string()))?
+        };
+        let spec = Entry::new(TypeSpec {
+            signature: TypeSig::GenericInst {
+                generic: Box::new(TypeSig::Class(open)),
+                args: instantiation.clone(),
+            },
+            custom_attributes: Vec::new(),
+        });
+        self.module.type_specs.push(spec.clone());
+        let imported = {
+            let module = &mut *self.module;
+            let foreign = &self.externals.modules[index];
+            module
+                .import_foreign_method_sig(&signature, foreign)
+                .map_err(|error| self.error(error.to_string()))?
+        };
+        let token = {
+            let module = &mut *self.module;
+            module
+                .import_method_on(&TypeDefOrRef::TypeSpec(spec), member, imported.clone())
+                .map_err(|error| self.error(error.to_string()))?
+        };
+        let params: Vec<Ty> = imported
+            .params
+            .iter()
+            .map(|param| substitute(param, &instantiation))
+            .collect();
+        let ret = substitute(&imported.ret, &instantiation);
+        Ok((token, params, ret))
     }
 
     /// Emits `call` on a MethodSpec so a generic method can be instantiated.

@@ -98,4 +98,19 @@ $genericManifest = Join-Path $work 'generic-manifest.txt'
 $genericResult = & dotnet $oracle $genericManifest $genericOutput 'Demo.GenericRunner' 'Run' 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { throw "generic call comparison failed: $genericResult" }
 Write-Output $genericResult.Trim()
+# Generic collection type from the runtime core library.
+if ($runtimeRoot) {
+    $coreLib = Join-Path (Join-Path $runtimeRoot $runtimeVersion) 'System.Private.CoreLib.dll'
+    if (Test-Path $coreLib) {
+        $listSource = Join-Path $root 'tests/fixtures/collection/ListRunner.cs'
+        $listOutput = Join-Path $work 'ListRunner.dll'
+        & $binary csc $listSource "-r:$coreLib" "-out:$listOutput"
+        if ($LASTEXITCODE -ne 0) { throw 'generic collection compilation failed' }
+        $listManifest = Join-Path $work 'list-manifest.txt'
+        [System.IO.File]::WriteAllLines($listManifest, @($listSource), [System.Text.UTF8Encoding]::new($false))
+        $listResult = & dotnet $oracle $listManifest $listOutput 'Demo.ListRunner' 'Run' 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "generic collection comparison failed: $listResult" }
+        Write-Output $listResult.Trim()
+    }
+}
 Write-Output 'Compile and runtime differential checks passed.'
