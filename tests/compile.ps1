@@ -64,4 +64,22 @@ if ($LASTEXITCODE -ne 0) { throw "external reference comparison failed: $externa
 if ($external -notmatch 'compiler233=42') { throw "unexpected external result: $external" }
 Write-Output $external.Trim()
 
+# Real framework assembly: qualified type name resolved through -reference.
+$runtimeLine = (& dotnet --list-runtimes | Where-Object { $_ -match '^Microsoft\.NETCore\.App ' } | Select-Object -Last 1)
+if ($runtimeLine -and $runtimeLine -match '^Microsoft\.NETCore\.App (\S+) \[(.+)\]$') {
+    $runtimeVersion = $Matches[1]
+    $runtimeRoot = $Matches[2]
+    $regexDll = Join-Path (Join-Path $runtimeRoot $runtimeVersion) 'System.Text.RegularExpressions.dll'
+    if (Test-Path $regexDll) {
+        $frameworkSource = Join-Path $root 'tests/fixtures/external/Framework.cs'
+        $frameworkOutput = Join-Path $work 'Framework.dll'
+        & $binary csc $frameworkSource "-r:$regexDll" "-out:$frameworkOutput"
+        if ($LASTEXITCODE -ne 0) { throw 'framework reference compilation failed' }
+        $frameworkManifest = Join-Path $work 'framework-manifest.txt'
+        [System.IO.File]::WriteAllLines($frameworkManifest, @($frameworkSource), [System.Text.UTF8Encoding]::new($false))
+        $frameworkResult = & dotnet $oracle $frameworkManifest $frameworkOutput 'Demo.FrameworkRunner' 'Run' 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "framework reference comparison failed: $frameworkResult" }
+        Write-Output $frameworkResult.Trim()
+    }
+}
 Write-Output 'Compile and runtime differential checks passed.'

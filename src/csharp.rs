@@ -2665,6 +2665,17 @@ impl<'a> FnEmitter<'a> {
         )
     }
 
+    /// Reconstructs `A.B.C` from a member chain so qualified type names resolve.
+    fn type_path(receiver: &Expr) -> Option<String> {
+        match receiver {
+            Expr::Name(name) => Some(name.clone()),
+            Expr::Member { target, name } => {
+                Self::type_path(target).map(|prefix| format!("{prefix}.{name}"))
+            }
+            _ => None,
+        }
+    }
+
     fn call(
         &mut self,
         receiver: Option<&Expr>,
@@ -2693,6 +2704,24 @@ impl<'a> FnEmitter<'a> {
                         }
                     }
                     return self.static_call(receiver_name, name, args);
+                }
+            }
+            // A dotted chain may be a qualified type (`System.Text.Regex`).
+            if let Some(path) = Self::type_path(receiver) {
+                let short = path.rsplit('.').next().unwrap_or(&path).to_string();
+                let is_value = self.locals.contains_key(&short)
+                    || self.params.iter().any(|(parameter, _)| *parameter == short)
+                    || {
+                        let current = self.current.clone();
+                        self.field_symbol(&current, &short).is_some()
+                    };
+                if !is_value
+                    && (self.types.contains_key(&short) || self.externals.find(&path).is_some())
+                {
+                    if let Some(result) = self.bcl_call(&path, name, args)? {
+                        return Ok(result);
+                    }
+                    return self.static_call(&short, name, args);
                 }
             }
             let receiver_type = self.expr(receiver)?;
@@ -2745,7 +2774,12 @@ impl<'a> FnEmitter<'a> {
         name: &str,
         args: &[Expr],
     ) -> Result<Ty, CompileError> {
-        if let Some(method) = self.method_symbol(type_name, name, args.len(), true) {
+        let short = type_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(type_name)
+            .to_string();
+        if let Some(method) = self.method_symbol(&short, name, args.len(), true) {
             self.push_arguments(args, &method.params, "argument")?;
             self.emitter.call(method.entry);
             return Ok(method.ret);
@@ -2779,7 +2813,8 @@ impl<'a> FnEmitter<'a> {
         name: &str,
         args: &[Expr],
     ) -> Result<Option<Ty>, CompileError> {
-        let qualified = receiver.trim_start_matches("System.");
+        let trimmed = receiver.trim_start_matches("System.");
+        let qualified = trimmed.rsplit('.').next().unwrap_or(trimmed);
         let result = match (qualified, name) {
             ("Console", "WriteLine") => {
                 let ty = self.single_argument(args, name)?;
