@@ -35,5 +35,11 @@ jobs:
         shell: pwsh
       - run: ./tests/runtime.ps1
         shell: pwsh
+      - run: ./tests/csc.ps1
+        shell: pwsh
+      - run: ./tests/differential.ps1
+        shell: pwsh
+      - run: ./tests/differential.ps1 -Mode compile
+        shell: pwsh
       - run: ./benchmarks/run.ps1 -RustMode Subset -Stage Compile -Source tests/fixtures/Arithmetic.cs -Iterations 5 -Warmup 1
         shell: pwsh

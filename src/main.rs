@@ -5,7 +5,7 @@ use std::{env, fs, hint::black_box, io::Write, path::Path, process::ExitCode, ti
 
 fn run() -> Result<bool, String> {
     let args: Vec<String> = env::args().collect();
-    let usage = "usage: compiler233-dotnet compile <file.cs> <output.dll> | check|check-subset <file.cs> | bench|bench-subset|bench-compile <file.cs> <iterations> <warmup>";
+    let usage = "usage: compiler233-dotnet compile <file.cs> <output.dll> | check|check-subset <file.cs> | bench|bench-subset|bench-compile <file.cs> <iterations> <warmup> | csc @<response.rsp> [options]";
     if args.len() < 3 {
         return Err(usage.into());
     }
@@ -166,7 +166,35 @@ fn run() -> Result<bool, String> {
     }
 }
 
+/// Accepts the spellings a csc consumer uses: an explicit `csc` subcommand, a
+/// compiler-style invocation that starts with an option or response file, or a
+/// bare C# source path.
+fn csc_arguments(args: &[String]) -> Option<&[String]> {
+    let first = args.first()?;
+    if first.eq_ignore_ascii_case("csc") {
+        return Some(&args[1..]);
+    }
+    let looks_like_source = Path::new(first)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cs"));
+    if first.starts_with('-') || first.starts_with('@') || looks_like_source {
+        return Some(args);
+    }
+    None
+}
+
 fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() == 1 && matches!(args[0].as_str(), "version" | "--version" | "-V") {
+        println!("compiler233-dotnet {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    if args.first().is_some_and(|first| first == "frontend") {
+        return ExitCode::from(compiler233_dotnet::frontend::run(&args[1..]));
+    }
+    if let Some(csc_args) = csc_arguments(&args) {
+        return ExitCode::from(compiler233_dotnet::csc::run(csc_args));
+    }
     match run() {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),

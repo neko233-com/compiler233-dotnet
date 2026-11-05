@@ -2,3 +2,6 @@
 **/bin/
 **/obj/
 /benchmarks/results/
+/artifacts/
+/.codely-cli/
+/CODELY.md

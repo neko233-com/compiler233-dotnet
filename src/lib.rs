@@ -1,10 +1,14 @@
-//! Experimental C# syntax frontends and limited .NET DLL compilation.
+//! Experimental C# syntax frontends, limited .NET DLL compilation, and a
+//! Roslyn `csc`-compatible command line front end.
 #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
 compile_error!("macOS is supported only on ARM64 (aarch64-apple-darwin)");
 use tree_sitter::{Node, Parser, Tree};
 
 pub mod compile;
+pub mod csc;
+pub mod frontend;
 pub mod subset;
+pub mod syntax;
 
 pub fn parser() -> Parser {
     let mut parser = Parser::new();
