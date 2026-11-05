@@ -28,6 +28,7 @@ pub fn parse_with_defines(
         position: 0,
         unit: CompilationUnit::default(),
         condition_context: false,
+        lambda_allowed: true,
     };
     parser.parse_compilation_unit()?;
     Ok(parser.unit)
@@ -41,6 +42,9 @@ struct Parser<'a> {
     /// True while parsing an `if`/`while`/`switch` condition, where `(name)`
     /// followed by a statement is far more likely than a cast.
     condition_context: bool,
+    /// False inside switch-arm guards, where `x =>` belongs to the arm rather
+    /// than starting a lambda.
+    lambda_allowed: bool,
 }
 
 const PREDEFINED_TYPES: &[&str] = &[
@@ -212,7 +216,8 @@ impl<'a> Parser<'a> {
             self.bump();
             self.bump();
         }
-        self.parse_qualified_name()?;
+        // `using Alias = Some.Namespace<Type>;` needs full type syntax.
+        self.parse_type_allowing_dots()?;
         self.expect(";")
     }
 
@@ -265,7 +270,9 @@ impl<'a> Parser<'a> {
         while self.check("[") {
             self.bump();
             loop {
-                if self.check_identifier() && self.peek_text(1) == Some(":") {
+                if (self.check_identifier() || self.kind() == TokenKind::Keyword)
+                    && self.peek_text(1) == Some(":")
+                {
                     self.bump();
                     self.bump();
                 }
@@ -687,8 +694,14 @@ impl<'a> Parser<'a> {
             return self.parse_statement();
         }
         if self.check("(") && self.looks_like_deconstruction_assignment() {
-            // `(int id, _) = call();`
-            self.parse_designation()?;
+            // `(int id, _) = call();` or `(a[i], a[j]) = (a[j], a[i]);`
+            let saved = self.position;
+            let typed_designation = self.parse_designation().is_ok() && self.check("=");
+            if !typed_designation {
+                self.position = saved;
+                // Parse the tuple target without consuming the `=`.
+                self.parse_conditional()?;
+            }
             self.expect("=")?;
             self.parse_expression()?;
             return self.expect(";");
@@ -732,9 +745,11 @@ impl<'a> Parser<'a> {
             self.eat_keyword("ref");
             self.eat_keyword("readonly");
             self.parse_type()?;
+            // `foreach (var (a, b) in ...)` and typed tuples
+            // `foreach ((int k, T v) in ...)` need no extra designation.
             if self.check("(") {
                 self.parse_designation()?;
-            } else {
+            } else if !self.check_keyword("in") {
                 self.expect_identifier()?;
             }
             self.expect_keyword("in")?;
@@ -814,12 +829,14 @@ impl<'a> Parser<'a> {
         }
         if self.check_keyword("goto") {
             self.bump();
-            if self.check_keyword("case") || self.check_keyword("default") {
-                self.bump();
-                self.parse_expression()?;
-            } else {
-                self.expect_identifier()?;
+            if self.eat_keyword("default") {
+                return self.expect(";");
             }
+            if self.eat_keyword("case") {
+                self.parse_expression()?;
+                return self.expect(";");
+            }
+            self.expect_identifier()?;
             return self.expect(";");
         }
         if self.check_keyword("using") {
@@ -934,7 +951,7 @@ impl<'a> Parser<'a> {
         // `case Type name:` and `case Type:` are patterns, not expressions.
         let saved = self.position;
         if self.parse_type().is_ok() {
-            if self.check(":") || self.check_identifier() {
+            if self.check(":") || (self.check_identifier() && !self.check_word("when")) {
                 if self.check_identifier() {
                     self.bump();
                 }
@@ -959,13 +976,20 @@ impl<'a> Parser<'a> {
     }
 
     fn looks_like_local_declaration(&mut self) -> bool {
+        if self.check_word("await") {
+            // `await Call(a, b);` is an expression statement, not a local
+            // function whose return type is the contextual keyword `await`.
+            return false;
+        }
         let saved = self.position;
         let result = (|| -> Result<bool, SyntaxError> {
             self.parse_modifiers();
             self.parse_type()?;
             let looks = if self.check_identifier() {
+                // `type name = ...`, `type name;` and local functions
+                // `type name(...)` all start a declaration.
                 self.peek_text(1)
-                    .is_some_and(|next| matches!(next, "=" | ";" | "," | ")" | "in"))
+                    .is_some_and(|next| matches!(next, "=" | ";" | "," | ")" | "in" | "("))
             } else if self.check("(") {
                 // `var (a, b) = ...` deconstruction.
                 self.parse_designation().is_ok() && matches!(self.text(), "=" | ";" | ")")
@@ -1115,7 +1139,9 @@ impl<'a> Parser<'a> {
                         // parameters; accept it here so one spelling parses.
                         let _ = self.eat_keyword("in");
                         let _ = self.eat_keyword("out");
-                        self.parse_type_inner(allow_dots, allow_nullable, stop_at_member)?;
+                        // Inside type arguments a dotted segment is always part
+                        // of the type, never a member name.
+                        self.parse_type_inner(allow_dots, allow_nullable, false)?;
                         if !self.eat(",") {
                             break;
                         }
@@ -1198,6 +1224,15 @@ impl<'a> Parser<'a> {
         result
     }
 
+    /// A switch-arm or case guard: `x =>` belongs to the arm here.
+    fn parse_guard(&mut self) -> Result<(), SyntaxError> {
+        let previous = self.lambda_allowed;
+        self.lambda_allowed = false;
+        let result = self.parse_expression();
+        self.lambda_allowed = previous;
+        result
+    }
+
     /// `(...) =` at statement start is a deconstruction assignment.
     fn looks_like_deconstruction_assignment(&mut self) -> bool {
         let saved = self.position;
@@ -1224,15 +1259,23 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_designation(&mut self) -> Result<(), SyntaxError> {
-        // Deconstruction designation: `(name, (x, y))`.
+        // Deconstruction designation: `(bool a, T b)` or `(name, (x, y))`.
         self.expect("(")?;
         while !self.check(")") && !self.at_end() {
             if self.check("(") {
                 self.parse_designation()?;
-            } else if self.check_identifier() {
-                self.bump();
             } else {
-                break;
+                let saved = self.position;
+                let typed = match self.parse_type() {
+                    Ok(()) => self.check_identifier(),
+                    Err(_) => false,
+                };
+                if typed {
+                    self.bump();
+                } else {
+                    self.position = saved;
+                    self.expect_identifier()?;
+                }
             }
             if !self.eat(",") {
                 break;
@@ -1457,6 +1500,8 @@ impl<'a> Parser<'a> {
                     | "nameof"
                     | "await"
                     | "delegate"
+                    | "checked"
+                    | "unchecked"
             ) || self.kind() == TokenKind::Identifier
                 || self.kind() == TokenKind::Number
                 || self.kind() == TokenKind::String
@@ -1541,7 +1586,7 @@ impl<'a> Parser<'a> {
         let saved = self.position;
         let mut matched = false;
         if self.parse_type().is_ok() {
-            if self.check_identifier() {
+            if self.check_identifier() && !matches!(self.text(), "or" | "and" | "when") {
                 self.bump();
             }
             matched = self.check("=>")
@@ -1566,7 +1611,7 @@ impl<'a> Parser<'a> {
                 self.parse_switch_pattern()?;
             }
             if self.eat_word("when") {
-                self.parse_expression()?;
+                self.parse_guard()?;
             }
             self.expect("=>")?;
             self.parse_expression()?;
@@ -1622,12 +1667,13 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         loop {
-            let by_reference =
-                self.eat_keyword("ref") || self.eat_keyword("out") || self.eat_keyword("in");
+            // A named argument may still carry `out`: `reason: out string text`.
             if self.check_identifier() && self.peek_text(1) == Some(":") {
                 self.bump();
                 self.bump();
             }
+            let by_reference =
+                self.eat_keyword("ref") || self.eat_keyword("out") || self.eat_keyword("in");
             // `out float value` / `out var value` declare a variable in place.
             if by_reference && self.looks_like_typed_argument() {
                 self.parse_type()?;
@@ -1651,14 +1697,27 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Result<(), SyntaxError> {
         if self.check("(") {
-            if self.looks_like_lambda() {
+            if self.lambda_allowed && self.looks_like_lambda() {
                 return self.parse_lambda();
             }
             self.bump();
+            // Parentheses end any guard context, so lambdas are legal again.
+            let previous_lambda = self.lambda_allowed;
+            self.lambda_allowed = true;
+            // Tuple elements may be named: `(mat: material, texture)`.
+            if self.check_identifier() && self.peek_text(1) == Some(":") {
+                self.bump();
+                self.bump();
+            }
             self.parse_expression()?;
             while self.eat(",") {
+                if self.check_identifier() && self.peek_text(1) == Some(":") {
+                    self.bump();
+                    self.bump();
+                }
                 self.parse_expression()?;
             }
+            self.lambda_allowed = previous_lambda;
             return self.expect(")");
         }
         if self.check_keyword("static")
@@ -1687,7 +1746,10 @@ impl<'a> Parser<'a> {
             }
             return Err(self.error("expected a lambda after 'async'"));
         }
-        if self.kind() == TokenKind::Identifier && self.peek_text(1) == Some("=>") {
+        if self.lambda_allowed
+            && self.kind() == TokenKind::Identifier
+            && self.peek_text(1) == Some("=>")
+        {
             return self.parse_lambda();
         }
         if self.check_keyword("new") {
@@ -1698,13 +1760,28 @@ impl<'a> Parser<'a> {
             self.bump();
             return Ok(());
         }
+        if self.check_keyword("stackalloc") {
+            // `stackalloc int[3]` and `stackalloc[] { 1, 2 }`.
+            self.bump();
+            if self.check("[") {
+                return self.parse_initializer();
+            }
+            self.parse_type_allowing_dots()?;
+            if self.check("[") {
+                self.bump();
+                if !self.check("]") {
+                    self.parse_expression()?;
+                }
+                self.expect("]")?;
+            }
+            return self.parse_initializer();
+        }
         if self.check_keyword("typeof")
             || self.check_keyword("sizeof")
             || self.check_keyword("default")
             || self.check_word("nameof")
             || self.check_keyword("checked")
             || self.check_keyword("unchecked")
-            || self.check_keyword("stackalloc")
         {
             self.bump();
             self.expect("(")?;
@@ -1808,6 +1885,16 @@ impl<'a> Parser<'a> {
 
     /// Pattern forms that appear after `is` and in switch arms.
     fn parse_pattern(&mut self) -> Result<(), SyntaxError> {
+        if self.check("(") {
+            // Parenthesized pattern: `is not (A or B)`.
+            self.bump();
+            self.parse_pattern()?;
+            while self.check_word("and") || self.check_word("or") {
+                self.bump();
+                self.parse_pattern()?;
+            }
+            return self.expect(")");
+        }
         if self.check("{") {
             // Property pattern: `is { Count: > 0 }`.
             self.bump();
@@ -1840,7 +1927,8 @@ impl<'a> Parser<'a> {
         }
         let saved = self.position;
         if self.parse_is_type().is_ok() {
-            let had_name = self.check_identifier();
+            // `or`/`and`/`when` are contextual identifiers, not variable names.
+            let had_name = self.check_identifier() && !matches!(self.text(), "or" | "and" | "when");
             if had_name {
                 self.bump();
             }
@@ -1941,7 +2029,30 @@ impl<'a> Parser<'a> {
             return self.parse_initializer();
         }
         if self.check("(") {
-            // Target-typed new: `new(4)`.
+            // Tuple-typed array or target-typed new: `new (string, int)[] { ... }`
+            // versus `new(4)`.
+            let saved = self.position;
+            if self.parse_type().is_ok() && matches!(self.text(), "[" | "{") {
+                if self.check("[") {
+                    loop {
+                        self.bump();
+                        if !self.check("]") {
+                            loop {
+                                self.parse_expression()?;
+                                if !self.eat(",") {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect("]")?;
+                        if !self.check("[") {
+                            break;
+                        }
+                    }
+                }
+                return self.parse_initializer();
+            }
+            self.position = saved;
             self.bump();
             self.parse_argument_list_body()?;
             self.expect(")")?;

@@ -16,7 +16,7 @@
 
 | 能力 | 状态和边界 |
 | --- | --- |
-| 原生 C# 语法前端 | 自研词法 + 递归下降解析：预处理指令与条件编译、命名空间、类型、成员、语句与表达式；不支持的构造带偏移报错。8530 个真实 Unity 脚本中 8485 个通过语法层（99.5%，0 误接受）。 |
+| 原生 C# 语法前端 | 自研词法 + 递归下降解析：预处理指令与条件编译、命名空间、类型、成员、语句与表达式；不支持的构造带偏移报错。对 `tuanjie-project-sf` 全部 8530 个脚本语法层 8530/8530 通过，误接受 0。 |
 | 受限编译与 DLL 生成 | 将支持的单文件子集编译为 .NET 10 DLL；使用 Rust 的 `hao` 库生成 PE、元数据与 CIL。 |
 | 语义检查 | 检查重复类型/方法/参数、未定义参数引用、受限整型常量表达式等；尚非完整 C# 类型系统和诊断。 |
 | 运行时对照 | 测试将输出 DLL 由 .NET 实际加载和执行，与 Roslyn 的结果和异常比较；覆盖范围见 `tests/fixtures`。 |
@@ -102,7 +102,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 产物写入 `benchmarks/results/differential/roslyn.json` 与 `differential.json`（逐文件分类、双方首条诊断）；中间文件在结束时删除，`-KeepWork` 可保留。默认语料为 `tests/fixtures/differential`；对真实项目请用 `-Corpus` 指向源目录，`compile` 模式还需用 `-References` 提供引用程序集目录，否则 Roslyn 会因缺少 UnityEngine 等引用而误判。
 
-本机基线（`-Mode frontend`，`tuanjie-project-sf` 全部 8530 个 `.cs`，C# 9）：`accept 8485 / false_reject 45 / false_accept 0`；前端单独处理全量耗时 762 毫秒，差分端到端约 9 秒（含构建检查与 Roslyn 侧分析），报告约 1.8 MB。语法不接受不代表产物正确，产物正确性由 `-Mode compile` 与 `tests/runtime.ps1` 负责。
+本机基线（`-Mode frontend`，`tuanjie-project-sf` 全部 8530 个 `.cs`，C# 9）：`accept 8530 / false_reject 0 / false_accept 0`；前端单独处理全量耗时约 0.85 秒，差分端到端约 9 秒（含构建检查与 Roslyn 侧分析），报告约 1.8 MB。语法通过不代表语义或产物正确，产物正确性由 `-Mode compile` 与 `tests/runtime.ps1` 负责。
 
 ## 发布
 
@@ -129,7 +129,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 - **M0（已完成）**：csc 兼容命令行前端、诊断与退出码、`-report` 报告、CLI 契约测试、tag 驱动的多平台发布。
 - **M1（已完成）**：Roslyn 差分门禁——同输入双编译，输出 accept / reject / false_reject / false_accept 分类与覆盖率，false_accept 默认上限 0；语料可指向任意 `.cs` 目录。
-- **M2（进行中）**：自研词法 + 递归下降解析已落地，覆盖预处理/条件编译、命名空间、类型、成员、语句与表达式；真实 Unity 脚本语法通过率 8485/8530（99.5%），误接受 0。剩余工作：trivia/span 保真、增量解析、45 个长尾构造（模式匹配变体、集合表达式等）。
+- **M2（进行中）**：自研词法 + 递归下降解析已落地，覆盖预处理/条件编译、命名空间、类型、成员、语句与表达式；真实 Unity 脚本语法层 8530/8530 通过，误接受 0。剩余工作：trivia/span 保真、增量解析，以及换更大语料后的长尾构造。
 - **M3**：绑定与类型系统（重载决议、泛型与类型推断、lambda/查询/模式匹配、可空引用类型）。
 - **M4**：CIL、元数据、便携 PDB、引用程序集，以及目标框架矩阵（netstandard2.0/2.1、net472、net8/9/10）。
 - **M5**：性能对标（冷启动、全量/增量 p50/p95、峰值内存）与 GitHub tag 发布（win-x64、linux-x64、macos-arm64）。
