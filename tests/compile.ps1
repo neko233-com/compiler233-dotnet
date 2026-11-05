@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $binaryName = if ($IsWindows) { 'compiler233-dotnet.exe' } else { 'compiler233-dotnet' }
 $binary = Join-Path $root "target/release/$binaryName"
@@ -45,5 +45,23 @@ $syntax = Join-Path $work 'Syntax.cs'
 $failure = & $binary csc $syntax "-out:$output" 2>&1 | Out-String
 if ($LASTEXITCODE -ne 1) { throw 'unbalanced source was accepted' }
 if ($failure -notmatch 'CD2330010') { throw "syntax error did not use CD2330010: $failure" }
+
+# External assembly reference: compile a library, then consume it with -r.
+$externalDir = Join-Path $work 'external'
+New-Item -ItemType Directory -Force $externalDir | Out-Null
+$libSource = Join-Path $root 'tests/fixtures/external/Lib.cs'
+$runnerSource = Join-Path $root 'tests/fixtures/external/Runner.cs'
+$libDll = Join-Path $externalDir 'Demo.External.dll'
+& $binary csc $libSource "-out:$libDll"
+if ($LASTEXITCODE -ne 0) { throw 'library for external reference failed to compile' }
+$runnerDll = Join-Path $externalDir 'Runner.dll'
+& $binary csc $runnerSource "-r:$libDll" "-out:$runnerDll"
+if ($LASTEXITCODE -ne 0) { throw 'consumer of the external reference failed to compile' }
+$externalManifest = Join-Path $externalDir 'manifest.txt'
+[System.IO.File]::WriteAllLines($externalManifest, @($libSource, $runnerSource), [System.Text.UTF8Encoding]::new($false))
+$external = & dotnet $oracle $externalManifest $runnerDll 'Demo.ExternalRunner' 'Run' 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { throw "external reference comparison failed: $external" }
+if ($external -notmatch 'compiler233=42') { throw "unexpected external result: $external" }
+Write-Output $external.Trim()
 
 Write-Output 'Compile and runtime differential checks passed.'

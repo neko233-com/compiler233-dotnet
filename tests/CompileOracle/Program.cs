@@ -49,7 +49,7 @@ var expected = Invoke(
     typeName,
     methodName);
 var actual = Invoke(
-    new AssemblyLoadContext("compiler233", true).LoadFromAssemblyPath(Path.GetFullPath(assemblyPath)),
+    LoadWithDependencies(assemblyPath),
     typeName,
     methodName);
 
@@ -60,6 +60,19 @@ if (expected != actual)
     return 1;
 }
 return 0;
+
+static Assembly LoadWithDependencies(string path)
+{
+    var full = Path.GetFullPath(path);
+    var directory = Path.GetDirectoryName(full)!;
+    var context = new AssemblyLoadContext("compiler233", true);
+    context.Resolving += (loader, name) =>
+    {
+        var candidate = Path.Combine(directory, name.Name + ".dll");
+        return File.Exists(candidate) ? loader.LoadFromAssemblyPath(candidate) : null;
+    };
+    return context.LoadFromAssemblyPath(full);
+}
 
 static string Invoke(Assembly assembly, string typeName, string methodName)
 {

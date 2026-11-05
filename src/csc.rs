@@ -523,7 +523,7 @@ fn compile_assembly(
         ));
         return None;
     };
-    let bytes = match csharp::compile(&sources, assembly_name) {
+    let bytes = match csharp::compile(&sources, assembly_name, &options.references) {
         Ok(bytes) => bytes,
         Err(error) => {
             diagnostics.push(Diagnostic::at(

@@ -14,6 +14,7 @@ use hao::{
         il::{EmitLabel, Emitter, Instruction, MemberToken, MethodBody, OpCode, Operand},
         md::streams::tables_stream::{FieldFlags, MethodFlags, TypeAttributes},
         module::{ModuleKind, TargetRuntime},
+        signature::PrimitiveType,
         signature::{FieldSig, MethodSig, TypeSig},
     },
 };
@@ -233,13 +234,107 @@ enum Expr {
     },
 }
 
-pub fn compile(sources: &[(String, String)], assembly_name: &str) -> Result<Vec<u8>, CompileError> {
+pub fn compile(
+    sources: &[(String, String)],
+    assembly_name: &str,
+    references: &[String],
+) -> Result<Vec<u8>, CompileError> {
     let mut program = Program { types: Vec::new() };
     for (file, text) in sources {
         let parsed = parse_file(file, text)?;
         program.types.extend(parsed);
     }
-    emit(&program, assembly_name, sources)
+    emit(&program, assembly_name, sources, references)
+}
+
+/// External assemblies referenced with `-reference:`, indexed by type name.
+struct Externals {
+    modules: Vec<Module>,
+    types: HashMap<String, (usize, Entry<TypeDef>)>,
+    /// Short type name to candidate full names, for sources that rely on `using`.
+    by_short_name: HashMap<String, Vec<String>>,
+    /// Declaring type full name to methods, because loaded TypeDef rows do not
+    /// carry their method list.
+    methods: HashMap<String, Vec<(usize, Entry<Method>)>>,
+}
+
+impl Externals {
+    fn load(paths: &[String], sources: &[(String, String)]) -> Result<Self, CompileError> {
+        let mut modules = Vec::new();
+        let mut types = HashMap::new();
+        let mut by_short_name: HashMap<String, Vec<String>> = HashMap::new();
+        let mut methods: HashMap<String, Vec<(usize, Entry<Method>)>> = HashMap::new();
+        for path in paths {
+            let module = Module::from_path_no_resolve(path).map_err(|error| CompileError {
+                file: sources
+                    .first()
+                    .map(|(file, _)| file.clone())
+                    .unwrap_or_default(),
+                line: 1,
+                column: 1,
+                message: format!("cannot read reference '{path}': {error}"),
+                syntax: false,
+            })?;
+            let index = modules.len();
+            for entry in module.all_types() {
+                let full_name = entry.get().full_name();
+                let short = full_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&full_name)
+                    .to_string();
+                by_short_name
+                    .entry(short)
+                    .or_default()
+                    .push(full_name.clone());
+                types.entry(full_name).or_insert((index, entry.clone()));
+            }
+            for method in module.all_methods() {
+                if let Some(declaring) = method.get().declaring_type.upgrade() {
+                    methods
+                        .entry(declaring.get().full_name())
+                        .or_default()
+                        .push((index, method.clone()));
+                }
+            }
+            modules.push(module);
+        }
+        Ok(Externals {
+            modules,
+            types,
+            by_short_name,
+            methods,
+        })
+    }
+
+    fn find(&self, full_name: &str) -> Option<&(usize, Entry<TypeDef>)> {
+        if let Some(entry) = self.types.get(full_name) {
+            return Some(entry);
+        }
+        let short = full_name.rsplit('.').next().unwrap_or(full_name);
+        let candidates = self.by_short_name.get(short)?;
+        if candidates.len() == 1 {
+            return self.types.get(&candidates[0]);
+        }
+        None
+    }
+
+    fn method(
+        &self,
+        type_full_name: &str,
+        name: &str,
+        arity: usize,
+    ) -> Option<(usize, Entry<Method>)> {
+        let (_, entry) = self.find(type_full_name)?;
+        let full_name = entry.get().full_name();
+
+        let candidates = self.methods.get(&full_name)?;
+        let found = candidates.iter().find(|(_, method)| {
+            let method = method.get();
+            method.name == name && method.signature.params.len() == arity
+        })?;
+        Some((found.0, found.1.clone()))
+    }
 }
 
 // ---------------------------------------------------------------- parsing
@@ -1223,7 +1318,25 @@ fn is_reference(ty: &Ty) -> bool {
     matches!(ty, Ty::String | Ty::Class(_) | Ty::Array(_))
 }
 
-fn resolve_type(ty: &Ty, types: &HashMap<String, Entry<TypeDef>>) -> Result<TypeSig, String> {
+fn external_ty(sig: &TypeSig) -> Ty {
+    match sig {
+        TypeSig::Primitive(PrimitiveType::I4) => Ty::Int,
+        TypeSig::Primitive(PrimitiveType::Boolean) => Ty::Bool,
+        TypeSig::Primitive(PrimitiveType::String) => Ty::String,
+        TypeSig::Primitive(PrimitiveType::Void) => Ty::Void,
+        TypeSig::Class(TypeDefOrRef::TypeDef(entry)) => Ty::Class(entry.get().full_name()),
+        TypeSig::Class(TypeDefOrRef::TypeRef(entry)) => Ty::Class(entry.get().full_name()),
+        TypeSig::SzArray(inner) => Ty::Array(Box::new(external_ty(inner))),
+        other => Ty::Named(format!("{other:?}")),
+    }
+}
+
+fn resolve_type(
+    ty: &Ty,
+    types: &HashMap<String, Entry<TypeDef>>,
+    externals: &Externals,
+    module: &mut Module,
+) -> Result<TypeSig, String> {
     Ok(match ty {
         Ty::Void => TypeSig::VOID,
         Ty::Int => TypeSig::INT32,
@@ -1231,9 +1344,20 @@ fn resolve_type(ty: &Ty, types: &HashMap<String, Entry<TypeDef>>) -> Result<Type
         Ty::String => TypeSig::STRING,
         Ty::Class(name) => match types.get(name) {
             Some(entry) => TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone())),
-            None => return Err(format!("unknown type '{name}'")),
+            None => match externals.find(name) {
+                Some((index, entry)) => {
+                    let imported = module
+                        .import_foreign_type(
+                            &TypeDefOrRef::TypeDef(entry.clone()),
+                            &externals.modules[*index],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    TypeSig::Class(imported)
+                }
+                None => return Err(format!("unknown type '{name}'")),
+            },
         },
-        Ty::Array(element) => TypeSig::sz_array(resolve_type(element, types)?),
+        Ty::Array(element) => TypeSig::sz_array(resolve_type(element, types, externals, module)?),
         Ty::Named(name) => return Err(format!("type '{name}' is not supported yet")),
     })
 }
@@ -1242,7 +1366,9 @@ fn emit(
     program: &Program,
     assembly_name: &str,
     sources: &[(String, String)],
+    references: &[String],
 ) -> Result<Vec<u8>, CompileError> {
+    let externals = Externals::load(references, sources)?;
     if program.types.is_empty() {
         return Err(CompileError {
             file: sources
@@ -1288,7 +1414,7 @@ fn emit(
         let mut symbol = TypeSymbol::default();
 
         for field in &decl.fields {
-            let signature = resolve_type(&field.ty, &types)
+            let signature = resolve_type(&field.ty, &types, &externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
             let flags = if field.is_static {
                 FieldFlags::Public | FieldFlags::Static
@@ -1313,10 +1439,10 @@ fn emit(
             let params: Vec<TypeSig> = method
                 .params
                 .iter()
-                .map(|(ty, _)| resolve_type(ty, &types))
+                .map(|(ty, _)| resolve_type(ty, &types, &externals, &mut module))
                 .collect::<Result<Vec<_>, String>>()
                 .map_err(|message| type_error(decl, sources, message))?;
-            let return_signature = resolve_type(&method.ret, &types)
+            let return_signature = resolve_type(&method.ret, &types, &externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
             let (flags, name, signature) = if method.is_ctor {
                 (
@@ -1371,7 +1497,7 @@ fn emit(
         }
 
         for (property_index, property) in decl.properties.iter().enumerate() {
-            let signature = resolve_type(&property.ty, &types)
+            let signature = resolve_type(&property.ty, &types, &externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
             let auto_getter = property.has_getter && property.getter.is_none();
             let auto_setter = property.has_setter && property.setter.is_none();
@@ -1506,6 +1632,7 @@ fn emit(
     for (index, entry, job) in jobs {
         let body = emit_body(
             &mut module,
+            &externals,
             &types,
             &symbols,
             &program.types[index],
@@ -1535,6 +1662,7 @@ enum Job {
 
 fn emit_body(
     module: &mut Module,
+    externals: &Externals,
     types: &HashMap<String, Entry<TypeDef>>,
     symbols: &HashMap<String, TypeSymbol>,
     decl: &TypeDecl,
@@ -1553,6 +1681,7 @@ fn emit_body(
         current: decl.name.clone(),
         is_static: true,
         return_ty: Ty::Void,
+        externals,
         locals: HashMap::new(),
         params: Vec::new(),
         loops: Vec::new(),
@@ -1676,6 +1805,7 @@ struct FnEmitter<'a> {
     current: String,
     is_static: bool,
     return_ty: Ty,
+    externals: &'a Externals,
     locals: HashMap<String, (u16, Ty)>,
     params: Vec<(String, Ty)>,
     loops: Vec<(EmitLabel, EmitLabel)>,
@@ -1775,8 +1905,8 @@ impl<'a> FnEmitter<'a> {
                 Ok(())
             }
             Stmt::Local { ty, name, init } => {
-                let signature =
-                    resolve_type(ty, self.types).map_err(|message| self.error(message))?;
+                let signature = resolve_type(ty, self.types, self.externals, &mut *self.module)
+                    .map_err(|message| self.error(message))?;
                 let index = self.emitter.declare_local(signature);
                 self.locals.insert(name.clone(), (index, ty.clone()));
                 if let Some(value) = init {
@@ -1825,15 +1955,21 @@ impl<'a> FnEmitter<'a> {
                         "foreach variable is {ty:?} but elements are {element:?}"
                     )));
                 }
-                let array_signature = resolve_type(&collection_type, self.types)
-                    .map_err(|message| self.error(message))?;
+                let array_signature = resolve_type(
+                    &collection_type,
+                    self.types,
+                    self.externals,
+                    &mut *self.module,
+                )
+                .map_err(|message| self.error(message))?;
                 let array_local = self.emitter.declare_local(array_signature);
                 self.emitter.stloc(array_local);
                 let index_local = self.emitter.declare_local(TypeSig::INT32);
                 self.emitter.ldc_i4(0);
                 self.emitter.stloc(index_local);
                 let element_signature =
-                    resolve_type(ty, self.types).map_err(|message| self.error(message))?;
+                    resolve_type(ty, self.types, self.externals, &mut *self.module)
+                        .map_err(|message| self.error(message))?;
                 let element_local = self.emitter.declare_local(element_signature);
                 let previous = self
                     .locals
@@ -2552,7 +2688,9 @@ impl<'a> FnEmitter<'a> {
                         if let Some(result) = self.bcl_call(receiver_name, name, args)? {
                             return Ok(result);
                         }
-                        return Err(self.error(format!("unknown type '{receiver_name}'")));
+                        if self.externals.find(receiver_name).is_none() {
+                            return Err(self.error(format!("unknown type '{receiver_name}'")));
+                        }
                     }
                     return self.static_call(receiver_name, name, args);
                 }
@@ -2561,15 +2699,32 @@ impl<'a> FnEmitter<'a> {
             let Ty::Class(type_name) = receiver_type else {
                 return Err(self.error(format!("type {receiver_type:?} has no methods")));
             };
-            let Some(method) = self.method_symbol(&type_name, name, args.len(), false) else {
-                return Err(self.error(format!(
-                    "no instance method '{name}' with {} parameter(s) on '{type_name}'",
-                    args.len()
-                )));
-            };
-            self.push_arguments(args, &method.params, "argument")?;
-            self.emitter.callvirt(method.entry);
-            return Ok(method.ret);
+            if let Some(method) = self.method_symbol(&type_name, name, args.len(), false) {
+                self.push_arguments(args, &method.params, "argument")?;
+                self.emitter.callvirt(method.entry);
+                return Ok(method.ret);
+            }
+            if let Some((index, entry)) = self.externals.method(&type_name, name, args.len()) {
+                let signature = {
+                    let guard = entry.get();
+                    guard.signature.clone()
+                };
+                let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
+                self.push_arguments(args, &params, "argument")?;
+                let token = {
+                    let module = &mut *self.module;
+                    let foreign = &self.externals.modules[index];
+                    module
+                        .import_foreign_method(&entry, foreign)
+                        .map_err(|error| self.error(error.to_string()))?
+                };
+                self.emitter.callvirt(token);
+                return Ok(external_ty(&signature.ret));
+            }
+            return Err(self.error(format!(
+                "no instance method '{name}' with {} parameter(s) on '{type_name}'",
+                args.len()
+            )));
         }
         if !self.is_static {
             let current = self.current.clone();
@@ -2590,15 +2745,32 @@ impl<'a> FnEmitter<'a> {
         name: &str,
         args: &[Expr],
     ) -> Result<Ty, CompileError> {
-        let Some(method) = self.method_symbol(type_name, name, args.len(), true) else {
-            return Err(self.error(format!(
-                "no static method '{name}' with {} parameter(s) on '{type_name}'",
-                args.len()
-            )));
-        };
-        self.push_arguments(args, &method.params, "argument")?;
-        self.emitter.call(method.entry);
-        Ok(method.ret)
+        if let Some(method) = self.method_symbol(type_name, name, args.len(), true) {
+            self.push_arguments(args, &method.params, "argument")?;
+            self.emitter.call(method.entry);
+            return Ok(method.ret);
+        }
+        if let Some((index, entry)) = self.externals.method(type_name, name, args.len()) {
+            let signature = {
+                let guard = entry.get();
+                guard.signature.clone()
+            };
+            let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
+            self.push_arguments(args, &params, "argument")?;
+            let token = {
+                let module = &mut *self.module;
+                let foreign = &self.externals.modules[index];
+                module
+                    .import_foreign_method(&entry, foreign)
+                    .map_err(|error| self.error(error.to_string()))?
+            };
+            self.emitter.call(token);
+            return Ok(external_ty(&signature.ret));
+        }
+        Err(self.error(format!(
+            "no static method '{name}' with {} parameter(s) on '{type_name}'",
+            args.len()
+        )))
     }
 
     fn bcl_call(
