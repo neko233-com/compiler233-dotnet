@@ -20,6 +20,8 @@ namespace Demo
             return value;
         }
 
+        public int Bonus { get; set; }
+
         public int Doubled()
         {
             return this.Value() + Value();

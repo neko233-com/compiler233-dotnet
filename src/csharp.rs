@@ -87,6 +87,7 @@ struct TypeDecl {
     name: String,
     fields: Vec<FieldDecl>,
     methods: Vec<MethodDecl>,
+    properties: Vec<PropertyDecl>,
 }
 
 #[derive(Debug)]
@@ -95,6 +96,17 @@ struct FieldDecl {
     ty: Ty,
     is_static: bool,
     init: Option<Expr>,
+}
+
+#[derive(Debug)]
+struct PropertyDecl {
+    name: String,
+    ty: Ty,
+    is_static: bool,
+    has_getter: bool,
+    has_setter: bool,
+    getter: Option<Block>,
+    setter: Option<Block>,
 }
 
 #[derive(Debug)]
@@ -417,6 +429,7 @@ impl<'a> Parser<'a> {
             name,
             fields: Vec::new(),
             methods: Vec::new(),
+            properties: Vec::new(),
         };
         self.expect("{")?;
         while !self.check("}") && !self.at_end() {
@@ -491,6 +504,53 @@ impl<'a> Parser<'a> {
 
         let ty = self.parse_type_reference()?;
         let name = self.identifier()?;
+        if self.check("{") {
+            // Property with accessors: `int Value { get; set; }`.
+            self.bump();
+            let mut getter = None;
+            let mut setter = None;
+            let mut has_getter = false;
+            let mut has_setter = false;
+            while !self.check("}") && !self.at_end() {
+                self.skip_attribute_lists()?;
+                while matches!(
+                    self.text(),
+                    "public" | "private" | "internal" | "protected" | "static" | "readonly"
+                ) {
+                    self.bump();
+                }
+                let accessor = self.identifier_like()?;
+                let body = if self.eat(";") {
+                    None
+                } else {
+                    Some(self.parse_block()?)
+                };
+                match accessor.as_str() {
+                    "get" => {
+                        has_getter = true;
+                        getter = body;
+                    }
+                    "set" => {
+                        has_setter = true;
+                        setter = body;
+                    }
+                    other => {
+                        return Err(self.error(format!("unsupported accessor '{other}'")));
+                    }
+                }
+            }
+            self.expect("}")?;
+            decl.properties.push(PropertyDecl {
+                name,
+                ty,
+                is_static,
+                has_getter,
+                has_setter,
+                getter,
+                setter,
+            });
+            return Ok(());
+        }
         if self.check("(") {
             let params = self.parse_parameter_list()?;
             let body = if self.check("{") {
@@ -1054,11 +1114,19 @@ struct MethodSymbol {
     entry: Entry<Method>,
 }
 
+struct PropertySymbol {
+    ty: Ty,
+    is_static: bool,
+    getter: Option<Entry<Method>>,
+    setter: Option<Entry<Method>>,
+}
+
 #[derive(Default)]
 struct TypeSymbol {
     fields: HashMap<String, FieldSymbol>,
     methods: Vec<MethodSymbol>,
     ctors: Vec<MethodSymbol>,
+    properties: HashMap<String, PropertySymbol>,
 }
 
 fn type_error(
@@ -1220,6 +1288,85 @@ fn emit(
             jobs.push((index, entry, Job::Declared(method_index)));
         }
 
+        for (property_index, property) in decl.properties.iter().enumerate() {
+            let signature = resolve_type(&property.ty, &types)
+                .map_err(|message| type_error(decl, sources, message))?;
+            let auto_getter = property.has_getter && property.getter.is_none();
+            let auto_setter = property.has_setter && property.setter.is_none();
+            let backing_name = format!("<{}>k__BackingField", property.name);
+            if auto_getter || auto_setter {
+                let flags = if property.is_static {
+                    FieldFlags::Private | FieldFlags::Static
+                } else {
+                    FieldFlags::Private
+                };
+                let entry = TypeDef::add_field(
+                    &ty,
+                    Field::new(
+                        flags,
+                        &backing_name,
+                        FieldSig {
+                            ty: signature.clone(),
+                        },
+                    ),
+                );
+                symbol.fields.insert(
+                    backing_name,
+                    FieldSymbol {
+                        ty: property.ty.clone(),
+                        is_static: property.is_static,
+                        entry,
+                    },
+                );
+            }
+            let mut property_symbol = PropertySymbol {
+                ty: property.ty.clone(),
+                is_static: property.is_static,
+                getter: None,
+                setter: None,
+            };
+            let extra = if property.is_static {
+                MethodFlags::Public
+                    | MethodFlags::Static
+                    | MethodFlags::HideBySig
+                    | MethodFlags::SpecialName
+            } else {
+                MethodFlags::Public | MethodFlags::HideBySig | MethodFlags::SpecialName
+            };
+            if property.has_getter {
+                let signature = if property.is_static {
+                    MethodSig::new_static(signature.clone(), vec![])
+                } else {
+                    MethodSig::new_instance(signature.clone(), vec![])
+                };
+                let entry = TypeDef::add_method(
+                    &ty,
+                    Method::new(extra, format!("get_{}", property.name), signature)
+                        .with_body(Emitter::new().finish()),
+                );
+                property_symbol.getter = Some(entry.clone());
+                jobs.push((index, entry, Job::Getter(property_index)));
+            }
+            if property.has_setter {
+                let signature = if property.is_static {
+                    MethodSig::new_static(TypeSig::VOID, vec![signature.clone()])
+                } else {
+                    MethodSig::new_instance(TypeSig::VOID, vec![signature.clone()])
+                };
+                let entry = TypeDef::add_method(
+                    &ty,
+                    Method::new(extra, format!("set_{}", property.name), signature)
+                        .with_body(Emitter::new().finish()),
+                );
+                entry.get_mut().params = vec![Entry::new(Param::new(1, "value"))];
+                property_symbol.setter = Some(entry.clone());
+                jobs.push((index, entry, Job::Setter(property_index)));
+            }
+            symbol
+                .properties
+                .insert(property.name.clone(), property_symbol);
+        }
+
         if symbol.ctors.is_empty() {
             let flags = MethodFlags::Public
                 | MethodFlags::HideBySig
@@ -1300,6 +1447,8 @@ enum Job {
     Declared(usize),
     DefaultCtor,
     StaticCtor,
+    Getter(usize),
+    Setter(usize),
 }
 
 fn emit_body(
@@ -1382,6 +1531,45 @@ fn emit_body(
                 }
             }
             context.emitter.ret();
+        }
+        Job::Getter(property_index) => {
+            let property = &decl.properties[*property_index];
+            context.is_static = property.is_static;
+            context.return_ty = property.ty.clone();
+            match &property.getter {
+                Some(body) => {
+                    context.block(body)?;
+                    let ends = body
+                        .statements
+                        .last()
+                        .is_some_and(|statement| matches!(statement, Stmt::Return(_)));
+                    if !ends {
+                        return Err(context.error("a getter must return a value"));
+                    }
+                }
+                None => {
+                    let name = format!("<{}>k__BackingField", property.name);
+                    context.load(&name)?;
+                    context.emitter.ret();
+                }
+            }
+        }
+        Job::Setter(property_index) => {
+            let property = &decl.properties[*property_index];
+            context.is_static = property.is_static;
+            context.return_ty = Ty::Void;
+            context.params = vec![("value".to_string(), property.ty.clone())];
+            match &property.setter {
+                Some(body) => {
+                    context.block(body)?;
+                    context.emitter.ret();
+                }
+                None => {
+                    let name = format!("<{}>k__BackingField", property.name);
+                    context.assign(&name, &Expr::Name("value".to_string()))?;
+                    context.emitter.ret();
+                }
+            }
         }
         Job::StaticCtor => {
             context.is_static = true;
@@ -1527,19 +1715,34 @@ impl<'a> FnEmitter<'a> {
                 let Ty::Class(type_name) = target_type else {
                     return Err(self.error(format!("type {target_type:?} has no fields")));
                 };
-                let Some(field) = self.field_symbol(&type_name, name) else {
-                    return Err(self.error(format!("unknown field '{type_name}.{name}'")));
-                };
-                if field.is_static {
-                    return Err(self.error(format!("'{type_name}.{name}' is static")));
+                if let Some(field) = self.field_symbol(&type_name, name) {
+                    if field.is_static {
+                        return Err(self.error(format!("'{type_name}.{name}' is static")));
+                    }
+                    let actual = self.expr(value)?;
+                    Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+                        .map_err(|message| self.error(message))?;
+                    self.emitter.emit(Instruction::new(
+                        OpCode::Stfld,
+                        Operand::Token(MemberToken::Field(field.entry)),
+                    ));
+                    return Ok(());
                 }
+                let setter = self
+                    .symbols
+                    .get(&type_name)
+                    .and_then(|symbol| symbol.properties.get(name))
+                    .map(|property| (property.ty.clone(), property.setter.clone()));
+                let Some((property_ty, setter)) = setter else {
+                    return Err(self.error(format!("unknown member '{type_name}.{name}'")));
+                };
+                let Some(setter) = setter else {
+                    return Err(self.error(format!("property '{type_name}.{name}' has no setter")));
+                };
                 let actual = self.expr(value)?;
-                Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+                Self::require(&actual, &property_ty, &format!("assignment to '{name}'"))
                     .map_err(|message| self.error(message))?;
-                self.emitter.emit(Instruction::new(
-                    OpCode::Stfld,
-                    Operand::Token(MemberToken::Field(field.entry)),
-                ));
+                self.emitter.callvirt(setter);
                 Ok(())
             }
             Stmt::Expression(expression) => {
@@ -1884,29 +2087,62 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.newobj(constructor.entry);
                 Ok(Ty::Class(type_name.clone()))
             }
-            Expr::Member { target, name } => {
-                let target_type = self.expr(target)?;
-                let Ty::Class(type_name) = target_type else {
-                    return Err(self.error(format!("type {target_type:?} has no members")));
-                };
-                let Some(field) = self.field_symbol(&type_name, name) else {
-                    return Err(self.error(format!("unknown field '{type_name}.{name}'")));
-                };
-                if field.is_static {
-                    return Err(self.error(format!("'{type_name}.{name}' is static")));
-                }
-                self.emitter.emit(Instruction::new(
-                    OpCode::Ldfld,
-                    Operand::Token(MemberToken::Field(field.entry)),
-                ));
-                Ok(field.ty)
-            }
+            Expr::Member { target, name } => self.member_read(target, name),
             Expr::Call {
                 receiver,
                 name,
                 args,
             } => self.call(receiver.as_deref(), name, args),
         }
+    }
+
+    fn member_read(&mut self, target: &Expr, name: &str) -> Result<Ty, CompileError> {
+        // `Type.StaticProperty` does not evaluate the type name as a value.
+        if let Expr::Name(type_name) = target
+            && self.types.contains_key(type_name)
+        {
+            if let Some(property) = self
+                .symbols
+                .get(type_name)
+                .and_then(|symbol| symbol.properties.get(name))
+                .filter(|property| property.is_static)
+            {
+                let Some(getter) = property.getter.clone() else {
+                    return Err(self.error(format!("property '{type_name}.{name}' has no getter")));
+                };
+                let ty = property.ty.clone();
+                self.emitter.call(getter);
+                return Ok(ty);
+            }
+            return Err(self.error(format!("unknown static member '{type_name}.{name}'")));
+        }
+        let target_type = self.expr(target)?;
+        let Ty::Class(type_name) = target_type else {
+            return Err(self.error(format!("type {target_type:?} has no members")));
+        };
+        if let Some(field) = self.field_symbol(&type_name, name) {
+            if field.is_static {
+                return Err(self.error(format!("'{type_name}.{name}' is static")));
+            }
+            self.emitter.emit(Instruction::new(
+                OpCode::Ldfld,
+                Operand::Token(MemberToken::Field(field.entry)),
+            ));
+            return Ok(field.ty);
+        }
+        let property = self
+            .symbols
+            .get(&type_name)
+            .and_then(|symbol| symbol.properties.get(name))
+            .map(|property| (property.ty.clone(), property.getter.clone()));
+        let Some((ty, getter)) = property else {
+            return Err(self.error(format!("unknown member '{type_name}.{name}'")));
+        };
+        let Some(getter) = getter else {
+            return Err(self.error(format!("property '{type_name}.{name}' has no getter")));
+        };
+        self.emitter.callvirt(getter);
+        Ok(ty)
     }
 
     fn push_arguments(

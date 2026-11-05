@@ -37,6 +37,8 @@ namespace Demo
             {
                 total = total + 1;
             }
+            first.Bonus = 5;
+            total = total + first.Bonus;
             return total;
         }
     }
