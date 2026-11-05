@@ -116,8 +116,8 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 继承：基类（本地或引用程序集）、`virtual`/`override` 虚调用、`: base(args)` 基类构造、基类方法继承与基类-派生类赋值兼容
 - 接口：`interface` 声明（抽象方法、无方法体）、类实现接口（`InterfaceImpl` + 隐式实现标记为 `virtual final newslot`）、接口类型变量与 `callvirt` 派发
 - 静态/实例方法、参数，重载按参数个数解析
-- 语句：局部声明、赋值、`if/else`、`while`、`for`、`return`、`break`/`continue`、块
-- 表达式：`int/float/bool/string` 与 `null` 字面量、`enum` 常量、算术与比较（含字符串/布尔相等、`== null`）、`&&/||` 短路、`??`、`!`、`++`/`--`、`+=`/`-=` 等复合赋值、字符串 `+` 拼接、赋值表达式、`string.Empty`/`int.MaxValue` 等预定义成员
+- 语句：局部声明、赋值、`if/else`、`while`、`for`、`return`、`break`/`continue`、`base.M(...)` 基类调用、块
+- 表达式：`int/float/bool/string/object` 与 `null` 字面量、`enum` 常量、算术与比较（含字符串/布尔相等、`== null`）、`&&/||` 短路、`??`、`?:` 三元、`(T)x` 转换与 `as`、`!`、`++`/`--`、`+=`/`-=`（含字段与属性）、字符串 `+` 拼接、赋值表达式、`string.Empty`/`int.MaxValue` 等预定义成员
 - 外部引用：`-reference:` 指定的程序集参与类型与方法解析（全名、唯一短名、`System.Text.Regex` 这类限定名），跨程序集静态/实例调用可用；`tests/compile.ps1` 会对 `System.Text.RegularExpressions` 与 Roslyn 构建的泛型库做真实对照
 - 泛型方法调用：`Foo<T>(...)` 通过 MethodSpec 实例化（外部程序集的方法），返回类型按实参替换`MVar`
 - 泛型类型实例：`List<int>` 等引用程序集里的泛型类型，字段/局部/参数签名用`GenericInst`，成员通过`TypeSpec`父的 MemberRef 调用（`list.Add(x)`、`list.Count`），`new List<int>()` 可用；泛型**类型定义**仍不支持

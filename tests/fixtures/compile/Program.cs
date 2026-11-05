@@ -74,6 +74,13 @@ namespace Demo
             {
                 total += 1;
             }
+            Dog dog = new Dog();
+            total = total + dog.Legs();
+
+            object boxed = extras;
+            Extras cast = (Extras)boxed;
+            cast.Total += 1;
+            total = total + cast.Total + (extras.Total > 0 ? 1 : 0);
             return total;
         }
     }

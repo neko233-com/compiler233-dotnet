@@ -71,6 +71,7 @@ fn line_column(source: &str, offset: usize) -> (usize, usize) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ty {
     Void,
+    Object,
     Int,
     Float,
     Bool,
@@ -187,6 +188,12 @@ enum Stmt {
         name: String,
         value: Expr,
     },
+    AssignMemberOp {
+        target: Expr,
+        name: String,
+        op: String,
+        value: Expr,
+    },
     AssignIndex {
         target: Expr,
         index: Expr,
@@ -229,6 +236,13 @@ enum Expr {
     Negate(Box<Expr>),
     Not(Box<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
+    Conditional {
+        condition: Box<Expr>,
+        when_true: Box<Expr>,
+        when_false: Box<Expr>,
+    },
+    As(Box<Expr>, Ty),
+    Cast(Ty, Box<Expr>),
     Call {
         receiver: Option<Box<Expr>>,
         name: String,
@@ -573,6 +587,7 @@ impl<'a> Parser<'a> {
             "float" => Ty::Float,
             "bool" => Ty::Bool,
             "string" | "String" => Ty::String,
+            "object" => Ty::Object,
             other if self.enums.contains_key(other) => Ty::Int,
             other => Ty::Class(other.to_string()),
         })
@@ -871,6 +886,7 @@ impl<'a> Parser<'a> {
             "float" => Ty::Float,
             "bool" => Ty::Bool,
             "string" | "String" => Ty::String,
+            "object" => Ty::Object,
             other if self.enums.contains_key(other) => Ty::Int,
             other => Ty::Class(other.to_string()),
         };
@@ -890,6 +906,16 @@ impl<'a> Parser<'a> {
             self.expect("]")?;
             ty = Ty::Array(Box::new(ty.clone()));
         }
+        if self.eat("?") {
+            // Nullable annotations on reference types do not change the emitted
+            // signature; Nullable<T> for value types is rejected.
+            if !matches!(
+                ty,
+                Ty::Class(_) | Ty::String | Ty::Array(_) | Ty::Generic(_, _)
+            ) {
+                return Err(self.error("nullable value types are not supported yet"));
+            }
+        }
         Ok(ty)
     }
 
@@ -900,6 +926,11 @@ impl<'a> Parser<'a> {
             loop {
                 let ty = self.parse_type_reference()?;
                 let name = self.identifier()?;
+                if self.eat("=") {
+                    // Default values are accepted for signature compatibility and
+                    // ignored: callers must pass every argument explicitly.
+                    self.parse_expression()?;
+                }
                 params.push((ty, name));
                 if !self.eat(",") {
                     break;
@@ -1083,6 +1114,24 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::Assign { name, value });
         }
         let expression = self.parse_expression()?;
+        if matches!(
+            self.text(),
+            "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^="
+        ) {
+            if let Expr::Member { target, name } = expression {
+                let op = self.text().to_string();
+                self.bump();
+                let value = self.parse_expression()?;
+                self.expect(";")?;
+                return Ok(Stmt::AssignMemberOp {
+                    target: *target,
+                    name,
+                    op,
+                    value,
+                });
+            }
+            return Err(self.error("compound assignment requires a member target"));
+        }
         if self.check("=") {
             if let Expr::Index { target, index } = expression {
                 self.bump();
@@ -1138,6 +1187,16 @@ impl<'a> Parser<'a> {
             let right = self.parse_coalesce()?;
             left = Expr::Coalesce(Box::new(left), Box::new(right));
         }
+        if self.eat("?") {
+            let when_true = self.parse_expression()?;
+            self.expect(":")?;
+            let when_false = self.parse_expression()?;
+            return Ok(Expr::Conditional {
+                condition: Box::new(left),
+                when_true: Box::new(when_true),
+                when_false: Box::new(when_false),
+            });
+        }
         Ok(left)
     }
 
@@ -1182,6 +1241,12 @@ impl<'a> Parser<'a> {
     fn parse_relational(&mut self) -> Result<Expr, CompileError> {
         let mut left = self.parse_additive()?;
         loop {
+            if self.check("as") {
+                self.bump();
+                let ty = self.parse_type_reference()?;
+                left = Expr::As(Box::new(left), ty);
+                continue;
+            }
             let op = match self.text() {
                 "<" => BinaryOp::Less,
                 "<=" => BinaryOp::LessOrEqual,
@@ -1250,6 +1315,13 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Not(Box::new(self.parse_unary()?)))
             }
             "(" => {
+                if self.looks_like_cast() {
+                    self.bump();
+                    let target = self.parse_type_reference()?;
+                    self.expect(")")?;
+                    let operand = self.parse_unary()?;
+                    return Ok(Expr::Cast(target, Box::new(operand)));
+                }
                 self.bump();
                 let inner = self.parse_expression()?;
                 self.expect(")")?;
@@ -1257,6 +1329,32 @@ impl<'a> Parser<'a> {
             }
             _ => self.parse_postfix(),
         }
+    }
+
+    fn looks_like_cast(&mut self) -> bool {
+        let saved = self.position;
+        let ok = (|| -> bool {
+            if !self.check("(") {
+                return false;
+            }
+            self.bump();
+            if self.parse_type_reference().is_err() || !self.check(")") {
+                return false;
+            }
+            self.bump();
+            matches!(
+                self.token().kind,
+                syntax::TokenKind::Identifier
+                    | syntax::TokenKind::Number
+                    | syntax::TokenKind::String
+                    | syntax::TokenKind::Char
+            ) || matches!(
+                self.text(),
+                "(" | "!" | "~" | "-" | "+" | "new" | "this" | "base" | "typeof" | "default"
+            )
+        })();
+        self.position = saved;
+        ok
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, CompileError> {
@@ -1395,6 +1493,10 @@ impl<'a> Parser<'a> {
         if self.check("this") {
             self.bump();
             return Ok(Expr::Name("this".to_string()));
+        }
+        if self.check("base") {
+            self.bump();
+            return Ok(Expr::Name("base".to_string()));
         }
         let token = self.token();
         match token.kind {
@@ -1631,6 +1733,7 @@ fn resolve_type(
     Ok(match ty {
         Ty::Void => TypeSig::VOID,
         Ty::Int => TypeSig::INT32,
+        Ty::Object => TypeSig::OBJECT,
         Ty::Float => TypeSig::Primitive(PrimitiveType::R4),
         Ty::Null => return Err("null has no type of its own".to_string()),
         Ty::Bool => TypeSig::BOOL,
@@ -2399,6 +2502,9 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn require_assignable(&self, actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
+        if *expected == Ty::Object && is_reference(actual) {
+            return Ok(());
+        }
         if *actual == Ty::Null && matches!(expected, Ty::String | Ty::Class(_) | Ty::Array(_)) {
             return Ok(());
         }
@@ -2636,6 +2742,65 @@ impl<'a> FnEmitter<'a> {
                         self.locals.remove(name);
                     }
                 }
+                Ok(())
+            }
+            Stmt::AssignMemberOp {
+                target,
+                name,
+                op,
+                value,
+            } => {
+                let opcode = match op.as_str() {
+                    "+=" => OpCode::Add,
+                    "-=" => OpCode::Sub,
+                    "*=" => OpCode::Mul,
+                    "/=" => OpCode::Div,
+                    "%=" => OpCode::Rem,
+                    "&=" => OpCode::And,
+                    "|=" => OpCode::Or,
+                    "^=" => OpCode::Xor,
+                    other => return Err(self.error(format!("unsupported operator '{other}'"))),
+                };
+                let target_type = self.expr(target)?;
+                let Ty::Class(type_name) = target_type else {
+                    return Err(self.error("compound assignment requires a class instance"));
+                };
+                if let Some(field) = self.field_symbol(&type_name, name) {
+                    self.emitter.dup();
+                    self.emitter.emit(Instruction::new(
+                        OpCode::Ldfld,
+                        Operand::Token(MemberToken::Field(field.entry.clone())),
+                    ));
+                    let rhs = self.expr(value)?;
+                    self.require_assignable(&rhs, &field.ty, "compound assignment")
+                        .map_err(|message| self.error(message))?;
+                    self.emitter.op(opcode);
+                    self.emitter.emit(Instruction::new(
+                        OpCode::Stfld,
+                        Operand::Token(MemberToken::Field(field.entry)),
+                    ));
+                    return Ok(());
+                }
+                let property = self
+                    .symbols
+                    .get(&type_name)
+                    .and_then(|symbol| symbol.properties.get(name))
+                    .cloned();
+                let Some(property) = property else {
+                    return Err(self.error(format!("unknown member '{type_name}.{name}'")));
+                };
+                let (Some(getter), Some(setter)) =
+                    (property.getter.clone(), property.setter.clone())
+                else {
+                    return Err(self.error(format!("property '{name}' needs a getter and setter")));
+                };
+                self.emitter.dup();
+                self.emitter.callvirt(getter);
+                let rhs = self.expr(value)?;
+                self.require_assignable(&rhs, &property.ty, "compound assignment")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.op(opcode);
+                self.emitter.callvirt(setter);
                 Ok(())
             }
             Stmt::AssignMember {
@@ -2889,6 +3054,17 @@ impl<'a> FnEmitter<'a> {
             self.emitter.ldarg(0);
             return Ok(Ty::Class(self.current.clone()));
         }
+        if name == "base" {
+            if self.is_static {
+                return Err(self.error("'base' cannot be used from a static method"));
+            }
+            let base = self
+                .base
+                .clone()
+                .unwrap_or_else(|| "System.Object".to_string());
+            self.emitter.ldarg(0);
+            return Ok(Ty::Class(base));
+        }
         if let Some((index, ty)) = self.locals.get(name).cloned() {
             self.emitter.ldloc(index);
             return Ok(ty);
@@ -3090,6 +3266,107 @@ impl<'a> FnEmitter<'a> {
                     .map_err(|message| self.error(message))?;
                 self.emitter.op(OpCode::Neg);
                 Ok(Ty::Int)
+            }
+            Expr::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                let condition_ty = self.expr(condition)?;
+                self.require_assignable(&condition_ty, &Ty::Bool, "?: condition")
+                    .map_err(|message| self.error(message))?;
+                let otherwise = self.emitter.label();
+                let end = self.emitter.label();
+                self.emitter.branch(OpCode::Brfalse, otherwise);
+                let result = self.expr(when_true)?;
+                self.emitter.branch(OpCode::Br, end);
+                self.emitter.mark(otherwise);
+                let alternative = self.expr(when_false)?;
+                self.require_assignable(&alternative, &result, "?: branches")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.mark(end);
+                Ok(result)
+            }
+            Expr::Cast(target, inner) => {
+                let source = self.expr(inner)?;
+                match (&source, target) {
+                    _ if &source == target => {}
+                    (Ty::Int, Ty::Float) => {
+                        self.emitter.op(OpCode::Conv_R4);
+                    }
+                    (Ty::Float, Ty::Int) => {
+                        self.emitter.op(OpCode::Conv_I4);
+                    }
+                    (Ty::Class(_) | Ty::Object | Ty::String | Ty::Array(_), Ty::Class(_)) => {
+                        let signature =
+                            resolve_type(target, self.types, self.externals, &mut *self.module)
+                                .map_err(|message| self.error(message))?;
+                        let token = match signature {
+                            TypeSig::Class(TypeDefOrRef::TypeRef(entry)) => {
+                                MemberToken::TypeRef(entry)
+                            }
+                            TypeSig::Class(TypeDefOrRef::TypeDef(entry)) => {
+                                MemberToken::TypeDef(entry)
+                            }
+                            TypeSig::Class(TypeDefOrRef::TypeSpec(entry)) => {
+                                MemberToken::TypeSpec(entry)
+                            }
+                            _ => return Err(self.error("cast target is not a reference type")),
+                        };
+                        self.emitter
+                            .emit(Instruction::new(OpCode::Castclass, Operand::Token(token)));
+                    }
+                    (Ty::Class(_), Ty::Int) => {
+                        self.emitter.op(OpCode::Unbox_Any);
+                        self.emitter.emit(Instruction::new(
+                            OpCode::Unbox_Any,
+                            Operand::Token(MemberToken::TypeRef(
+                                match self
+                                    .module
+                                    .corlib_type("System.Int32")
+                                    .map_err(|error| self.error(error.to_string()))?
+                                {
+                                    TypeDefOrRef::TypeRef(entry) => entry,
+                                    _ => {
+                                        return Err(
+                                            self.error("System.Int32 is not a type reference")
+                                        );
+                                    }
+                                },
+                            )),
+                        ));
+                    }
+                    _ => {
+                        return Err(self.error(format!("cannot cast {source:?} to {target:?} yet")));
+                    }
+                }
+                Ok(target.clone())
+            }
+            Expr::As(inner, target) => {
+                let _source = self.expr(inner)?;
+                match target {
+                    Ty::Class(_) => {
+                        let signature =
+                            resolve_type(target, self.types, self.externals, &mut *self.module)
+                                .map_err(|message| self.error(message))?;
+                        let token = match signature {
+                            TypeSig::Class(TypeDefOrRef::TypeRef(entry)) => {
+                                MemberToken::TypeRef(entry)
+                            }
+                            TypeSig::Class(TypeDefOrRef::TypeDef(entry)) => {
+                                MemberToken::TypeDef(entry)
+                            }
+                            TypeSig::Class(TypeDefOrRef::TypeSpec(entry)) => {
+                                MemberToken::TypeSpec(entry)
+                            }
+                            _ => return Err(self.error("'as' requires a reference type")),
+                        };
+                        self.emitter
+                            .emit(Instruction::new(OpCode::Isinst, Operand::Token(token)));
+                        Ok(target.clone())
+                    }
+                    _ => Err(self.error(format!("'as {target:?}' is not supported"))),
+                }
             }
             Expr::Coalesce(left, right) => {
                 let ty = self.expr(left)?;
@@ -3517,6 +3794,44 @@ impl<'a> FnEmitter<'a> {
         args: &[Expr],
     ) -> Result<Ty, CompileError> {
         if let Some(receiver) = receiver {
+            if let Expr::Name(receiver_name) = receiver
+                && receiver_name == "base"
+            {
+                let Some(base) = self.base.clone() else {
+                    return Err(self.error("'base' is used in a type without a base class"));
+                };
+                let short = base.rsplit('.').next().unwrap_or(&base).to_string();
+                if let Some(method) = self.inherited_method(&short, name, args.len()) {
+                    self.emitter.ldarg(0);
+                    self.push_arguments(args, &method.params, "argument")?;
+                    // `base.M()` binds the base implementation, so this is a
+                    // non-virtual call.
+                    self.emitter.call(method.entry);
+                    return Ok(method.ret);
+                }
+                if let Some((index, entry)) = self.externals.method(&base, name, args.len()) {
+                    let signature = {
+                        let guard = entry.get();
+                        guard.signature.clone()
+                    };
+                    let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
+                    self.emitter.ldarg(0);
+                    self.push_arguments(args, &params, "argument")?;
+                    let token = {
+                        let module = &mut *self.module;
+                        let foreign = &self.externals.modules[index];
+                        module
+                            .import_foreign_method(&entry, foreign)
+                            .map_err(|error| self.error(error.to_string()))?
+                    };
+                    self.emitter.call(token);
+                    return Ok(external_ty(&signature.ret));
+                }
+                return Err(self.error(format!(
+                    "base type '{base}' has no method '{name}' with {} parameter(s)",
+                    args.len()
+                )));
+            }
             if let Expr::Name(receiver_name) = receiver {
                 let is_value = receiver_name == "this"
                     || self.locals.contains_key(receiver_name)
@@ -3787,6 +4102,7 @@ impl<'a> FnEmitter<'a> {
                 let ty = self.single_argument(args, name)?;
                 let parameter = match ty {
                     Ty::Int => TypeSig::INT32,
+                    Ty::Object => TypeSig::OBJECT,
                     Ty::Float => TypeSig::Primitive(PrimitiveType::R4),
                     Ty::Bool => TypeSig::BOOL,
                     Ty::String => TypeSig::STRING,
@@ -3805,6 +4121,7 @@ impl<'a> FnEmitter<'a> {
                 let ty = self.single_argument(args, name)?;
                 let parameter = match ty {
                     Ty::Int => TypeSig::INT32,
+                    Ty::Object => TypeSig::OBJECT,
                     Ty::Float => TypeSig::Primitive(PrimitiveType::R4),
                     Ty::String => TypeSig::STRING,
                     _ => return Err(self.error("Console.Write has no supported overload")),
