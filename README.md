@@ -112,13 +112,14 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 对象：`new T(...)`（按参数个数匹配构造函数）、`obj.field` 读写、`obj.Method(...)` 与 `this.Method(...)` 调用
 - 属性：`get`/`set` 访问器（自动属性生成后备字段）、`obj.Prop` 读取与 `obj.Prop = v` 赋值、静态属性
 - 数组：`new int[n]`、`a[i]` 读写、`a.Length`、`foreach` 遍历（`int`/`bool`/`string`/类元素）
+- 继承：基类（本地或引用程序集）、`virtual`/`override` 虚调用、`: base(args)` 基类构造、基类方法继承与基类-派生类赋值兼容
 - 静态/实例方法、参数，重载按参数个数解析
 - 语句：局部声明、赋值、`if/else`、`while`、`for`、`return`、`break`/`continue`、块
 - 表达式：`int/bool/string` 字面量、标识符、算术、比较（含字符串/布尔相等）、`&&/||` 短路、`!`、`++`/`--`、字符串 `+` 拼接、赋值表达式
 - 外部引用：`-reference:` 指定的程序集参与类型与方法解析（全名、唯一短名、`System.Text.Regex` 这类限定名），跨程序集静态/实例调用可用；`tests/compile.ps1` 会对 `System.Text.RegularExpressions` 做真实框架调用对照
 - 调用：本程序集的静态/实例方法与构造函数；BCL 的 `System.Math.Max/Min/Abs`、`System.Convert.ToString`、`System.String.Concat`、`System.Console.Write/WriteLine`（按需添加 `System.Console` 程序集引用）
 
-尚未支持、会被明确拒绝而不是静默降级：多维/交错数组、泛型、接口与继承、lambda、`try`/`async`/`switch`。
+尚未支持、会被明确拒绝而不是静默降级：接口实现、多维/交错数组、泛型、lambda、`try`/`async`/`switch`。
 
 验收方式：`./tests/compile.ps1` 用 Roslyn 编译同一批源码，分别加载两个程序集并执行 `Demo.Program.Run()`，结果不一致即失败。
 

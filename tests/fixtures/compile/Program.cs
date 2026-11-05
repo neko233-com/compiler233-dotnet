@@ -50,6 +50,9 @@ namespace Demo
                 sum = sum + value;
             }
             total = total + sum + values.Length;
+
+            Shape shape = new Square();
+            total = total + shape.Area() + shape.Tag();
             return total;
         }
     }

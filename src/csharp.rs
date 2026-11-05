@@ -87,6 +87,7 @@ struct TypeDecl {
     offset: usize,
     namespace: String,
     name: String,
+    base: Option<String>,
     fields: Vec<FieldDecl>,
     methods: Vec<MethodDecl>,
     properties: Vec<PropertyDecl>,
@@ -119,6 +120,15 @@ struct MethodDecl {
     params: Vec<(Ty, String)>,
     body: Option<Block>,
     is_ctor: bool,
+    virtual_kind: VirtualKind,
+    base_args: Option<Vec<Expr>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtualKind {
+    None,
+    Virtual,
+    Override,
 }
 
 #[derive(Debug)]
@@ -535,12 +545,17 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         let name = self.identifier()?;
+        let mut base = None;
         if self.eat(":") {
-            // Base list: accept but ignore; Object is the implicit base.
+            // The first entry is the base class; extra entries are interfaces,
+            // which the bounded core records but does not implement yet.
             loop {
-                self.parse_qualified_name()?;
+                let entry = self.parse_qualified_name()?;
                 if self.check("<") {
                     self.skip_balanced("<", ">")?;
+                }
+                if base.is_none() {
+                    base = Some(entry);
                 }
                 if !self.eat(",") {
                     break;
@@ -552,6 +567,7 @@ impl<'a> Parser<'a> {
             offset: class_offset,
             namespace: namespace.to_string(),
             name,
+            base,
             fields: Vec::new(),
             methods: Vec::new(),
             properties: Vec::new(),
@@ -586,6 +602,7 @@ impl<'a> Parser<'a> {
         self.skip_attribute_lists()?;
         let mut is_static = false;
         let mut is_public = false;
+        let mut virtual_kind = VirtualKind::None;
         loop {
             match self.text() {
                 "public" => {
@@ -599,8 +616,15 @@ impl<'a> Parser<'a> {
                     is_static = true;
                     self.bump();
                 }
-                "readonly" | "const" | "sealed" | "override" | "virtual" | "unsafe" | "extern"
-                | "async" | "partial" => {
+                "virtual" => {
+                    virtual_kind = VirtualKind::Virtual;
+                    self.bump();
+                }
+                "override" => {
+                    virtual_kind = VirtualKind::Override;
+                    self.bump();
+                }
+                "readonly" | "const" | "sealed" | "unsafe" | "extern" | "async" | "partial" => {
                     self.bump();
                 }
                 _ => break,
@@ -615,6 +639,26 @@ impl<'a> Parser<'a> {
         if self.token().kind == syntax::TokenKind::Identifier && self.peek(1) == Some("(") {
             let name = self.identifier()?;
             let params = self.parse_parameter_list()?;
+            let mut base_args = None;
+            if self.eat(":") {
+                // `base(...)` and `this(...)` share the argument list here;
+                // initializer chaining is only partially modelled.
+                if self.check("base") || self.check("this") {
+                    self.bump();
+                }
+                self.expect("(")?;
+                let mut args = Vec::new();
+                if !self.check(")") {
+                    loop {
+                        args.push(self.parse_expression()?);
+                        if !self.eat(",") {
+                            break;
+                        }
+                    }
+                }
+                self.expect(")")?;
+                base_args = Some(args);
+            }
             let body = self.parse_block()?;
             decl.methods.push(MethodDecl {
                 name,
@@ -623,6 +667,8 @@ impl<'a> Parser<'a> {
                 params,
                 body: Some(body),
                 is_ctor: true,
+                virtual_kind: VirtualKind::None,
+                base_args,
             });
             return Ok(());
         }
@@ -691,6 +737,8 @@ impl<'a> Parser<'a> {
                 params,
                 body,
                 is_ctor: false,
+                virtual_kind,
+                base_args: None,
             });
             return Ok(());
         }
@@ -1295,6 +1343,7 @@ struct PropertySymbol {
 
 #[derive(Default)]
 struct TypeSymbol {
+    base: Option<String>,
     fields: HashMap<String, FieldSymbol>,
     methods: Vec<MethodSymbol>,
     ctors: Vec<MethodSymbol>,
@@ -1406,12 +1455,42 @@ fn emit(
         types.insert(decl.name.clone(), entry);
     }
 
+    // Pass 0.5: resolve base types now that every local type exists.
+    for decl in &program.types {
+        let Some(base_name) = &decl.base else {
+            continue;
+        };
+        let Some(entry) = types.get(&decl.name).cloned() else {
+            continue;
+        };
+        let resolved = if let Some(local) = types.get(base_name) {
+            TypeDefOrRef::TypeDef(local.clone())
+        } else if let Some((index, foreign)) = externals.find(base_name) {
+            module
+                .import_foreign_type(
+                    &TypeDefOrRef::TypeDef(foreign.clone()),
+                    &externals.modules[*index],
+                )
+                .map_err(|error| type_error(decl, sources, error.to_string()))?
+        } else {
+            return Err(type_error(
+                decl,
+                sources,
+                format!("unknown base type '{base_name}'"),
+            ));
+        };
+        entry.get_mut().extends = Some(resolved);
+    }
+
     // Pass 1: fields, method shells and constructors.
     let mut symbols: HashMap<String, TypeSymbol> = HashMap::new();
     let mut jobs: Vec<(usize, Entry<Method>, Job)> = Vec::new();
     for (index, decl) in program.types.iter().enumerate() {
         let ty = types[&decl.name].clone();
-        let mut symbol = TypeSymbol::default();
+        let mut symbol = TypeSymbol {
+            base: decl.base.clone(),
+            ..TypeSymbol::default()
+        };
 
         for field in &decl.fields {
             let signature = resolve_type(&field.ty, &types, &externals, &mut module)
@@ -1444,6 +1523,11 @@ fn emit(
                 .map_err(|message| type_error(decl, sources, message))?;
             let return_signature = resolve_type(&method.ret, &types, &externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
+            let virtual_flags = match method.virtual_kind {
+                VirtualKind::Virtual => MethodFlags::Virtual | MethodFlags::NewSlot,
+                VirtualKind::Override => MethodFlags::Virtual | MethodFlags::ReuseSlot,
+                VirtualKind::None => MethodFlags::empty(),
+            };
             let (flags, name, signature) = if method.is_ctor {
                 (
                     MethodFlags::Public
@@ -1461,7 +1545,7 @@ fn emit(
                 )
             } else {
                 (
-                    MethodFlags::Public | MethodFlags::HideBySig,
+                    MethodFlags::Public | MethodFlags::HideBySig | virtual_flags,
                     method.name.clone(),
                     MethodSig::new_instance(return_signature, params),
                 )
@@ -1706,6 +1790,17 @@ fn emit_body(
                     method.name
                 )));
             };
+            if method.is_ctor {
+                context.call_base_constructor(decl, method.base_args.as_deref())?;
+                for field in &decl.fields {
+                    if field.is_static {
+                        continue;
+                    }
+                    if let Some(initializer) = &field.init {
+                        context.field_store(field, initializer)?;
+                    }
+                }
+            }
             context.block(body)?;
             if method.is_ctor || method.ret == Ty::Void {
                 context.emitter.ret();
@@ -1724,15 +1819,7 @@ fn emit_body(
         }
         Job::DefaultCtor => {
             context.is_static = false;
-            let object_ctor = context
-                .module
-                .import_corlib_method(
-                    "System.Object",
-                    ".ctor",
-                    MethodSig::new_instance(TypeSig::VOID, vec![]),
-                )
-                .map_err(|error| context.error(error.to_string()))?;
-            context.emitter.ldarg(0).call(object_ctor);
+            context.call_base_constructor(decl, None)?;
             for field in &decl.fields {
                 if field.is_static {
                     continue;
@@ -1859,6 +1946,23 @@ impl<'a> FnEmitter<'a> {
         })
     }
 
+    /// Instance methods are inherited, so search the local base chain too.
+    fn inherited_method(&self, type_name: &str, name: &str, arity: usize) -> Option<MethodSymbol> {
+        let mut current = Some(type_name.to_string());
+        while let Some(owner) = current {
+            let short = owner.rsplit('.').next().unwrap_or(&owner).to_string();
+            if let Some(method) = self.method_symbol(&short, name, arity, false) {
+                return Some(method);
+            }
+            let base = self
+                .symbols
+                .get(&short)
+                .and_then(|symbol| symbol.base.clone())?;
+            current = Some(base);
+        }
+        None
+    }
+
     fn constructor(&self, type_name: &str, arity: usize) -> Option<MethodSymbol> {
         self.symbols.get(type_name).and_then(|symbol| {
             symbol
@@ -1867,6 +1971,42 @@ impl<'a> FnEmitter<'a> {
                 .find(|ctor| ctor.params.len() == arity)
                 .cloned()
         })
+    }
+
+    fn assignable(&self, actual: &Ty, expected: &Ty) -> bool {
+        if actual == expected {
+            return true;
+        }
+        let (Ty::Class(actual_name), Ty::Class(expected_name)) = (actual, expected) else {
+            return false;
+        };
+        let mut current = Some(actual_name.clone());
+        while let Some(name) = current {
+            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+            let Some(symbol) = self.symbols.get(&short) else {
+                return false;
+            };
+            match &symbol.base {
+                Some(base) => {
+                    if base == expected_name
+                        || base.rsplit('.').next() == Some(expected_name.as_str())
+                    {
+                        return true;
+                    }
+                    current = Some(base.clone());
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
+    fn require_assignable(&self, actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
+        if self.assignable(actual, expected) {
+            Ok(())
+        } else {
+            Self::require(actual, expected, what)
+        }
     }
 
     fn require(actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
@@ -1911,7 +2051,7 @@ impl<'a> FnEmitter<'a> {
                 self.locals.insert(name.clone(), (index, ty.clone()));
                 if let Some(value) = init {
                     let actual = self.expr(value)?;
-                    Self::require(&actual, ty, &format!("initializer of '{name}'"))
+                    self.require_assignable(&actual, ty, &format!("initializer of '{name}'"))
                         .map_err(|message| self.error(message))?;
                     self.emitter.stloc(index);
                 }
@@ -2026,7 +2166,7 @@ impl<'a> FnEmitter<'a> {
                         return Err(self.error(format!("'{type_name}.{name}' is static")));
                     }
                     let actual = self.expr(value)?;
-                    Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+                    self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
                         .map_err(|message| self.error(message))?;
                     self.emitter.emit(Instruction::new(
                         OpCode::Stfld,
@@ -2046,7 +2186,7 @@ impl<'a> FnEmitter<'a> {
                     return Err(self.error(format!("property '{type_name}.{name}' has no setter")));
                 };
                 let actual = self.expr(value)?;
-                Self::require(&actual, &property_ty, &format!("assignment to '{name}'"))
+                self.require_assignable(&actual, &property_ty, &format!("assignment to '{name}'"))
                     .map_err(|message| self.error(message))?;
                 self.emitter.callvirt(setter);
                 Ok(())
@@ -2062,7 +2202,7 @@ impl<'a> FnEmitter<'a> {
                 match value {
                     Some(expression) => {
                         let actual = self.expr(expression)?;
-                        Self::require(&actual, &self.return_ty, "return")
+                        self.require_assignable(&actual, &self.return_ty, "return")
                             .map_err(|message| self.error(message))?;
                     }
                     None => {
@@ -2080,7 +2220,7 @@ impl<'a> FnEmitter<'a> {
                 else_branch,
             } => {
                 let actual = self.expr(condition)?;
-                Self::require(&actual, &Ty::Bool, "if condition")
+                self.require_assignable(&actual, &Ty::Bool, "if condition")
                     .map_err(|message| self.error(message))?;
                 let alternative = self.emitter.label();
                 let end = self.emitter.label();
@@ -2099,7 +2239,7 @@ impl<'a> FnEmitter<'a> {
                 let end = self.emitter.label();
                 self.emitter.mark(top);
                 let actual = self.expr(condition)?;
-                Self::require(&actual, &Ty::Bool, "while condition")
+                self.require_assignable(&actual, &Ty::Bool, "while condition")
                     .map_err(|message| self.error(message))?;
                 self.emitter.branch(OpCode::Brfalse, end);
                 self.loops.push((end, top));
@@ -2124,7 +2264,7 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.mark(top);
                 if let Some(condition) = condition {
                     let actual = self.expr(condition)?;
-                    Self::require(&actual, &Ty::Bool, "for condition")
+                    self.require_assignable(&actual, &Ty::Bool, "for condition")
                         .map_err(|message| self.error(message))?;
                     self.emitter.branch(OpCode::Brfalse, end);
                 }
@@ -2148,7 +2288,7 @@ impl<'a> FnEmitter<'a> {
     fn assign(&mut self, name: &str, value: &Expr) -> Result<(), CompileError> {
         if let Some((index, ty)) = self.locals.get(name).cloned() {
             let actual = self.expr(value)?;
-            Self::require(&actual, &ty, &format!("assignment to '{name}'"))
+            self.require_assignable(&actual, &ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.stloc(index);
             return Ok(());
@@ -2160,7 +2300,7 @@ impl<'a> FnEmitter<'a> {
         {
             let ty = self.params[position].1.clone();
             let actual = self.expr(value)?;
-            Self::require(&actual, &ty, &format!("assignment to '{name}'"))
+            self.require_assignable(&actual, &ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.starg(self.argument_index(position));
             return Ok(());
@@ -2170,7 +2310,7 @@ impl<'a> FnEmitter<'a> {
         };
         if field.is_static {
             let actual = self.expr(value)?;
-            Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+            self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.emit(Instruction::new(
                 OpCode::Stsfld,
@@ -2185,7 +2325,7 @@ impl<'a> FnEmitter<'a> {
         }
         self.emitter.ldarg(0);
         let actual = self.expr(value)?;
-        Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+        self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
             .map_err(|message| self.error(message))?;
         self.emitter.emit(Instruction::new(
             OpCode::Stfld,
@@ -2205,7 +2345,7 @@ impl<'a> FnEmitter<'a> {
     fn assign_value(&mut self, name: &str, value: &Expr) -> Result<Ty, CompileError> {
         if let Some((index, ty)) = self.locals.get(name).cloned() {
             let actual = self.expr(value)?;
-            Self::require(&actual, &ty, &format!("assignment to '{name}'"))
+            self.require_assignable(&actual, &ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.dup();
             self.emitter.stloc(index);
@@ -2218,7 +2358,7 @@ impl<'a> FnEmitter<'a> {
         {
             let ty = self.params[position].1.clone();
             let actual = self.expr(value)?;
-            Self::require(&actual, &ty, &format!("assignment to '{name}'"))
+            self.require_assignable(&actual, &ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.dup();
             self.emitter.starg(self.argument_index(position));
@@ -2229,7 +2369,7 @@ impl<'a> FnEmitter<'a> {
         };
         if field.is_static {
             let actual = self.expr(value)?;
-            Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+            self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.dup();
             self.emitter.emit(Instruction::new(
@@ -2245,7 +2385,7 @@ impl<'a> FnEmitter<'a> {
         }
         self.emitter.ldarg(0);
         let actual = self.expr(value)?;
-        Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+        self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
             .map_err(|message| self.error(message))?;
         self.emitter.dup();
         self.emitter.emit(Instruction::new(
@@ -2299,6 +2439,83 @@ impl<'a> FnEmitter<'a> {
         Ok(field.ty)
     }
 
+    fn call_base_constructor(
+        &mut self,
+        decl: &TypeDecl,
+        args: Option<&[Expr]>,
+    ) -> Result<(), CompileError> {
+        let base_name = decl
+            .base
+            .clone()
+            .unwrap_or_else(|| "System.Object".to_string());
+        let short = base_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&base_name)
+            .to_string();
+        let arity = args.map(<[Expr]>::len).unwrap_or(0);
+        self.emitter.ldarg(0);
+        if let Some(symbol) = self.symbols.get(&short) {
+            let Some(ctor) = symbol
+                .ctors
+                .iter()
+                .find(|ctor| ctor.params.len() == arity)
+                .cloned()
+            else {
+                return Err(self.error(format!(
+                    "base '{base_name}' has no constructor with {arity} argument(s)"
+                )));
+            };
+            if let Some(args) = args {
+                for (index, argument) in args.iter().enumerate() {
+                    let actual = self.expr(argument)?;
+                    self.require_assignable(&actual, &ctor.params[index], "base argument")
+                        .map_err(|message| self.error(message))?;
+                }
+            }
+            self.emitter.call(ctor.entry);
+            return Ok(());
+        }
+        if base_name == "System.Object" {
+            let ctor = self
+                .module
+                .import_corlib_method(
+                    "System.Object",
+                    ".ctor",
+                    MethodSig::new_instance(TypeSig::VOID, vec![]),
+                )
+                .map_err(|error| self.error(error.to_string()))?;
+            self.emitter.call(ctor);
+            return Ok(());
+        }
+        if let Some((index, entry)) = self.externals.method(&base_name, ".ctor", arity) {
+            let signature = {
+                let guard = entry.get();
+                guard.signature.clone()
+            };
+            let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
+            if let Some(args) = args {
+                for (index, argument) in args.iter().enumerate() {
+                    let actual = self.expr(argument)?;
+                    self.require_assignable(&actual, &params[index], "base argument")
+                        .map_err(|message| self.error(message))?;
+                }
+            }
+            let token = {
+                let module = &mut *self.module;
+                let foreign = &self.externals.modules[index];
+                module
+                    .import_foreign_method(&entry, foreign)
+                    .map_err(|error| self.error(error.to_string()))?
+            };
+            self.emitter.call(token);
+            return Ok(());
+        }
+        Err(self.error(format!(
+            "base type '{base_name}' has no constructor with {arity} argument(s)"
+        )))
+    }
+
     fn store_top(&mut self, name: &str) -> Result<(), CompileError> {
         if let Some((index, _)) = self.locals.get(name).cloned() {
             self.emitter.stloc(index);
@@ -2346,13 +2563,14 @@ impl<'a> FnEmitter<'a> {
             Expr::Name(name) => self.load(name),
             Expr::Negate(inner) => {
                 let ty = self.expr(inner)?;
-                Self::require(&ty, &Ty::Int, "unary '-'").map_err(|message| self.error(message))?;
+                self.require_assignable(&ty, &Ty::Int, "unary '-'")
+                    .map_err(|message| self.error(message))?;
                 self.emitter.op(OpCode::Neg);
                 Ok(Ty::Int)
             }
             Expr::Not(inner) => {
                 let ty = self.expr(inner)?;
-                Self::require(&ty, &Ty::Bool, "unary '!'")
+                self.require_assignable(&ty, &Ty::Bool, "unary '!'")
                     .map_err(|message| self.error(message))?;
                 self.emitter.ldc_i4(0);
                 self.emitter.op(OpCode::Ceq);
@@ -2366,7 +2584,8 @@ impl<'a> FnEmitter<'a> {
                 prefix,
             } => {
                 let ty = self.load(name)?;
-                Self::require(&ty, &Ty::Int, "increment").map_err(|message| self.error(message))?;
+                self.require_assignable(&ty, &Ty::Int, "increment")
+                    .map_err(|message| self.error(message))?;
                 if *prefix {
                     self.emitter.ldc_i4(delta.abs());
                     self.emitter
@@ -2527,7 +2746,8 @@ impl<'a> FnEmitter<'a> {
     ) -> Result<(), CompileError> {
         for (index, argument) in args.iter().enumerate() {
             let actual = self.expr(argument)?;
-            Self::require(&actual, &params[index], what).map_err(|message| self.error(message))?;
+            self.require_assignable(&actual, &params[index], what)
+                .map_err(|message| self.error(message))?;
         }
         Ok(())
     }
@@ -2537,7 +2757,7 @@ impl<'a> FnEmitter<'a> {
             let end = self.emitter.label();
             let done = self.emitter.label();
             let ty = self.expr(left)?;
-            Self::require(&ty, &Ty::Bool, "logical operand")
+            self.require_assignable(&ty, &Ty::Bool, "logical operand")
                 .map_err(|message| self.error(message))?;
             let short_circuit = if matches!(op, BinaryOp::And) {
                 OpCode::Brfalse
@@ -2546,7 +2766,7 @@ impl<'a> FnEmitter<'a> {
             };
             self.emitter.branch(short_circuit, end);
             let ty = self.expr(right)?;
-            Self::require(&ty, &Ty::Bool, "logical operand")
+            self.require_assignable(&ty, &Ty::Bool, "logical operand")
                 .map_err(|message| self.error(message))?;
             self.emitter.branch(short_circuit, end);
             self.emitter.ldc_i4(1);
@@ -2603,8 +2823,9 @@ impl<'a> FnEmitter<'a> {
             self.emitter.call(entry);
             return Ok(Ty::String);
         }
-        Self::require(&left_ty, &Ty::Int, "left operand").map_err(|message| self.error(message))?;
-        Self::require(&right_ty, &Ty::Int, "right operand")
+        self.require_assignable(&left_ty, &Ty::Int, "left operand")
+            .map_err(|message| self.error(message))?;
+        self.require_assignable(&right_ty, &Ty::Int, "right operand")
             .map_err(|message| self.error(message))?;
         match op {
             BinaryOp::Add => {
@@ -2728,7 +2949,7 @@ impl<'a> FnEmitter<'a> {
             let Ty::Class(type_name) = receiver_type else {
                 return Err(self.error(format!("type {receiver_type:?} has no methods")));
             };
-            if let Some(method) = self.method_symbol(&type_name, name, args.len(), false) {
+            if let Some(method) = self.inherited_method(&type_name, name, args.len()) {
                 self.push_arguments(args, &method.params, "argument")?;
                 self.emitter.callvirt(method.entry);
                 return Ok(method.ret);
@@ -2946,7 +3167,7 @@ impl<'a> FnEmitter<'a> {
         };
         if symbol.is_static {
             let actual = self.expr(value)?;
-            Self::require(&actual, &symbol.ty, "field initializer")
+            self.require_assignable(&actual, &symbol.ty, "field initializer")
                 .map_err(|message| self.error(message))?;
             self.emitter.emit(Instruction::new(
                 OpCode::Stsfld,
@@ -2955,7 +3176,7 @@ impl<'a> FnEmitter<'a> {
         } else {
             self.emitter.ldarg(0);
             let actual = self.expr(value)?;
-            Self::require(&actual, &symbol.ty, "field initializer")
+            self.require_assignable(&actual, &symbol.ty, "field initializer")
                 .map_err(|message| self.error(message))?;
             self.emitter.emit(Instruction::new(
                 OpCode::Stfld,
