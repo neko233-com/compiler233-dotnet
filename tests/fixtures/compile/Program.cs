@@ -77,6 +77,9 @@ namespace Demo
             Dog dog = new Dog();
             total = total + dog.Legs();
 
+            Point point = new Point { x = 2, y = 3, Sum = 5 };
+            total = total + point.x + point.y + point.Sum;
+
             object boxed = extras;
             Extras cast = (Extras)boxed;
             cast.Total += 1;

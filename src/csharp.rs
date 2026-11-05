@@ -256,6 +256,7 @@ enum Expr {
     New {
         ty: Ty,
         args: Vec<Expr>,
+        fields: Vec<(String, Expr)>,
     },
     NewArray {
         element: Ty,
@@ -1558,8 +1559,30 @@ impl<'a> Parser<'a> {
             if !matches!(element, Ty::Class(_) | Ty::Generic(_, _)) {
                 return Err(self.error("only classes can be constructed with 'new Type(...)'"));
             }
-            let args = self.parse_arguments()?;
-            return Ok(Expr::New { ty: element, args });
+            let args = if self.check("{") {
+                Vec::new()
+            } else {
+                self.parse_arguments()?
+            };
+            let mut fields = Vec::new();
+            if self.check("{") {
+                self.bump();
+                while !self.check("}") && !self.at_end() {
+                    let name = self.identifier()?;
+                    self.expect("=")?;
+                    let value = self.parse_expression()?;
+                    fields.push((name, value));
+                    if !self.eat(",") {
+                        break;
+                    }
+                }
+                self.expect("}")?;
+            }
+            return Ok(Expr::New {
+                ty: element,
+                args,
+                fields,
+            });
         }
         if self.check("this") {
             self.bump();
@@ -3501,7 +3524,7 @@ impl<'a> FnEmitter<'a> {
                 }
                 Ok(Ty::Int)
             }
-            Expr::New { ty, args } => match ty {
+            Expr::New { ty, args, fields } => match ty {
                 Ty::Class(type_name) => {
                     let Some(constructor) = self.constructor(type_name, args.len()) else {
                         return Err(self.error(format!(
@@ -3511,6 +3534,7 @@ impl<'a> FnEmitter<'a> {
                     };
                     self.push_arguments(args, &constructor.params, "argument")?;
                     self.emitter.newobj(constructor.entry);
+                    self.apply_initializer(type_name, fields)?;
                     Ok(Ty::Class(type_name.clone()))
                 }
                 Ty::Generic(type_name, type_args) => {
@@ -3518,6 +3542,10 @@ impl<'a> FnEmitter<'a> {
                         self.generic_member(type_name, type_args, ".ctor", args.len())?;
                     self.push_arguments(args, &params, "argument")?;
                     self.emitter.newobj(token);
+                    if !fields.is_empty() {
+                        return Err(self
+                            .error("object initializers on generic types are not supported yet"));
+                    }
                     Ok(ty.clone())
                 }
                 other => Err(self.error(format!("'new {other:?}' is not supported"))),
@@ -3742,6 +3770,48 @@ impl<'a> FnEmitter<'a> {
         };
         self.emitter.callvirt(getter);
         Ok(ty)
+    }
+
+    /// Applies `new T(...) { Name = value }` assignments, keeping the object on
+    /// the stack as the expression result.
+    fn apply_initializer(
+        &mut self,
+        type_name: &str,
+        fields: &[(String, Expr)],
+    ) -> Result<(), CompileError> {
+        for (name, value) in fields {
+            if let Some(field) = self.field_symbol(type_name, name) {
+                if field.is_static {
+                    return Err(self.error(format!("'{name}' is static")));
+                }
+                self.emitter.dup();
+                let actual = self.expr(value)?;
+                self.require_assignable(&actual, &field.ty, "initializer")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.emit(Instruction::new(
+                    OpCode::Stfld,
+                    Operand::Token(MemberToken::Field(field.entry)),
+                ));
+                continue;
+            }
+            let property = self
+                .symbols
+                .get(type_name)
+                .and_then(|symbol| symbol.properties.get(name))
+                .cloned();
+            let Some(property) = property else {
+                return Err(self.error(format!("unknown member '{type_name}.{name}'")));
+            };
+            let Some(setter) = property.setter else {
+                return Err(self.error(format!("property '{name}' has no setter")));
+            };
+            self.emitter.dup();
+            let actual = self.expr(value)?;
+            self.require_assignable(&actual, &property.ty, "initializer")
+                .map_err(|message| self.error(message))?;
+            self.emitter.callvirt(setter);
+        }
+        Ok(())
     }
 
     fn push_arguments(

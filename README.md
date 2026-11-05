@@ -110,7 +110,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 `csc` 模式不再只做子集校验：它构建 AST、解析名字与类型、发射可执行 CIL，并把多个源文件合并为一个程序集。当前支持的核心：
 
 - 命名空间（块式与文件级）、类（含静态类）、静态/实例字段与初始化器（实例初始化器在构造函数，静态初始化器在 `.cctor`）
-- 对象：`new T(...)`（按参数个数匹配构造函数）、`obj.field` 读写、`obj.Method(...)` 与 `this.Method(...)` 调用
+- 对象：`new T(...)`（按参数个数匹配构造函数）、`new T { Name = value }` 对象初始化器（字段与属性）、`obj.field` 读写、`obj.Method(...)` 与 `this.Method(...)` 调用
 - 属性：`get`/`set` 访问器（自动属性生成后备字段）、`obj.Prop` 读取与 `obj.Prop = v` 赋值、静态属性
 - 数组：`new int[n]`、`a[i]` 读写、`a.Length`、`foreach` 遍历（`int`/`bool`/`string`/类元素）
 - 继承：基类（本地或引用程序集）、`virtual`/`override` 虚调用、`: base(args)` 基类构造、基类方法继承与基类-派生类赋值兼容
