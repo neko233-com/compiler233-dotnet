@@ -15,8 +15,8 @@ namespace Demo
             {
                 total = total + 1;
             }
-            total = total + Counter.Add(2);
-            total = total + Counter.Add(3);
+            total = total + Tally.Add(2);
+            total = total + Tally.Add(3);
 
             int skipped = 0;
             for (i = 0; i < 6; i++)
@@ -26,6 +26,11 @@ namespace Demo
                 skipped = skipped + i;
             }
             total = total + skipped;
+
+            Counter first = new Counter(10);
+            Counter second = new Counter(1);
+            total = total + first.Add(2) + second.Add(3);
+            total = total + first.Doubled();
 
             string label = "compiler233";
             if (label == "compiler233" && label != "roslyn")

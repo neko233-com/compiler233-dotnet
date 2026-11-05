@@ -10,7 +10,7 @@ use hao::{
     Module,
     dotnet::entries::Version,
     dotnet::{
-        entries::{Entry, Field, Method, Param, TypeDef},
+        entries::{Entry, Field, Method, Param, TypeDef, TypeDefOrRef},
         il::{EmitLabel, Emitter, Instruction, MemberToken, MethodBody, OpCode, Operand},
         md::streams::tables_stream::{FieldFlags, MethodFlags, TypeAttributes},
         module::{ModuleKind, TargetRuntime},
@@ -70,19 +70,8 @@ enum Ty {
     Int,
     Bool,
     String,
+    Class(String),
     Named(String),
-}
-
-impl Ty {
-    fn signature(&self) -> TypeSig {
-        match self {
-            Ty::Void => TypeSig::VOID,
-            Ty::Int => TypeSig::INT32,
-            Ty::Bool => TypeSig::BOOL,
-            Ty::String => TypeSig::STRING,
-            Ty::Named(_) => TypeSig::OBJECT,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -184,8 +173,16 @@ enum Expr {
     Negate(Box<Expr>),
     Not(Box<Expr>),
     Call {
-        receiver: Option<String>,
+        receiver: Option<Box<Expr>>,
         name: String,
+        args: Vec<Expr>,
+    },
+    Member {
+        target: Box<Expr>,
+        name: String,
+    },
+    New {
+        type_name: String,
         args: Vec<Expr>,
     },
     Assign {
@@ -537,13 +534,13 @@ impl<'a> Parser<'a> {
             "int" => Ty::Int,
             "bool" => Ty::Bool,
             "string" | "String" => Ty::String,
-            other => Ty::Named(other.to_string()),
+            other => Ty::Class(other.to_string()),
         };
         // Generic/array suffixes are accepted for signature compatibility but
         // the bounded core only supports the scalar types above.
         if self.check("<") {
             self.skip_balanced("<", ">")?;
-            ty = Ty::Named(name.clone());
+            ty = Ty::Named(format!("{name}[]"));
         }
         while self.eat("[") {
             self.expect("]")?;
@@ -863,52 +860,41 @@ impl<'a> Parser<'a> {
             });
         }
         loop {
-            if self.check("(") {
-                let args = self.parse_arguments()?;
-                expression = match expression {
-                    Expr::Name(name) => Expr::Call {
-                        receiver: None,
-                        name,
-                        args,
-                    },
-                    Expr::Call {
-                        receiver: None,
-                        name,
-                        args: existing,
-                    } => Expr::Call {
-                        receiver: None,
-                        name: format!("{name}?"),
-                        args: existing,
-                    },
-                    Expr::Call {
-                        receiver: Some(_), ..
-                    } => return Err(self.error("nested call targets are not supported")),
-                    _ => return Err(self.error("expected a callable name before '('")),
-                };
-                continue;
-            }
             if self.check(".") {
-                let Expr::Name(receiver) = expression else {
-                    return Err(self.error("member access requires a simple receiver"));
-                };
                 self.bump();
                 let name = self.identifier()?;
                 if self.check("(") {
                     let args = self.parse_arguments()?;
                     expression = Expr::Call {
-                        receiver: Some(receiver),
+                        receiver: Some(Box::new(expression)),
                         name,
                         args,
                     };
                 } else {
-                    expression = Expr::Name(format!("{receiver}.{name}"));
+                    expression = Expr::Member {
+                        target: Box::new(expression),
+                        name,
+                    };
+                }
+                continue;
+            }
+            if self.check("(") {
+                let args = self.parse_arguments()?;
+                match expression {
+                    Expr::Name(name) => {
+                        expression = Expr::Call {
+                            receiver: None,
+                            name,
+                            args,
+                        };
+                    }
+                    _ => return Err(self.error("only a named method can be called")),
                 }
                 continue;
             }
             return Ok(expression);
         }
     }
-
     fn parse_arguments(&mut self) -> Result<Vec<Expr>, CompileError> {
         self.expect("(")?;
         let mut args = Vec::new();
@@ -925,6 +911,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, CompileError> {
+        if self.check("new") {
+            self.bump();
+            let type_name = self.parse_qualified_name()?;
+            let args = self.parse_arguments()?;
+            return Ok(Expr::New { type_name, args });
+        }
+        if self.check("this") {
+            self.bump();
+            return Ok(Expr::Name("this".to_string()));
+        }
         let token = self.token();
         match token.kind {
             syntax::TokenKind::Number => {
@@ -1023,12 +1019,15 @@ fn unquote(raw: &str) -> Result<String, CompileError> {
 
 // ---------------------------------------------------------------- emission
 
+// ---------------------------------------------------------------- emission
+
 struct FieldSymbol {
     ty: Ty,
     is_static: bool,
     entry: Entry<Field>,
 }
 
+#[derive(Clone)]
 struct MethodSymbol {
     name: String,
     is_static: bool,
@@ -1041,7 +1040,7 @@ struct MethodSymbol {
 struct TypeSymbol {
     fields: HashMap<String, FieldSymbol>,
     methods: Vec<MethodSymbol>,
-    ctor: Option<Entry<Method>>,
+    ctors: Vec<MethodSymbol>,
 }
 
 fn type_error(
@@ -1057,8 +1056,18 @@ fn type_error(
     CompileError::new(&decl.file, source, decl.offset, message)
 }
 
-fn signature_of(ty: &Ty) -> TypeSig {
-    ty.signature()
+fn resolve_type(ty: &Ty, types: &HashMap<String, Entry<TypeDef>>) -> Result<TypeSig, String> {
+    Ok(match ty {
+        Ty::Void => TypeSig::VOID,
+        Ty::Int => TypeSig::INT32,
+        Ty::Bool => TypeSig::BOOL,
+        Ty::String => TypeSig::STRING,
+        Ty::Class(name) => match types.get(name) {
+            Some(entry) => TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone())),
+            None => return Err(format!("unknown type '{name}'")),
+        },
+        Ty::Named(name) => return Err(format!("type '{name}' is not supported yet")),
+    })
 }
 
 fn emit(
@@ -1083,35 +1092,36 @@ fn emit(
         .corlib_type("System.Object")
         .map_err(|error| type_error(&program.types[0], sources, error.to_string()))?;
 
-    let mut symbols: HashMap<String, TypeSymbol> = HashMap::new();
-    let mut type_entries: HashMap<String, Entry<TypeDef>> = HashMap::new();
-    let mut jobs: Vec<(usize, Entry<Method>, Job)> = Vec::new();
-
-    for (index, decl) in program.types.iter().enumerate() {
-        if symbols.contains_key(&decl.name) {
+    // Pass 0: declare every type so fields and signatures can reference types
+    // that are declared later in the compilation.
+    let mut types: HashMap<String, Entry<TypeDef>> = HashMap::new();
+    for decl in &program.types {
+        if types.contains_key(&decl.name) {
             return Err(type_error(
                 decl,
                 sources,
                 format!("duplicate type '{}'", decl.name),
             ));
         }
-        let ty = module.add_type(TypeDef::new(
+        let entry = module.add_type(TypeDef::new(
             TypeAttributes::Public | TypeAttributes::BeforeFieldInit,
             &decl.namespace,
             &decl.name,
             Some(object.clone()),
         ));
-        type_entries.insert(decl.name.clone(), ty.clone());
+        types.insert(decl.name.clone(), entry);
+    }
+
+    // Pass 1: fields, method shells and constructors.
+    let mut symbols: HashMap<String, TypeSymbol> = HashMap::new();
+    let mut jobs: Vec<(usize, Entry<Method>, Job)> = Vec::new();
+    for (index, decl) in program.types.iter().enumerate() {
+        let ty = types[&decl.name].clone();
         let mut symbol = TypeSymbol::default();
 
         for field in &decl.fields {
-            if matches!(field.ty, Ty::Named(_)) {
-                return Err(type_error(
-                    decl,
-                    sources,
-                    format!("field '{}' has an unsupported type", field.name),
-                ));
-            }
+            let signature = resolve_type(&field.ty, &types)
+                .map_err(|message| type_error(decl, sources, message))?;
             let flags = if field.is_static {
                 FieldFlags::Public | FieldFlags::Static
             } else {
@@ -1119,13 +1129,7 @@ fn emit(
             };
             let entry = TypeDef::add_field(
                 &ty,
-                Field::new(
-                    flags,
-                    &field.name,
-                    FieldSig {
-                        ty: signature_of(&field.ty),
-                    },
-                ),
+                Field::new(flags, &field.name, FieldSig { ty: signature }),
             );
             symbol.fields.insert(
                 field.name.clone(),
@@ -1137,30 +1141,16 @@ fn emit(
             );
         }
 
-        let mut has_ctor = false;
         for (method_index, method) in decl.methods.iter().enumerate() {
-            if matches!(method.ret, Ty::Named(_))
-                || method
-                    .params
-                    .iter()
-                    .any(|(ty, _)| matches!(ty, Ty::Named(_)))
-            {
-                return Err(type_error(
-                    decl,
-                    sources,
-                    format!(
-                        "method '{}' uses a type the bounded core does not support",
-                        method.name
-                    ),
-                ));
-            }
             let params: Vec<TypeSig> = method
                 .params
                 .iter()
-                .map(|(ty, _)| signature_of(ty))
-                .collect();
-            let (flags, name, sig) = if method.is_ctor {
-                has_ctor = true;
+                .map(|(ty, _)| resolve_type(ty, &types))
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(|message| type_error(decl, sources, message))?;
+            let return_signature = resolve_type(&method.ret, &types)
+                .map_err(|message| type_error(decl, sources, message))?;
+            let (flags, name, signature) = if method.is_ctor {
                 (
                     MethodFlags::Public
                         | MethodFlags::HideBySig
@@ -1173,101 +1163,108 @@ fn emit(
                 (
                     MethodFlags::Public | MethodFlags::Static | MethodFlags::HideBySig,
                     method.name.clone(),
-                    MethodSig::new_static(signature_of(&method.ret), params),
+                    MethodSig::new_static(return_signature, params),
                 )
             } else {
                 (
                     MethodFlags::Public | MethodFlags::HideBySig,
                     method.name.clone(),
-                    MethodSig::new_instance(signature_of(&method.ret), params),
+                    MethodSig::new_instance(return_signature, params),
                 )
             };
             let entry = TypeDef::add_method(
                 &ty,
-                Method::new(flags, name.clone(), sig).with_body(Emitter::new().finish()),
+                Method::new(flags, name.clone(), signature).with_body(Emitter::new().finish()),
             );
-            let mut param_entries = Vec::new();
-            for (parameter_index, (_, parameter_name)) in method.params.iter().enumerate() {
-                param_entries.push(Entry::new(Param::new(
-                    parameter_index as u16 + 1,
-                    parameter_name.clone(),
-                )));
-            }
-            entry.get_mut().params = param_entries;
-            entry.edit_body(|body| *body = Emitter::new().finish());
+            entry.get_mut().params = method
+                .params
+                .iter()
+                .enumerate()
+                .map(|(parameter_index, (_, parameter_name))| {
+                    Entry::new(Param::new(
+                        parameter_index as u16 + 1,
+                        parameter_name.clone(),
+                    ))
+                })
+                .collect();
+            let symbol_method = MethodSymbol {
+                name: name.clone(),
+                is_static: method.is_static && !method.is_ctor,
+                ret: method.ret.clone(),
+                params: method.params.iter().map(|(ty, _)| ty.clone()).collect(),
+                entry: entry.clone(),
+            };
             if method.is_ctor {
-                symbol.ctor = Some(entry.clone());
+                symbol.ctors.push(symbol_method);
             } else {
-                symbol.methods.push(MethodSymbol {
-                    name: name.clone(),
-                    is_static: method.is_static,
-                    ret: method.ret.clone(),
-                    params: method.params.iter().map(|(ty, _)| ty.clone()).collect(),
-                    entry: entry.clone(),
-                });
+                symbol.methods.push(symbol_method);
             }
             jobs.push((index, entry, Job::Declared(method_index)));
         }
 
-        if !has_ctor {
+        if symbol.ctors.is_empty() {
             let flags = MethodFlags::Public
                 | MethodFlags::HideBySig
                 | MethodFlags::SpecialName
                 | MethodFlags::RTSpecialName;
-            let sig = MethodSig::new_instance(TypeSig::VOID, vec![]);
             let entry = TypeDef::add_method(
                 &ty,
-                Method::new(flags, ".ctor", sig).with_body(Emitter::new().finish()),
+                Method::new(
+                    flags,
+                    ".ctor",
+                    MethodSig::new_instance(TypeSig::VOID, vec![]),
+                )
+                .with_body(Emitter::new().finish()),
             );
-            entry.edit_body(|body| *body = Emitter::new().finish());
-            symbol.ctor = Some(entry.clone());
+            symbol.ctors.push(MethodSymbol {
+                name: ".ctor".to_string(),
+                is_static: false,
+                ret: Ty::Void,
+                params: Vec::new(),
+                entry: entry.clone(),
+            });
             jobs.push((index, entry, Job::DefaultCtor));
         }
 
         symbols.insert(decl.name.clone(), symbol);
     }
 
-    let has_static_initializer = program.types.iter().any(|decl| {
-        decl.fields
+    // Static constructors exist only when a static field has an initializer.
+    for (index, decl) in program.types.iter().enumerate() {
+        if !decl
+            .fields
             .iter()
             .any(|field| field.is_static && field.init.is_some())
-    });
-    if has_static_initializer {
-        for (index, decl) in program.types.iter().enumerate() {
-            if !decl
-                .fields
-                .iter()
-                .any(|field| field.is_static && field.init.is_some())
-            {
-                continue;
-            }
-            let Some(ty) = type_entries.get(&decl.name).cloned() else {
-                continue;
-            };
-            {
-                let flags = MethodFlags::Private
-                    | MethodFlags::Static
-                    | MethodFlags::HideBySig
-                    | MethodFlags::SpecialName
-                    | MethodFlags::RTSpecialName;
-                let entry = TypeDef::add_method(
-                    &ty,
-                    Method::new(
-                        flags,
-                        ".cctor",
-                        MethodSig::new_static(TypeSig::VOID, vec![]),
-                    )
-                    .with_body(Emitter::new().finish()),
-                );
-                entry.edit_body(|body| *body = Emitter::new().finish());
-                jobs.push((index, entry, Job::StaticCtor));
-            }
+        {
+            continue;
         }
+        let ty = types[&decl.name].clone();
+        let flags = MethodFlags::Private
+            | MethodFlags::Static
+            | MethodFlags::HideBySig
+            | MethodFlags::SpecialName
+            | MethodFlags::RTSpecialName;
+        let entry = TypeDef::add_method(
+            &ty,
+            Method::new(
+                flags,
+                ".cctor",
+                MethodSig::new_static(TypeSig::VOID, vec![]),
+            )
+            .with_body(Emitter::new().finish()),
+        );
+        jobs.push((index, entry, Job::StaticCtor));
     }
 
     for (index, entry, job) in jobs {
-        let decl = &program.types[index];
-        let body = emit_body(&mut module, &symbols, decl, &job, sources)?;
+        let body = emit_body(
+            &mut module,
+            &types,
+            &symbols,
+            &program.types[index],
+            &job,
+            sources,
+        )?;
         entry.edit_body(|slot| *slot = body);
     }
 
@@ -1289,6 +1286,7 @@ enum Job {
 
 fn emit_body(
     module: &mut Module,
+    types: &HashMap<String, Entry<TypeDef>>,
     symbols: &HashMap<String, TypeSymbol>,
     decl: &TypeDecl,
     job: &Job,
@@ -1301,6 +1299,7 @@ fn emit_body(
         .unwrap_or_default();
     let mut context = FnEmitter {
         module,
+        types,
         symbols,
         current: decl.name.clone(),
         is_static: true,
@@ -1323,22 +1322,20 @@ fn emit_body(
                 .iter()
                 .map(|(ty, name)| (name.clone(), ty.clone()))
                 .collect();
-            match &method.body {
-                Some(body) => context.block(body)?,
-                None => {
-                    return Err(context.error(format!(
-                        "method '{}' has no body; extern methods are not supported",
-                        method.name
-                    )));
-                }
-            }
+            let Some(body) = &method.body else {
+                return Err(context.error(format!(
+                    "method '{}' has no body; extern methods are not supported",
+                    method.name
+                )));
+            };
+            context.block(body)?;
             if method.is_ctor || method.ret == Ty::Void {
                 context.emitter.ret();
             } else {
-                let ends_with_return = method
-                    .body
-                    .as_ref()
-                    .is_some_and(|block| matches!(block.statements.last(), Some(Stmt::Return(_))));
+                let ends_with_return = body
+                    .statements
+                    .last()
+                    .is_some_and(|statement| matches!(statement, Stmt::Return(_)));
                 if !ends_with_return {
                     return Err(context.error(format!(
                         "method '{}' must end with a return statement",
@@ -1386,6 +1383,7 @@ fn emit_body(
 
 struct FnEmitter<'a> {
     module: &'a mut Module,
+    types: &'a HashMap<String, Entry<TypeDef>>,
     symbols: &'a HashMap<String, TypeSymbol>,
     current: String,
     is_static: bool,
@@ -1412,43 +1410,45 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
-    fn store_top(&mut self, name: &str) -> Result<(), CompileError> {
-        if let Some((index, _)) = self.locals.get(name).cloned() {
-            self.emitter.stloc(index);
-            return Ok(());
-        }
-        if let Some(position) = self
-            .params
-            .iter()
-            .position(|(parameter, _)| parameter == name)
-        {
-            self.emitter.starg(self.argument_index(position));
-            return Ok(());
-        }
-        let Some(field) = self.field_symbol(name) else {
-            return Err(self.error(format!("undefined identifier '{name}'")));
-        };
-        if !field.is_static {
-            return Err(self.error(format!(
-                "incrementing instance field '{name}' is not supported yet"
-            )));
-        }
-        self.emitter.emit(Instruction::new(
-            OpCode::Stsfld,
-            Operand::Token(MemberToken::Field(field.entry)),
-        ));
-        Ok(())
-    }
-
-    fn field_symbol(&self, name: &str) -> Option<FieldSymbol> {
+    fn field_symbol(&self, type_name: &str, name: &str) -> Option<FieldSymbol> {
         self.symbols
-            .get(&self.current)
+            .get(type_name)
             .and_then(|symbol| symbol.fields.get(name))
             .map(|field| FieldSymbol {
                 ty: field.ty.clone(),
                 is_static: field.is_static,
                 entry: field.entry.clone(),
             })
+    }
+
+    fn method_symbol(
+        &self,
+        type_name: &str,
+        name: &str,
+        arity: usize,
+        want_static: bool,
+    ) -> Option<MethodSymbol> {
+        self.symbols.get(type_name).and_then(|symbol| {
+            symbol
+                .methods
+                .iter()
+                .find(|method| {
+                    method.name == name
+                        && method.params.len() == arity
+                        && method.is_static == want_static
+                })
+                .cloned()
+        })
+    }
+
+    fn constructor(&self, type_name: &str, arity: usize) -> Option<MethodSymbol> {
+        self.symbols.get(type_name).and_then(|symbol| {
+            symbol
+                .ctors
+                .iter()
+                .find(|ctor| ctor.params.len() == arity)
+                .cloned()
+        })
     }
 
     fn require(actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
@@ -1487,10 +1487,9 @@ impl<'a> FnEmitter<'a> {
                 Ok(())
             }
             Stmt::Local { ty, name, init } => {
-                if matches!(ty, Ty::Named(_)) {
-                    return Err(self.error(format!("local '{name}' has an unsupported type")));
-                }
-                let index = self.emitter.declare_local(signature_of(ty));
+                let signature =
+                    resolve_type(ty, self.types).map_err(|message| self.error(message))?;
+                let index = self.emitter.declare_local(signature);
                 self.locals.insert(name.clone(), (index, ty.clone()));
                 if let Some(value) = init {
                     let actual = self.expr(value)?;
@@ -1569,6 +1568,7 @@ impl<'a> FnEmitter<'a> {
                     self.statement(init)?;
                 }
                 let top = self.emitter.label();
+                let step_label = self.emitter.label();
                 let end = self.emitter.label();
                 self.emitter.mark(top);
                 if let Some(condition) = condition {
@@ -1577,7 +1577,6 @@ impl<'a> FnEmitter<'a> {
                         .map_err(|message| self.error(message))?;
                     self.emitter.branch(OpCode::Brfalse, end);
                 }
-                let step_label = self.emitter.label();
                 self.loops.push((end, step_label));
                 self.block(body)?;
                 self.loops.pop();
@@ -1615,7 +1614,7 @@ impl<'a> FnEmitter<'a> {
             self.emitter.starg(self.argument_index(position));
             return Ok(());
         }
-        let Some(field) = self.field_symbol(name) else {
+        let Some(field) = self.field_symbol(&self.current.clone(), name) else {
             return Err(self.error(format!("undefined identifier '{name}'")));
         };
         if field.is_static {
@@ -1644,7 +1643,75 @@ impl<'a> FnEmitter<'a> {
         Ok(())
     }
 
+    fn assign_expression(&mut self, name: &str, value: &Expr) -> Result<Ty, CompileError> {
+        let ty = self.assign_value(name, value)?;
+        if ty == Ty::Void {
+            return Err(self.error("cannot assign a void expression"));
+        }
+        Ok(ty)
+    }
+
+    fn assign_value(&mut self, name: &str, value: &Expr) -> Result<Ty, CompileError> {
+        if let Some((index, ty)) = self.locals.get(name).cloned() {
+            let actual = self.expr(value)?;
+            Self::require(&actual, &ty, &format!("assignment to '{name}'"))
+                .map_err(|message| self.error(message))?;
+            self.emitter.dup();
+            self.emitter.stloc(index);
+            return Ok(ty);
+        }
+        if let Some(position) = self
+            .params
+            .iter()
+            .position(|(parameter, _)| parameter == name)
+        {
+            let ty = self.params[position].1.clone();
+            let actual = self.expr(value)?;
+            Self::require(&actual, &ty, &format!("assignment to '{name}'"))
+                .map_err(|message| self.error(message))?;
+            self.emitter.dup();
+            self.emitter.starg(self.argument_index(position));
+            return Ok(ty);
+        }
+        let Some(field) = self.field_symbol(&self.current.clone(), name) else {
+            return Err(self.error(format!("undefined identifier '{name}'")));
+        };
+        if field.is_static {
+            let actual = self.expr(value)?;
+            Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+                .map_err(|message| self.error(message))?;
+            self.emitter.dup();
+            self.emitter.emit(Instruction::new(
+                OpCode::Stsfld,
+                Operand::Token(MemberToken::Field(field.entry)),
+            ));
+            return Ok(field.ty);
+        }
+        if self.is_static {
+            return Err(self.error(format!(
+                "instance field '{name}' cannot be used from a static method"
+            )));
+        }
+        self.emitter.ldarg(0);
+        let actual = self.expr(value)?;
+        Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+            .map_err(|message| self.error(message))?;
+        self.emitter.dup();
+        self.emitter.emit(Instruction::new(
+            OpCode::Stfld,
+            Operand::Token(MemberToken::Field(field.entry)),
+        ));
+        Ok(field.ty)
+    }
+
     fn load(&mut self, name: &str) -> Result<Ty, CompileError> {
+        if name == "this" {
+            if self.is_static {
+                return Err(self.error("'this' cannot be used from a static method"));
+            }
+            self.emitter.ldarg(0);
+            return Ok(Ty::Class(self.current.clone()));
+        }
         if let Some((index, ty)) = self.locals.get(name).cloned() {
             self.emitter.ldloc(index);
             return Ok(ty);
@@ -1658,7 +1725,7 @@ impl<'a> FnEmitter<'a> {
             self.emitter.ldarg(self.argument_index(position));
             return Ok(ty);
         }
-        let Some(field) = self.field_symbol(name) else {
+        let Some(field) = self.field_symbol(&self.current.clone(), name) else {
             return Err(self.error(format!("undefined identifier '{name}'")));
         };
         if field.is_static {
@@ -1681,6 +1748,36 @@ impl<'a> FnEmitter<'a> {
         Ok(field.ty)
     }
 
+    fn store_top(&mut self, name: &str) -> Result<(), CompileError> {
+        if let Some((index, _)) = self.locals.get(name).cloned() {
+            self.emitter.stloc(index);
+            return Ok(());
+        }
+        if let Some(position) = self
+            .params
+            .iter()
+            .position(|(parameter, _)| parameter == name)
+        {
+            self.emitter.starg(self.argument_index(position));
+            return Ok(());
+        }
+        let Some(field) = self.field_symbol(&self.current.clone(), name) else {
+            return Err(self.error(format!("undefined identifier '{name}'")));
+        };
+        if !field.is_static {
+            return Err(self.error(format!(
+                "incrementing instance field '{name}' is not supported yet"
+            )));
+        }
+        self.emitter.emit(Instruction::new(
+            OpCode::Stsfld,
+            Operand::Token(MemberToken::Field(field.entry)),
+        ));
+        Ok(())
+    }
+}
+
+impl<'a> FnEmitter<'a> {
     fn expr(&mut self, expression: &Expr) -> Result<Ty, CompileError> {
         match expression {
             Expr::Int(value) => {
@@ -1711,11 +1808,6 @@ impl<'a> FnEmitter<'a> {
                 Ok(Ty::Bool)
             }
             Expr::Binary(op, left, right) => self.binary(*op, left, right),
-            Expr::Call {
-                receiver,
-                name,
-                args,
-            } => self.call(receiver.as_deref(), name, args),
             Expr::Assign { name, value } => self.assign_expression(name, value),
             Expr::Increment {
                 name,
@@ -1739,36 +1831,79 @@ impl<'a> FnEmitter<'a> {
                 }
                 Ok(Ty::Int)
             }
+            Expr::New { type_name, args } => {
+                let Some(constructor) = self.constructor(type_name, args.len()) else {
+                    return Err(self.error(format!(
+                        "no constructor for '{type_name}' taking {} argument(s)",
+                        args.len()
+                    )));
+                };
+                self.push_arguments(args, &constructor.params, "argument")?;
+                self.emitter.newobj(constructor.entry);
+                Ok(Ty::Class(type_name.clone()))
+            }
+            Expr::Member { target, name } => {
+                let target_type = self.expr(target)?;
+                let Ty::Class(type_name) = target_type else {
+                    return Err(self.error(format!("type {target_type:?} has no members")));
+                };
+                let Some(field) = self.field_symbol(&type_name, name) else {
+                    return Err(self.error(format!("unknown field '{type_name}.{name}'")));
+                };
+                if field.is_static {
+                    return Err(self.error(format!("'{type_name}.{name}' is static")));
+                }
+                self.emitter.emit(Instruction::new(
+                    OpCode::Ldfld,
+                    Operand::Token(MemberToken::Field(field.entry)),
+                ));
+                Ok(field.ty)
+            }
+            Expr::Call {
+                receiver,
+                name,
+                args,
+            } => self.call(receiver.as_deref(), name, args),
         }
     }
 
+    fn push_arguments(
+        &mut self,
+        args: &[Expr],
+        params: &[Ty],
+        what: &str,
+    ) -> Result<(), CompileError> {
+        for (index, argument) in args.iter().enumerate() {
+            let actual = self.expr(argument)?;
+            Self::require(&actual, &params[index], what).map_err(|message| self.error(message))?;
+        }
+        Ok(())
+    }
+
     fn binary(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> Result<Ty, CompileError> {
-        match op {
-            BinaryOp::And | BinaryOp::Or => {
-                let end = self.emitter.label();
-                let done = self.emitter.label();
-                let ty = self.expr(left)?;
-                Self::require(&ty, &Ty::Bool, "logical operand")
-                    .map_err(|message| self.error(message))?;
-                let short_circuit = if matches!(op, BinaryOp::And) {
-                    OpCode::Brfalse
-                } else {
-                    OpCode::Brtrue
-                };
-                self.emitter.branch(short_circuit, end);
-                let ty = self.expr(right)?;
-                Self::require(&ty, &Ty::Bool, "logical operand")
-                    .map_err(|message| self.error(message))?;
-                self.emitter.branch(short_circuit, end);
-                self.emitter.ldc_i4(1);
-                self.emitter.branch(OpCode::Br, done);
-                self.emitter.mark(end);
-                self.emitter
-                    .ldc_i4(if matches!(op, BinaryOp::And) { 0 } else { 1 });
-                self.emitter.mark(done);
-                return Ok(Ty::Bool);
-            }
-            _ => {}
+        if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            let end = self.emitter.label();
+            let done = self.emitter.label();
+            let ty = self.expr(left)?;
+            Self::require(&ty, &Ty::Bool, "logical operand")
+                .map_err(|message| self.error(message))?;
+            let short_circuit = if matches!(op, BinaryOp::And) {
+                OpCode::Brfalse
+            } else {
+                OpCode::Brtrue
+            };
+            self.emitter.branch(short_circuit, end);
+            let ty = self.expr(right)?;
+            Self::require(&ty, &Ty::Bool, "logical operand")
+                .map_err(|message| self.error(message))?;
+            self.emitter.branch(short_circuit, end);
+            self.emitter.ldc_i4(1);
+            self.emitter.branch(OpCode::Br, done);
+            self.emitter.mark(end);
+            self.emitter
+                .ldc_i4(if matches!(op, BinaryOp::And) { 0 } else { 1 });
+            self.emitter.mark(done);
+            return Ok(Ty::Bool);
         }
 
         let left_ty = self.expr(left)?;
@@ -1777,17 +1912,20 @@ impl<'a> FnEmitter<'a> {
             && left_ty == Ty::String
             && right_ty == Ty::String
         {
-            let method = self.import_bcl_method(
-                "System.Runtime",
-                "System.String",
-                if matches!(op, BinaryOp::Equal) {
-                    "op_Equality"
-                } else {
-                    "op_Inequality"
-                },
-                MethodSig::new_static(TypeSig::BOOL, vec![TypeSig::STRING, TypeSig::STRING]),
-            )?;
-            self.emitter.call(method);
+            let method = if matches!(op, BinaryOp::Equal) {
+                "op_Equality"
+            } else {
+                "op_Inequality"
+            };
+            let entry = self
+                .module
+                .import_corlib_method(
+                    "System.String",
+                    method,
+                    MethodSig::new_static(TypeSig::BOOL, vec![TypeSig::STRING, TypeSig::STRING]),
+                )
+                .map_err(|error| self.error(error.to_string()))?;
+            self.emitter.call(entry);
             return Ok(Ty::Bool);
         }
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
@@ -1802,7 +1940,7 @@ impl<'a> FnEmitter<'a> {
             return Ok(Ty::Bool);
         }
         if matches!(op, BinaryOp::Add) && left_ty == Ty::String && right_ty == Ty::String {
-            let concat = self
+            let entry = self
                 .module
                 .import_corlib_method(
                     "System.String",
@@ -1810,7 +1948,7 @@ impl<'a> FnEmitter<'a> {
                     MethodSig::new_static(TypeSig::STRING, vec![TypeSig::STRING, TypeSig::STRING]),
                 )
                 .map_err(|error| self.error(error.to_string()))?;
-            self.emitter.call(concat);
+            self.emitter.call(entry);
             return Ok(Ty::String);
         }
         Self::require(&left_ty, &Ty::Int, "left operand").map_err(|message| self.error(message))?;
@@ -1877,147 +2015,158 @@ impl<'a> FnEmitter<'a> {
 
     fn call(
         &mut self,
-        receiver: Option<&str>,
+        receiver: Option<&Expr>,
         name: &str,
         args: &[Expr],
     ) -> Result<Ty, CompileError> {
         if let Some(receiver) = receiver {
-            let qualified = receiver.trim_start_matches("System.");
-            match (qualified, name) {
-                ("Console", "WriteLine") => {
-                    let ty = self.single_argument(args, name)?;
-                    let parameter = match ty {
-                        Ty::Int => TypeSig::INT32,
-                        Ty::Bool => TypeSig::BOOL,
-                        Ty::String => TypeSig::STRING,
-                        _ => return Err(self.error("Console.WriteLine has no supported overload")),
+            if let Expr::Name(receiver_name) = receiver {
+                let is_value = receiver_name == "this"
+                    || self.locals.contains_key(receiver_name)
+                    || self
+                        .params
+                        .iter()
+                        .any(|(parameter, _)| parameter == receiver_name)
+                    || {
+                        let current = self.current.clone();
+                        self.field_symbol(&current, receiver_name).is_some()
                     };
-                    let method = self.import_bcl_method(
-                        "System.Console",
-                        "System.Console",
-                        "WriteLine",
-                        MethodSig::new_static(TypeSig::VOID, vec![parameter]),
-                    )?;
-                    self.emitter.call(method);
-                    return Ok(Ty::Void);
+                if !is_value {
+                    if !self.types.contains_key(receiver_name) {
+                        if let Some(result) = self.bcl_call(receiver_name, name, args)? {
+                            return Ok(result);
+                        }
+                        return Err(self.error(format!("unknown type '{receiver_name}'")));
+                    }
+                    return self.static_call(receiver_name, name, args);
                 }
-                ("Console", "Write") => {
-                    let ty = self.single_argument(args, name)?;
-                    let parameter = match ty {
-                        Ty::String => TypeSig::STRING,
-                        Ty::Int => TypeSig::INT32,
-                        _ => return Err(self.error("Console.Write has no supported overload")),
-                    };
-                    let method = self.import_bcl_method(
-                        "System.Console",
-                        "System.Console",
-                        "Write",
-                        MethodSig::new_static(TypeSig::VOID, vec![parameter]),
-                    )?;
-                    self.emitter.call(method);
-                    return Ok(Ty::Void);
-                }
-                ("Math", "Max") | ("Math", "Min") => {
-                    self.expect_arity(args, 2, name)?;
-                    let ty = self.call_arguments(args)?;
-                    Self::require(&ty, &Ty::Int, name).map_err(|message| self.error(message))?;
-                    let method = self
-                        .module
-                        .import_corlib_method(
-                            "System.Math",
-                            name,
-                            MethodSig::new_static(
-                                TypeSig::INT32,
-                                vec![TypeSig::INT32, TypeSig::INT32],
-                            ),
-                        )
-                        .map_err(|error| self.error(error.to_string()))?;
-                    self.emitter.call(method);
-                    return Ok(Ty::Int);
-                }
-                ("Math", "Abs") => {
-                    let ty = self.single_argument(args, name)?;
-                    Self::require(&ty, &Ty::Int, name).map_err(|message| self.error(message))?;
-                    let method = self
-                        .module
-                        .import_corlib_method(
-                            "System.Math",
-                            "Abs",
-                            MethodSig::new_static(TypeSig::INT32, vec![TypeSig::INT32]),
-                        )
-                        .map_err(|error| self.error(error.to_string()))?;
-                    self.emitter.call(method);
-                    return Ok(Ty::Int);
-                }
-                ("Convert", "ToString") => {
-                    let ty = self.single_argument(args, name)?;
-                    Self::require(&ty, &Ty::Int, name).map_err(|message| self.error(message))?;
-                    let method = self
-                        .module
-                        .import_corlib_method(
-                            "System.Convert",
-                            "ToString",
-                            MethodSig::new_static(TypeSig::STRING, vec![TypeSig::INT32]),
-                        )
-                        .map_err(|error| self.error(error.to_string()))?;
-                    self.emitter.call(method);
-                    return Ok(Ty::String);
-                }
-                _ => {}
             }
-            return self.call_declared(Some(receiver), name, args);
+            let receiver_type = self.expr(receiver)?;
+            let Ty::Class(type_name) = receiver_type else {
+                return Err(self.error(format!("type {receiver_type:?} has no methods")));
+            };
+            let Some(method) = self.method_symbol(&type_name, name, args.len(), false) else {
+                return Err(self.error(format!(
+                    "no instance method '{name}' with {} parameter(s) on '{type_name}'",
+                    args.len()
+                )));
+            };
+            self.push_arguments(args, &method.params, "argument")?;
+            self.emitter.callvirt(method.entry);
+            return Ok(method.ret);
         }
-        self.call_declared(None, name, args)
+        if !self.is_static {
+            let current = self.current.clone();
+            if let Some(method) = self.method_symbol(&current, name, args.len(), false) {
+                self.emitter.ldarg(0);
+                self.push_arguments(args, &method.params, "argument")?;
+                self.emitter.callvirt(method.entry);
+                return Ok(method.ret);
+            }
+        }
+        let current = self.current.clone();
+        self.static_call(&current, name, args)
     }
 
-    fn call_declared(
+    fn static_call(
         &mut self,
-        receiver: Option<&str>,
+        type_name: &str,
         name: &str,
         args: &[Expr],
     ) -> Result<Ty, CompileError> {
-        let owner = receiver.unwrap_or(&self.current);
-        let Some(symbol) = self.symbols.get(owner) else {
-            return Err(self.error(format!("unknown type '{owner}'")));
-        };
-        let Some(method) = symbol
-            .methods
-            .iter()
-            .find(|method| method.name == name && method.params.len() == args.len())
-            .map(|method| MethodSymbol {
-                name: method.name.clone(),
-                is_static: method.is_static,
-                ret: method.ret.clone(),
-                params: method.params.clone(),
-                entry: method.entry.clone(),
-            })
-        else {
+        let Some(method) = self.method_symbol(type_name, name, args.len(), true) else {
             return Err(self.error(format!(
-                "no method '{name}' with {} parameter(s) on '{owner}'",
+                "no static method '{name}' with {} parameter(s) on '{type_name}'",
                 args.len()
             )));
         };
-        if !method.is_static {
-            if self.is_static || receiver.is_some() {
-                return Err(self.error(format!("instance method '{name}' requires an instance")));
-            }
-            self.emitter.ldarg(0);
-        }
-        for (index, argument) in args.iter().enumerate() {
-            let actual = self.expr(argument)?;
-            Self::require(&actual, &method.params[index], "argument")
-                .map_err(|message| self.error(message))?;
-        }
-        if method.is_static {
-            self.emitter.call(method.entry);
-        } else {
-            self.emitter.callvirt(method.entry);
-        }
+        self.push_arguments(args, &method.params, "argument")?;
+        self.emitter.call(method.entry);
         Ok(method.ret)
     }
 
-    /// Imports a method from a framework assembly, adding the assembly
-    /// reference on demand. `System.Console` lives outside corelib.
+    fn bcl_call(
+        &mut self,
+        receiver: &str,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<Option<Ty>, CompileError> {
+        let qualified = receiver.trim_start_matches("System.");
+        let result = match (qualified, name) {
+            ("Console", "WriteLine") => {
+                let ty = self.single_argument(args, name)?;
+                let parameter = match ty {
+                    Ty::Int => TypeSig::INT32,
+                    Ty::Bool => TypeSig::BOOL,
+                    Ty::String => TypeSig::STRING,
+                    _ => return Err(self.error("Console.WriteLine has no supported overload")),
+                };
+                let entry = self.import_bcl_method(
+                    "System.Console",
+                    "System.Console",
+                    "WriteLine",
+                    MethodSig::new_static(TypeSig::VOID, vec![parameter]),
+                )?;
+                self.emitter.call(entry);
+                Ty::Void
+            }
+            ("Console", "Write") => {
+                let ty = self.single_argument(args, name)?;
+                let parameter = match ty {
+                    Ty::Int => TypeSig::INT32,
+                    Ty::String => TypeSig::STRING,
+                    _ => return Err(self.error("Console.Write has no supported overload")),
+                };
+                let entry = self.import_bcl_method(
+                    "System.Console",
+                    "System.Console",
+                    "Write",
+                    MethodSig::new_static(TypeSig::VOID, vec![parameter]),
+                )?;
+                self.emitter.call(entry);
+                Ty::Void
+            }
+            ("Math", "Max") | ("Math", "Min") => {
+                self.expect_arity(args, 2, name)?;
+                self.push_arguments(args, &[Ty::Int, Ty::Int], name)?;
+                let entry = self.import_bcl_method(
+                    "System.Runtime",
+                    "System.Math",
+                    name,
+                    MethodSig::new_static(TypeSig::INT32, vec![TypeSig::INT32, TypeSig::INT32]),
+                )?;
+                self.emitter.call(entry);
+                Ty::Int
+            }
+            ("Math", "Abs") => {
+                self.expect_arity(args, 1, name)?;
+                self.push_arguments(args, &[Ty::Int], name)?;
+                let entry = self.import_bcl_method(
+                    "System.Runtime",
+                    "System.Math",
+                    name,
+                    MethodSig::new_static(TypeSig::INT32, vec![TypeSig::INT32]),
+                )?;
+                self.emitter.call(entry);
+                Ty::Int
+            }
+            ("Convert", "ToString") => {
+                self.expect_arity(args, 1, name)?;
+                self.push_arguments(args, &[Ty::Int], name)?;
+                let entry = self.import_bcl_method(
+                    "System.Runtime",
+                    "System.Convert",
+                    "ToString",
+                    MethodSig::new_static(TypeSig::STRING, vec![TypeSig::INT32]),
+                )?;
+                self.emitter.call(entry);
+                Ty::String
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(result))
+    }
+
     fn import_bcl_method(
         &mut self,
         assembly: &str,
@@ -2067,16 +2216,9 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
-    fn call_arguments(&mut self, args: &[Expr]) -> Result<Ty, CompileError> {
-        let mut last = Ty::Void;
-        for argument in args {
-            last = self.expr(argument)?;
-        }
-        Ok(last)
-    }
-
     fn field_store(&mut self, field: &FieldDecl, value: &Expr) -> Result<(), CompileError> {
-        let Some(symbol) = self.field_symbol(&field.name) else {
+        let current = self.current.clone();
+        let Some(symbol) = self.field_symbol(&current, &field.name) else {
             return Err(self.error(format!("unknown field '{}'", field.name)));
         };
         if symbol.is_static {
@@ -2098,64 +2240,5 @@ impl<'a> FnEmitter<'a> {
             ));
         }
         Ok(())
-    }
-}
-
-impl<'a> FnEmitter<'a> {
-    /// Assignment used as a value: the value stays on the stack for the caller.
-    fn assign_expression(&mut self, name: &str, value: &Expr) -> Result<Ty, CompileError> {
-        if let Some((index, ty)) = self.locals.get(name).cloned() {
-            let actual = self.expr(value)?;
-            Self::require(&actual, &ty, &format!("assignment to '{name}'"))
-                .map_err(|message| self.error(message))?;
-            if ty == Ty::Void {
-                return Err(self.error("cannot assign a void expression"));
-            }
-            self.emitter.dup();
-            self.emitter.stloc(index);
-            return Ok(ty);
-        }
-        if let Some(position) = self
-            .params
-            .iter()
-            .position(|(parameter, _)| parameter == name)
-        {
-            let ty = self.params[position].1.clone();
-            let actual = self.expr(value)?;
-            Self::require(&actual, &ty, &format!("assignment to '{name}'"))
-                .map_err(|message| self.error(message))?;
-            self.emitter.dup();
-            self.emitter.starg(self.argument_index(position));
-            return Ok(ty);
-        }
-        let Some(field) = self.field_symbol(name) else {
-            return Err(self.error(format!("undefined identifier '{name}'")));
-        };
-        if field.is_static {
-            let actual = self.expr(value)?;
-            Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
-                .map_err(|message| self.error(message))?;
-            self.emitter.dup();
-            self.emitter.emit(Instruction::new(
-                OpCode::Stsfld,
-                Operand::Token(MemberToken::Field(field.entry)),
-            ));
-            return Ok(field.ty);
-        }
-        if self.is_static {
-            return Err(self.error(format!(
-                "instance field '{name}' cannot be used from a static method"
-            )));
-        }
-        self.emitter.ldarg(0);
-        let actual = self.expr(value)?;
-        Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
-            .map_err(|message| self.error(message))?;
-        self.emitter.dup();
-        self.emitter.emit(Instruction::new(
-            OpCode::Stfld,
-            Operand::Token(MemberToken::Field(field.entry)),
-        ));
-        Ok(field.ty)
     }
 }
