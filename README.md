@@ -23,6 +23,7 @@
 | 对照工具 | tree-sitter C# 用于独立的语法实验；Roslyn 使用本机 .NET 10 SDK 自带程序集作为参考。 |
 | csc 兼容前端 | 解析 `@响应文件`（引号、`#` 注释、嵌套与环检测）以及 Unity/HotReload233 实际传入的选项；诊断按 `path(line,col): error CODE: message` 输出，退出码 0/1；`-report:<path>` 写出机器可读报告。多文件、非 library 目标、签名与资源等未实现能力明确拒绝，且不产出程序集。 |
 | HotReload233 接入 | 接入点已确认为 csc 进程契约；本仓库暂不改动 HotReload233，待语言覆盖达标后再接。 |
+| 真实工程度量 | `benchmarks/compile-survey.ps1` 用 `-reference` 指向工程 `Library/ScriptAssemblies`，抽样编译真实脚本并统计失败原因分布 |
 | 差分门禁 | 以 Roslyn 为 oracle 对同一批 `.cs` 双编译，输出 accept / reject / false_reject / false_accept 分类与覆盖率；false_accept 默认上限为 0。 |
 
 受限编译器只接受 ASCII 源码、顶层 `class`，其中包含 `static int` 方法、`int` 参数，以及每个方法中一条 `return`。表达式支持参数、`int` 范围内的十进制常量、括号和二元 `+ - * /`。输出为库而非可直接启动的程序；不支持预处理、泛型、引用程序集、跨方法调用、调试信息或 VB。语法检查通过不代表程序通过了语义检查。
@@ -116,7 +117,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 接口：`interface` 声明（抽象方法、无方法体）、类实现接口（`InterfaceImpl` + 隐式实现标记为 `virtual final newslot`）、接口类型变量与 `callvirt` 派发
 - 静态/实例方法、参数，重载按参数个数解析
 - 语句：局部声明、赋值、`if/else`、`while`、`for`、`return`、`break`/`continue`、块
-- 表达式：`int/bool/string` 字面量、标识符、算术、比较（含字符串/布尔相等）、`&&/||` 短路、`!`、`++`/`--`、字符串 `+` 拼接、赋值表达式
+- 表达式：`int/float/bool/string` 与 `null` 字面量、`enum` 常量、算术与比较（含字符串/布尔相等、`== null`）、`&&/||` 短路、`??`、`!`、`++`/`--`、`+=`/`-=` 等复合赋值、字符串 `+` 拼接、赋值表达式、`string.Empty`/`int.MaxValue` 等预定义成员
 - 外部引用：`-reference:` 指定的程序集参与类型与方法解析（全名、唯一短名、`System.Text.Regex` 这类限定名），跨程序集静态/实例调用可用；`tests/compile.ps1` 会对 `System.Text.RegularExpressions` 做真实框架调用对照
 - 调用：本程序集的静态/实例方法与构造函数；BCL 的 `System.Math.Max/Min/Abs`、`System.Convert.ToString`、`System.String.Concat`、`System.Console.Write/WriteLine`（按需添加 `System.Console` 程序集引用）
 

@@ -69,8 +69,10 @@ fn line_column(source: &str, offset: usize) -> (usize, usize) {
 enum Ty {
     Void,
     Int,
+    Float,
     Bool,
     String,
+    Null,
     Class(String),
     Array(Box<Ty>),
     Named(String),
@@ -79,6 +81,7 @@ enum Ty {
 #[derive(Debug)]
 struct Program {
     types: Vec<TypeDecl>,
+    enums: EnumValues,
 }
 
 #[derive(Debug)]
@@ -168,6 +171,11 @@ enum Stmt {
     },
     Empty,
     Block(Block),
+    AssignOp {
+        name: String,
+        op: String,
+        value: Expr,
+    },
     Break,
     Continue,
     AssignMember {
@@ -208,12 +216,15 @@ enum BinaryOp {
 #[derive(Debug)]
 enum Expr {
     Int(i32),
+    Float(f32),
+    Null,
     Bool(bool),
     Str(String),
     Name(String),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
     Negate(Box<Expr>),
     Not(Box<Expr>),
+    Coalesce(Box<Expr>, Box<Expr>),
     Call {
         receiver: Option<Box<Expr>>,
         name: String,
@@ -251,10 +262,19 @@ pub fn compile(
     assembly_name: &str,
     references: &[String],
 ) -> Result<Vec<u8>, CompileError> {
-    let mut program = Program { types: Vec::new() };
+    let mut program = Program {
+        types: Vec::new(),
+        enums: HashMap::new(),
+    };
+    // Enums are compile-time constants, so their names must be known before any
+    // file is parsed regardless of declaration order.
     for (file, text) in sources {
-        let parsed = parse_file(file, text)?;
-        program.types.extend(parsed);
+        let (_, enums) = parse_file(file, text, &program.enums)?;
+        program.enums.extend(enums);
+    }
+    for (file, text) in sources {
+        let (types, _) = parse_file(file, text, &program.enums)?;
+        program.types.extend(types);
     }
     emit(&program, assembly_name, sources, references)
 }
@@ -352,23 +372,33 @@ impl Externals {
 // ---------------------------------------------------------------- parsing
 
 struct Parser<'a> {
+    enums: EnumValues,
     file: &'a str,
     source: &'a str,
     tokens: Vec<syntax::Token>,
     position: usize,
 }
 
-fn parse_file(file: &str, source: &str) -> Result<Vec<TypeDecl>, CompileError> {
+type EnumValues = HashMap<String, HashMap<String, i32>>;
+
+fn parse_file(
+    file: &str,
+    source: &str,
+    enums: &HashMap<String, HashMap<String, i32>>,
+) -> Result<(Vec<TypeDecl>, EnumValues), CompileError> {
     let tokens = syntax::lex(source).map_err(|error: SyntaxError| {
         CompileError::new(file, source, error.offset, error.message)
     })?;
     let mut parser = Parser {
+        enums: enums.clone(),
         file,
         source,
         tokens,
         position: 0,
     };
-    parser.parse_unit()
+    let types = parser.parse_unit()?;
+    let enums = std::mem::take(&mut parser.enums);
+    Ok((types, enums))
 }
 
 impl<'a> Parser<'a> {
@@ -486,6 +516,9 @@ impl<'a> Parser<'a> {
                 | "abstract" | "partial" | "unsafe" | "readonly" => {
                     self.bump();
                 }
+                "enum" => {
+                    self.parse_enum_declaration()?;
+                }
                 "class" | "struct" | "interface" | "record" => {
                     types.push(self.parse_type(&namespace)?);
                     if self.check("}") && !namespace.is_empty() {
@@ -510,10 +543,40 @@ impl<'a> Parser<'a> {
         let name = self.parse_qualified_name()?;
         Ok(match name.as_str() {
             "int" => Ty::Int,
+            "float" => Ty::Float,
             "bool" => Ty::Bool,
             "string" | "String" => Ty::String,
+            other if self.enums.contains_key(other) => Ty::Int,
             other => Ty::Class(other.to_string()),
         })
+    }
+
+    fn parse_enum_declaration(&mut self) -> Result<(), CompileError> {
+        self.bump(); // enum
+        let name = self.identifier()?;
+        if self.eat(":") {
+            self.parse_qualified_name()?;
+        }
+        self.expect("{")?;
+        let mut values = HashMap::new();
+        let mut next = 0i32;
+        while !self.check("}") && !self.at_end() {
+            let member = self.identifier()?;
+            if self.eat("=")
+                && let Expr::Int(value) = self.parse_expression()?
+            {
+                next = value;
+            }
+            values.insert(member, next);
+            next += 1;
+            if !self.eat(",") {
+                break;
+            }
+        }
+        self.eat(",");
+        self.expect("}")?;
+        self.enums.insert(name, values);
+        Ok(())
     }
 
     fn parse_qualified_name(&mut self) -> Result<String, CompileError> {
@@ -778,8 +841,10 @@ impl<'a> Parser<'a> {
         let mut ty = match name.as_str() {
             "void" => Ty::Void,
             "int" => Ty::Int,
+            "float" => Ty::Float,
             "bool" => Ty::Bool,
             "string" | "String" => Ty::String,
+            other if self.enums.contains_key(other) => Ty::Int,
             other => Ty::Class(other.to_string()),
         };
         // Generic/array suffixes are accepted for signature compatibility but
@@ -955,6 +1020,27 @@ impl<'a> Parser<'a> {
             self.expect(";")?;
             return Ok(Stmt::Local { ty, name, init });
         }
+        // Compound assignment: `name += expr;`
+        if self.token().kind == syntax::TokenKind::Identifier
+            && matches!(
+                self.peek(1),
+                Some("+=")
+                    | Some("-=")
+                    | Some("*=")
+                    | Some("/=")
+                    | Some("%=")
+                    | Some("&=")
+                    | Some("|=")
+                    | Some("^=")
+            )
+        {
+            let name = self.identifier()?;
+            let op = self.text().to_string();
+            self.bump();
+            let value = self.parse_expression()?;
+            self.expect(";")?;
+            return Ok(Stmt::AssignOp { name, op, value });
+        }
         // Assignment: `name = expr;`
         if self.token().kind == syntax::TokenKind::Identifier && self.peek(1) == Some("=") {
             let name = self.identifier()?;
@@ -1013,6 +1099,16 @@ impl<'a> Parser<'a> {
                 value: Box::new(value),
             });
         }
+        let mut left = self.parse_coalesce()?;
+        while self.check("??") {
+            self.bump();
+            let right = self.parse_coalesce()?;
+            left = Expr::Coalesce(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_coalesce(&mut self) -> Result<Expr, CompileError> {
         self.parse_logical_or()
     }
 
@@ -1233,12 +1329,32 @@ impl<'a> Parser<'a> {
                 let text = self.text().to_string();
                 self.bump();
                 let cleaned = text.replace('_', "");
-                let value = cleaned
-                    .trim_end_matches(['u', 'U', 'l', 'L'])
-                    .parse::<i32>()
-                    .map_err(|_| {
-                        self.error(format!("integer literal '{text}' is not supported"))
+                let is_float = cleaned.contains('.')
+                    || cleaned.contains('e')
+                    || cleaned.contains('E')
+                    || cleaned.ends_with(['f', 'F', 'd', 'D', 'm', 'M']);
+                if is_float {
+                    let numeric = cleaned.trim_end_matches(['f', 'F', 'd', 'D', 'm', 'M']);
+                    let value = numeric.parse::<f32>().map_err(|_| {
+                        self.error(format!("float literal '{text}' is not supported"))
                     })?;
+                    return Ok(Expr::Float(value));
+                }
+                let trimmed = cleaned.trim_end_matches(['u', 'U', 'l', 'L']);
+                let value = if let Some(hex) = trimmed
+                    .strip_prefix("0x")
+                    .or_else(|| trimmed.strip_prefix("0X"))
+                {
+                    i32::from_str_radix(hex, 16)
+                } else if let Some(bin) = trimmed
+                    .strip_prefix("0b")
+                    .or_else(|| trimmed.strip_prefix("0B"))
+                {
+                    i32::from_str_radix(bin, 2)
+                } else {
+                    trimmed.parse::<i32>()
+                }
+                .map_err(|_| self.error(format!("integer literal '{text}' is not supported")))?;
                 Ok(Expr::Int(value))
             }
             syntax::TokenKind::String => {
@@ -1264,6 +1380,10 @@ impl<'a> Parser<'a> {
                 }
             }
             syntax::TokenKind::Keyword => match self.text() {
+                "null" => {
+                    self.bump();
+                    Ok(Expr::Null)
+                }
                 "true" => {
                     self.bump();
                     Ok(Expr::Bool(true))
@@ -1271,6 +1391,30 @@ impl<'a> Parser<'a> {
                 "false" => {
                     self.bump();
                     Ok(Expr::Bool(false))
+                }
+                other
+                    if matches!(
+                        other,
+                        "string"
+                            | "int"
+                            | "bool"
+                            | "float"
+                            | "double"
+                            | "long"
+                            | "short"
+                            | "byte"
+                            | "object"
+                            | "char"
+                            | "uint"
+                            | "ulong"
+                            | "ushort"
+                            | "sbyte"
+                            | "decimal"
+                    ) =>
+                {
+                    // Predefined type used as a receiver: `string.Empty`.
+                    self.bump();
+                    Ok(Expr::Name(other.to_string()))
                 }
                 other => Err(self.error(format!("'{other}' is not supported in expressions"))),
             },
@@ -1342,6 +1486,7 @@ struct MethodSymbol {
     entry: Entry<Method>,
 }
 
+#[derive(Clone)]
 struct PropertySymbol {
     ty: Ty,
     is_static: bool,
@@ -1398,6 +1543,8 @@ fn resolve_type(
     Ok(match ty {
         Ty::Void => TypeSig::VOID,
         Ty::Int => TypeSig::INT32,
+        Ty::Float => TypeSig::Primitive(PrimitiveType::R4),
+        Ty::Null => return Err("null has no type of its own".to_string()),
         Ty::Bool => TypeSig::BOOL,
         Ty::String => TypeSig::STRING,
         Ty::Class(name) => match types.get(name) {
@@ -1823,6 +1970,7 @@ fn emit(
         let body = emit_body(
             &mut module,
             &externals,
+            &program.enums,
             effective[index].0.as_ref(),
             &types,
             &symbols,
@@ -1855,6 +2003,7 @@ enum Job {
 fn emit_body(
     module: &mut Module,
     externals: &Externals,
+    enums: &HashMap<String, HashMap<String, i32>>,
     base: Option<&String>,
     types: &HashMap<String, Entry<TypeDef>>,
     symbols: &HashMap<String, TypeSymbol>,
@@ -1875,6 +2024,7 @@ fn emit_body(
         is_static: true,
         return_ty: Ty::Void,
         externals,
+        enums,
         base: base.cloned(),
         locals: HashMap::new(),
         params: Vec::new(),
@@ -2006,6 +2156,7 @@ struct FnEmitter<'a> {
     is_static: bool,
     return_ty: Ty,
     externals: &'a Externals,
+    enums: &'a EnumValues,
     base: Option<String>,
     locals: HashMap<String, (u16, Ty)>,
     params: Vec<(String, Ty)>,
@@ -2141,6 +2292,9 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn require_assignable(&self, actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
+        if *actual == Ty::Null && matches!(expected, Ty::String | Ty::Class(_) | Ty::Array(_)) {
+            return Ok(());
+        }
         if self.assignable(actual, expected) {
             Ok(())
         } else {
@@ -2197,6 +2351,92 @@ impl<'a> FnEmitter<'a> {
                 Ok(())
             }
             Stmt::Assign { name, value } => self.assign(name, value),
+            Stmt::AssignOp { name, op, value } => {
+                let opcode = match op.as_str() {
+                    "+=" => OpCode::Add,
+                    "-=" => OpCode::Sub,
+                    "*=" => OpCode::Mul,
+                    "/=" => OpCode::Div,
+                    "%=" => OpCode::Rem,
+                    "&=" => OpCode::And,
+                    "|=" => OpCode::Or,
+                    "^=" => OpCode::Xor,
+                    other => return Err(self.error(format!("unsupported operator '{other}'"))),
+                };
+                let current = self.current.clone();
+                if let Some(field) = self.field_symbol(&current, name)
+                    && !field.is_static
+                {
+                    if self.is_static {
+                        return Err(self.error(format!(
+                            "instance field '{name}' cannot be used from a static method"
+                        )));
+                    }
+                    // Keep the receiver for the final stfld: [this, this, value].
+                    self.emitter.ldarg(0);
+                    self.emitter.dup();
+                    self.emitter.emit(Instruction::new(
+                        OpCode::Ldfld,
+                        Operand::Token(MemberToken::Field(field.entry.clone())),
+                    ));
+                    let rhs = self.expr(value)?;
+                    self.require_assignable(&rhs, &field.ty, "compound assignment")
+                        .map_err(|message| self.error(message))?;
+                    self.emitter.op(opcode);
+                    self.emitter.emit(Instruction::new(
+                        OpCode::Stfld,
+                        Operand::Token(MemberToken::Field(field.entry)),
+                    ));
+                    return Ok(());
+                }
+                let current = self.current.clone();
+                let property = self
+                    .symbols
+                    .get(&current)
+                    .and_then(|symbol| symbol.properties.get(name))
+                    .map(|property| {
+                        (
+                            property.ty.clone(),
+                            property.getter.clone(),
+                            property.setter.clone(),
+                        )
+                    });
+                if let Some((ty, getter, setter)) = property {
+                    if self.is_static {
+                        return Err(self.error(format!(
+                            "compound assignment to static property '{name}' is not supported yet"
+                        )));
+                    }
+                    let Some(getter) = getter else {
+                        return Err(self.error(format!("property '{name}' has no getter")));
+                    };
+                    let Some(setter) = setter else {
+                        return Err(self.error(format!("property '{name}' has no setter")));
+                    };
+                    self.emitter.ldarg(0);
+                    self.emitter.callvirt(getter);
+                    let rhs = self.expr(value)?;
+                    self.require_assignable(&rhs, &ty, "compound assignment")
+                        .map_err(|message| self.error(message))?;
+                    self.emitter.op(opcode);
+                    let signature =
+                        resolve_type(&ty, self.types, self.externals, &mut *self.module)
+                            .map_err(|message| self.error(message))?;
+                    let temporary = self.emitter.declare_local(signature);
+                    self.emitter.stloc(temporary);
+                    self.emitter.ldarg(0);
+                    self.emitter.ldloc(temporary);
+                    self.emitter.callvirt(setter);
+                    return Ok(());
+                }
+                let ty = self.load(name)?;
+                let rhs = self.expr(value)?;
+                self.require_assignable(&rhs, &ty, "compound assignment")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.op(opcode);
+                self.store_top(name)?;
+                Ok(())
+            }
             Stmt::AssignIndex {
                 target,
                 index,
@@ -2556,7 +2796,30 @@ impl<'a> FnEmitter<'a> {
             return Ok(ty);
         }
         let Some(field) = self.field_symbol(&self.current.clone(), name) else {
-            return Err(self.error(format!("undefined identifier '{name}'")));
+            let current = self.current.clone();
+            let property = self
+                .symbols
+                .get(&current)
+                .and_then(|symbol| symbol.properties.get(name))
+                .cloned();
+            let Some(property) = property else {
+                return Err(self.error(format!("undefined identifier '{name}'")));
+            };
+            let Some(getter) = property.getter else {
+                return Err(self.error(format!("property '{name}' has no getter")));
+            };
+            if property.is_static {
+                self.emitter.call(getter);
+            } else {
+                if self.is_static {
+                    return Err(self.error(format!(
+                        "instance property '{name}' cannot be used from a static method"
+                    )));
+                }
+                self.emitter.ldarg(0);
+                self.emitter.callvirt(getter);
+            }
+            return Ok(property.ty);
         };
         if field.is_static {
             self.emitter.emit(Instruction::new(
@@ -2668,9 +2931,18 @@ impl<'a> FnEmitter<'a> {
             return Err(self.error(format!("undefined identifier '{name}'")));
         };
         if !field.is_static {
-            return Err(self.error(format!(
-                "incrementing instance field '{name}' is not supported yet"
-            )));
+            if self.is_static {
+                return Err(self.error(format!(
+                    "instance field '{name}' cannot be used from a static method"
+                )));
+            }
+            // `load` already pushed the receiver, so the value on top is stored
+            // against it: [this, value] -> stfld.
+            self.emitter.emit(Instruction::new(
+                OpCode::Stfld,
+                Operand::Token(MemberToken::Field(field.entry)),
+            ));
+            return Ok(());
         }
         self.emitter.emit(Instruction::new(
             OpCode::Stsfld,
@@ -2687,6 +2959,15 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.ldc_i4(*value);
                 Ok(Ty::Int)
             }
+            Expr::Null => {
+                self.emitter.ldnull();
+                Ok(Ty::Null)
+            }
+            Expr::Float(value) => {
+                self.emitter
+                    .emit(Instruction::new(OpCode::Ldc_R4, Operand::Float32(*value)));
+                Ok(Ty::Float)
+            }
             Expr::Bool(value) => {
                 self.emitter.ldc_i4(i32::from(*value));
                 Ok(Ty::Bool)
@@ -2702,6 +2983,18 @@ impl<'a> FnEmitter<'a> {
                     .map_err(|message| self.error(message))?;
                 self.emitter.op(OpCode::Neg);
                 Ok(Ty::Int)
+            }
+            Expr::Coalesce(left, right) => {
+                let ty = self.expr(left)?;
+                let end = self.emitter.label();
+                self.emitter.dup();
+                self.emitter.branch(OpCode::Brtrue, end);
+                self.emitter.pop();
+                let right_ty = self.expr(right)?;
+                self.require_assignable(&right_ty, &ty, "??")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.mark(end);
+                Ok(ty)
             }
             Expr::Not(inner) => {
                 let ty = self.expr(inner)?;
@@ -2804,6 +3097,14 @@ impl<'a> FnEmitter<'a> {
                 TypeDefOrRef::TypeRef(entry) => Ok(MemberToken::TypeRef(entry)),
                 _ => Err(self.error("System.Boolean is not a type reference")),
             },
+            Ty::Float => match self
+                .module
+                .corlib_type("System.Single")
+                .map_err(|error| self.error(error.to_string()))?
+            {
+                TypeDefOrRef::TypeRef(entry) => Ok(MemberToken::TypeRef(entry)),
+                _ => Err(self.error("System.Single is not a type reference")),
+            },
             Ty::String => match self
                 .module
                 .corlib_type("System.String")
@@ -2817,6 +3118,41 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn member_read(&mut self, target: &Expr, name: &str) -> Result<Ty, CompileError> {
+        if let Expr::Name(type_name) = target
+            && let Some(values) = self.enums.get(type_name)
+        {
+            let Some(value) = values.get(name) else {
+                return Err(self.error(format!("enum '{type_name}' has no member '{name}'")));
+            };
+            self.emitter.ldc_i4(*value);
+            return Ok(Ty::Int);
+        }
+        if let Expr::Name(builtin) = target
+            && !self.types.contains_key(builtin)
+        {
+            let is_value = self.locals.contains_key(builtin)
+                || self
+                    .params
+                    .iter()
+                    .any(|(parameter, _)| parameter == builtin);
+            if !is_value {
+                match (builtin.as_str(), name) {
+                    ("string", "Empty") => {
+                        self.emitter.ldstr("");
+                        return Ok(Ty::String);
+                    }
+                    ("int", "MaxValue") => {
+                        self.emitter.ldc_i4(i32::MAX);
+                        return Ok(Ty::Int);
+                    }
+                    ("int", "MinValue") => {
+                        self.emitter.ldc_i4(i32::MIN);
+                        return Ok(Ty::Int);
+                    }
+                    _ => {}
+                }
+            }
+        }
         // `Type.StaticProperty` does not evaluate the type name as a value.
         if let Expr::Name(type_name) = target
             && self.types.contains_key(type_name)
@@ -2936,6 +3272,17 @@ impl<'a> FnEmitter<'a> {
             return Ok(Ty::Bool);
         }
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && (left_ty == Ty::Null || right_ty == Ty::Null)
+        {
+            // Reference comparison against null: `node == null`.
+            self.emitter.op(OpCode::Ceq);
+            if matches!(op, BinaryOp::NotEqual) {
+                self.emitter.ldc_i4(0);
+                self.emitter.op(OpCode::Ceq);
+            }
+            return Ok(Ty::Bool);
+        }
+        if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && left_ty == Ty::Bool
             && right_ty == Ty::Bool
         {
@@ -2958,10 +3305,14 @@ impl<'a> FnEmitter<'a> {
             self.emitter.call(entry);
             return Ok(Ty::String);
         }
-        self.require_assignable(&left_ty, &Ty::Int, "left operand")
-            .map_err(|message| self.error(message))?;
-        self.require_assignable(&right_ty, &Ty::Int, "right operand")
-            .map_err(|message| self.error(message))?;
+        if !matches!(
+            (&left_ty, &right_ty),
+            (Ty::Float, Ty::Float) | (Ty::Int, Ty::Int)
+        ) {
+            return Err(self.error(format!(
+                "operands are {left_ty:?} and {right_ty:?}; mixed or non-numeric arithmetic is not supported yet"
+            )));
+        }
         match op {
             BinaryOp::Add => {
                 self.emitter.op(OpCode::Add);
@@ -3004,21 +3355,22 @@ impl<'a> FnEmitter<'a> {
             }
             BinaryOp::And | BinaryOp::Or => unreachable!(),
         }
-        Ok(
-            if matches!(
-                op,
-                BinaryOp::Equal
-                    | BinaryOp::NotEqual
-                    | BinaryOp::Less
-                    | BinaryOp::Greater
-                    | BinaryOp::LessOrEqual
-                    | BinaryOp::GreaterOrEqual
-            ) {
-                Ty::Bool
-            } else {
-                Ty::Int
-            },
-        )
+        if matches!(
+            op,
+            BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::Less
+                | BinaryOp::Greater
+                | BinaryOp::LessOrEqual
+                | BinaryOp::GreaterOrEqual
+        ) {
+            return Ok(Ty::Bool);
+        }
+        Ok(if left_ty == Ty::Float {
+            Ty::Float
+        } else {
+            Ty::Int
+        })
     }
 
     /// Reconstructs `A.B.C` from a member chain so qualified type names resolve.
@@ -3176,6 +3528,7 @@ impl<'a> FnEmitter<'a> {
                 let ty = self.single_argument(args, name)?;
                 let parameter = match ty {
                     Ty::Int => TypeSig::INT32,
+                    Ty::Float => TypeSig::Primitive(PrimitiveType::R4),
                     Ty::Bool => TypeSig::BOOL,
                     Ty::String => TypeSig::STRING,
                     _ => return Err(self.error("Console.WriteLine has no supported overload")),
@@ -3193,6 +3546,7 @@ impl<'a> FnEmitter<'a> {
                 let ty = self.single_argument(args, name)?;
                 let parameter = match ty {
                     Ty::Int => TypeSig::INT32,
+                    Ty::Float => TypeSig::Primitive(PrimitiveType::R4),
                     Ty::String => TypeSig::STRING,
                     _ => return Err(self.error("Console.Write has no supported overload")),
                 };

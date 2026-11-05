@@ -56,6 +56,24 @@ namespace Demo
             total = total + shape.Area() + shape.Tag();
             INamed named = square;
             total = total + named.Score();
+
+            Extras extras = new Extras();
+            extras.Bump(2);
+            extras.Bump(3);
+            total = total + extras.Total;
+            if (extras.Scaled(2.0f) > 0.5f)
+            {
+                total += 1;
+            }
+            if (extras.Note("none") == "none")
+            {
+                total += 1;
+            }
+            Tier tier = Tier.Pro;
+            if (tier == Tier.Pro)
+            {
+                total += 1;
+            }
             return total;
         }
     }
