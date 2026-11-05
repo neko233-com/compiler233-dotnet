@@ -51,8 +51,11 @@ namespace Demo
             }
             total = total + sum + values.Length;
 
-            Shape shape = new Square();
+            Square square = new Square();
+            Shape shape = square;
             total = total + shape.Area() + shape.Tag();
+            INamed named = square;
+            total = total + named.Score();
             return total;
         }
     }

@@ -10,7 +10,7 @@ use hao::{
     Module,
     dotnet::entries::Version,
     dotnet::{
-        entries::{Entry, Field, Method, Param, TypeDef, TypeDefOrRef},
+        entries::{Entry, Field, InterfaceImpl, Method, Param, TypeDef, TypeDefOrRef},
         il::{EmitLabel, Emitter, Instruction, MemberToken, MethodBody, OpCode, Operand},
         md::streams::tables_stream::{FieldFlags, MethodFlags, TypeAttributes},
         module::{ModuleKind, TargetRuntime},
@@ -88,6 +88,8 @@ struct TypeDecl {
     namespace: String,
     name: String,
     base: Option<String>,
+    interfaces: Vec<String>,
+    is_interface: bool,
     fields: Vec<FieldDecl>,
     methods: Vec<MethodDecl>,
     properties: Vec<PropertyDecl>,
@@ -485,9 +487,6 @@ impl<'a> Parser<'a> {
                     self.bump();
                 }
                 "class" | "struct" | "interface" | "record" => {
-                    if self.check("interface") {
-                        return Err(self.error("interfaces are not supported yet"));
-                    }
                     types.push(self.parse_type(&namespace)?);
                     if self.check("}") && !namespace.is_empty() {
                         self.bump();
@@ -540,15 +539,16 @@ impl<'a> Parser<'a> {
 
     fn parse_type(&mut self, namespace: &str) -> Result<TypeDecl, CompileError> {
         let class_offset = self.token().start;
-        self.bump(); // class / struct / record
+        let is_interface = self.check("interface");
+        self.bump(); // class / struct / interface / record
         if self.check("record") {
             self.bump();
         }
         let name = self.identifier()?;
         let mut base = None;
+        let mut interfaces = Vec::new();
         if self.eat(":") {
-            // The first entry is the base class; extra entries are interfaces,
-            // which the bounded core records but does not implement yet.
+            // The first entry is the base class, the rest are interfaces.
             loop {
                 let entry = self.parse_qualified_name()?;
                 if self.check("<") {
@@ -556,11 +556,17 @@ impl<'a> Parser<'a> {
                 }
                 if base.is_none() {
                     base = Some(entry);
+                } else {
+                    interfaces.push(entry);
                 }
                 if !self.eat(",") {
                     break;
                 }
             }
+        }
+        if is_interface {
+            // Interfaces have no base class; every listed type is a base interface.
+            interfaces.extend(base.take());
         }
         let mut decl = TypeDecl {
             file: self.file.to_string(),
@@ -568,6 +574,8 @@ impl<'a> Parser<'a> {
             namespace: namespace.to_string(),
             name,
             base,
+            interfaces,
+            is_interface,
             fields: Vec::new(),
             methods: Vec::new(),
             properties: Vec::new(),
@@ -1344,6 +1352,7 @@ struct PropertySymbol {
 #[derive(Default)]
 struct TypeSymbol {
     base: Option<String>,
+    interfaces: Vec<String>,
     fields: HashMap<String, FieldSymbol>,
     methods: Vec<MethodSymbol>,
     ctors: Vec<MethodSymbol>,
@@ -1447,17 +1456,58 @@ fn emit(
             ));
         }
         let entry = module.add_type(TypeDef::new(
-            TypeAttributes::Public | TypeAttributes::BeforeFieldInit,
+            if decl.is_interface {
+                TypeAttributes::Public | TypeAttributes::Interface | TypeAttributes::Abstract
+            } else {
+                TypeAttributes::Public | TypeAttributes::BeforeFieldInit
+            },
             &decl.namespace,
             &decl.name,
-            Some(object.clone()),
+            if decl.is_interface {
+                None
+            } else {
+                Some(object.clone())
+            },
         ));
         types.insert(decl.name.clone(), entry);
     }
 
+    // A type listed first in the base list may still be an interface
+    // (`class X : IFoo`), which has no extends entry.
+    let local_interfaces: std::collections::HashSet<String> = program
+        .types
+        .iter()
+        .filter(|decl| decl.is_interface)
+        .map(|decl| decl.name.clone())
+        .collect();
+    let is_interface_name = |name: &str| -> bool {
+        let short = name.rsplit('.').next().unwrap_or(name);
+        if local_interfaces.contains(short) {
+            return true;
+        }
+        externals
+            .find(name)
+            .is_some_and(|(_, entry)| entry.get().flags.contains(TypeAttributes::Interface))
+    };
+    let effective: Vec<(Option<String>, Vec<String>)> = program
+        .types
+        .iter()
+        .map(|decl| {
+            let mut base = decl.base.clone();
+            let mut interfaces = decl.interfaces.clone();
+            if let Some(name) = &base
+                && is_interface_name(name)
+            {
+                interfaces.push(name.clone());
+                base = None;
+            }
+            (base, interfaces)
+        })
+        .collect();
+
     // Pass 0.5: resolve base types now that every local type exists.
-    for decl in &program.types {
-        let Some(base_name) = &decl.base else {
+    for (index, decl) in program.types.iter().enumerate() {
+        let Some(base_name) = &effective[index].0 else {
             continue;
         };
         let Some(entry) = types.get(&decl.name).cloned() else {
@@ -1482,13 +1532,46 @@ fn emit(
         entry.get_mut().extends = Some(resolved);
     }
 
+    // Pass 0.6: record implemented interfaces.
+    for (index, decl) in program.types.iter().enumerate() {
+        if effective[index].1.is_empty() {
+            continue;
+        }
+        let Some(entry) = types.get(&decl.name).cloned() else {
+            continue;
+        };
+        for interface_name in &effective[index].1 {
+            let resolved = if let Some(local) = types.get(interface_name) {
+                TypeDefOrRef::TypeDef(local.clone())
+            } else if let Some((index, foreign)) = externals.find(interface_name) {
+                module
+                    .import_foreign_type(
+                        &TypeDefOrRef::TypeDef(foreign.clone()),
+                        &externals.modules[*index],
+                    )
+                    .map_err(|error| type_error(decl, sources, error.to_string()))?
+            } else {
+                return Err(type_error(
+                    decl,
+                    sources,
+                    format!("unknown interface '{interface_name}'"),
+                ));
+            };
+            entry
+                .get_mut()
+                .interfaces
+                .push(InterfaceImpl::new(resolved));
+        }
+    }
+
     // Pass 1: fields, method shells and constructors.
     let mut symbols: HashMap<String, TypeSymbol> = HashMap::new();
     let mut jobs: Vec<(usize, Entry<Method>, Job)> = Vec::new();
     for (index, decl) in program.types.iter().enumerate() {
         let ty = types[&decl.name].clone();
         let mut symbol = TypeSymbol {
-            base: decl.base.clone(),
+            base: effective[index].0.clone(),
+            interfaces: effective[index].1.clone(),
             ..TypeSymbol::default()
         };
 
@@ -1523,10 +1606,27 @@ fn emit(
                 .map_err(|message| type_error(decl, sources, message))?;
             let return_signature = resolve_type(&method.ret, &types, &externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
-            let virtual_flags = match method.virtual_kind {
-                VirtualKind::Virtual => MethodFlags::Virtual | MethodFlags::NewSlot,
-                VirtualKind::Override => MethodFlags::Virtual | MethodFlags::ReuseSlot,
-                VirtualKind::None => MethodFlags::empty(),
+            let virtual_flags = if decl.is_interface {
+                MethodFlags::Public
+                    | MethodFlags::Virtual
+                    | MethodFlags::NewSlot
+                    | MethodFlags::Abstract
+            } else {
+                let mut flags = match method.virtual_kind {
+                    VirtualKind::Virtual => MethodFlags::Virtual | MethodFlags::NewSlot,
+                    VirtualKind::Override => MethodFlags::Virtual | MethodFlags::ReuseSlot,
+                    VirtualKind::None => MethodFlags::empty(),
+                };
+                if !effective[index].1.is_empty()
+                    && !method.is_static
+                    && !method.is_ctor
+                    && method.virtual_kind == VirtualKind::None
+                {
+                    // Implicit interface implementations must be virtual and final.
+                    flags =
+                        flags | MethodFlags::Virtual | MethodFlags::NewSlot | MethodFlags::Final;
+                }
+                flags
             };
             let (flags, name, signature) = if method.is_ctor {
                 (
@@ -1550,10 +1650,14 @@ fn emit(
                     MethodSig::new_instance(return_signature, params),
                 )
             };
-            let entry = TypeDef::add_method(
-                &ty,
-                Method::new(flags, name.clone(), signature).with_body(Emitter::new().finish()),
-            );
+            let shell = Method::new(flags, name.clone(), signature);
+            // Abstract interface methods must not carry a body.
+            let shell = if decl.is_interface {
+                shell
+            } else {
+                shell.with_body(Emitter::new().finish())
+            };
+            let entry = TypeDef::add_method(&ty, shell);
             entry.get_mut().params = method
                 .params
                 .iter()
@@ -1577,7 +1681,9 @@ fn emit(
             } else {
                 symbol.methods.push(symbol_method);
             }
-            jobs.push((index, entry, Job::Declared(method_index)));
+            if !decl.is_interface {
+                jobs.push((index, entry, Job::Declared(method_index)));
+            }
         }
 
         for (property_index, property) in decl.properties.iter().enumerate() {
@@ -1659,7 +1765,7 @@ fn emit(
                 .insert(property.name.clone(), property_symbol);
         }
 
-        if symbol.ctors.is_empty() {
+        if !decl.is_interface && symbol.ctors.is_empty() {
             let flags = MethodFlags::Public
                 | MethodFlags::HideBySig
                 | MethodFlags::SpecialName
@@ -1717,6 +1823,7 @@ fn emit(
         let body = emit_body(
             &mut module,
             &externals,
+            effective[index].0.as_ref(),
             &types,
             &symbols,
             &program.types[index],
@@ -1744,9 +1851,11 @@ enum Job {
     Setter(usize),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_body(
     module: &mut Module,
     externals: &Externals,
+    base: Option<&String>,
     types: &HashMap<String, Entry<TypeDef>>,
     symbols: &HashMap<String, TypeSymbol>,
     decl: &TypeDecl,
@@ -1766,6 +1875,7 @@ fn emit_body(
         is_static: true,
         return_ty: Ty::Void,
         externals,
+        base: base.cloned(),
         locals: HashMap::new(),
         params: Vec::new(),
         loops: Vec::new(),
@@ -1785,13 +1895,16 @@ fn emit_body(
                 .map(|(ty, name)| (name.clone(), ty.clone()))
                 .collect();
             let Some(body) = &method.body else {
+                if decl.is_interface {
+                    return Ok(context.emitter.finish());
+                }
                 return Err(context.error(format!(
                     "method '{}' has no body; extern methods are not supported",
                     method.name
                 )));
             };
             if method.is_ctor {
-                context.call_base_constructor(decl, method.base_args.as_deref())?;
+                context.call_base_constructor(method.base_args.as_deref())?;
                 for field in &decl.fields {
                     if field.is_static {
                         continue;
@@ -1819,7 +1932,7 @@ fn emit_body(
         }
         Job::DefaultCtor => {
             context.is_static = false;
-            context.call_base_constructor(decl, None)?;
+            context.call_base_constructor(None)?;
             for field in &decl.fields {
                 if field.is_static {
                     continue;
@@ -1893,6 +2006,7 @@ struct FnEmitter<'a> {
     is_static: bool,
     return_ty: Ty,
     externals: &'a Externals,
+    base: Option<String>,
     locals: HashMap<String, (u16, Ty)>,
     params: Vec<(String, Ty)>,
     loops: Vec<(EmitLabel, EmitLabel)>,
@@ -1980,6 +2094,9 @@ impl<'a> FnEmitter<'a> {
         let (Ty::Class(actual_name), Ty::Class(expected_name)) = (actual, expected) else {
             return false;
         };
+        if self.implements_interface(actual, expected) {
+            return true;
+        }
         let mut current = Some(actual_name.clone());
         while let Some(name) = current {
             let short = name.rsplit('.').next().unwrap_or(&name).to_string();
@@ -1997,6 +2114,28 @@ impl<'a> FnEmitter<'a> {
                 }
                 None => return false,
             }
+        }
+        false
+    }
+
+    /// True when `actual` (or one of its bases) lists `expected` as an interface.
+    fn implements_interface(&self, actual: &Ty, expected: &Ty) -> bool {
+        let (Ty::Class(actual_name), Ty::Class(expected_name)) = (actual, expected) else {
+            return false;
+        };
+        let expected_short = expected_name.rsplit('.').next().unwrap_or(expected_name);
+        let mut current = Some(actual_name.clone());
+        while let Some(name) = current {
+            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+            let Some(symbol) = self.symbols.get(&short) else {
+                return false;
+            };
+            if symbol.interfaces.iter().any(|interface| {
+                interface == expected_name || interface.rsplit('.').next() == Some(expected_short)
+            }) {
+                return true;
+            }
+            current = symbol.base.clone();
         }
         false
     }
@@ -2439,12 +2578,8 @@ impl<'a> FnEmitter<'a> {
         Ok(field.ty)
     }
 
-    fn call_base_constructor(
-        &mut self,
-        decl: &TypeDecl,
-        args: Option<&[Expr]>,
-    ) -> Result<(), CompileError> {
-        let base_name = decl
+    fn call_base_constructor(&mut self, args: Option<&[Expr]>) -> Result<(), CompileError> {
+        let base_name = self
             .base
             .clone()
             .unwrap_or_else(|| "System.Object".to_string());

@@ -1,5 +1,10 @@
 namespace Demo
 {
+    public interface INamed
+    {
+        int Score();
+    }
+
     public class Shape
     {
         public virtual int Area()
@@ -13,11 +18,16 @@ namespace Demo
         }
     }
 
-    public class Square : Shape
+    public class Square : Shape, INamed
     {
         public override int Area()
         {
             return 4;
+        }
+
+        public int Score()
+        {
+            return 2;
         }
     }
 }
