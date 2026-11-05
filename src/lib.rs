@@ -1,6 +1,8 @@
 //! Experimental C# syntax parsing. This crate does not implement semantic analysis or emit.
 use tree_sitter::{Node, Parser, Tree};
 
+pub mod subset;
+
 pub fn parser() -> Parser {
     let mut parser = Parser::new();
     parser

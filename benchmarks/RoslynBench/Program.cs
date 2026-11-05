@@ -20,6 +20,7 @@ for (int i = 0; i < iterations; i++)
     long start = Stopwatch.GetTimestamp();
     var root = CSharpSyntaxTree.ParseText(source, options).GetRoot();
     bool diagnostic = root.ContainsDiagnostics;
+    GC.KeepAlive(root);
     samples[i] = (long)Stopwatch.GetElapsedTime(start).TotalNanoseconds;
     GC.KeepAlive(diagnostic);
 }

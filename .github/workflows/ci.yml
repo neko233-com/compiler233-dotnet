@@ -19,3 +19,7 @@ jobs:
       - run: cargo test --locked
       - run: ./benchmarks/run.ps1 -Iterations 5 -Warmup 1
         shell: pwsh
+      - run: ./benchmarks/check-subset.ps1
+        shell: pwsh
+      - run: ./benchmarks/run.ps1 -RustMode Subset -Source benchmarks/corpus/Subset.cs -Iterations 5 -Warmup 1
+        shell: pwsh

@@ -1,7 +1,8 @@
 param(
     [string]$Source = (Join-Path $PSScriptRoot 'corpus/Example.cs'),
     [ValidateRange(1, 1000000)][int]$Iterations = 200,
-    [ValidateRange(0, 1000000)][int]$Warmup = 30
+    [ValidateRange(0, 1000000)][int]$Warmup = 30,
+    [ValidateSet('TreeSitter', 'Subset')][string]$RustMode = 'TreeSitter'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -13,7 +14,8 @@ try {
     $dotnetBuild = & dotnet build benchmarks/RoslynBench/RoslynBench.csproj -c Release --nologo
     if ($LASTEXITCODE -ne 0) { throw "Roslyn benchmark build failed: $dotnetBuild" }
     $binary = if ($IsWindows) { 'compiler233-dotnet.exe' } else { 'compiler233-dotnet' }
-    $rust = & (Join-Path $root "target/release/$binary") bench $sourcePath $Iterations $Warmup | ConvertFrom-Json
+    $command = if ($RustMode -eq 'Subset') { 'bench-subset' } else { 'bench' }
+    $rust = & (Join-Path $root "target/release/$binary") $command $sourcePath $Iterations $Warmup | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Rust benchmark failed' }
     $roslyn = & dotnet (Join-Path $root 'benchmarks/RoslynBench/bin/Release/net10.0/RoslynBench.dll') $sourcePath $Iterations $Warmup | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Roslyn benchmark failed' }
