@@ -144,6 +144,11 @@ enum Stmt {
     Block(Block),
     Break,
     Continue,
+    AssignMember {
+        target: Expr,
+        name: String,
+        value: Expr,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -702,6 +707,19 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::Assign { name, value });
         }
         let expression = self.parse_expression()?;
+        if self.check("=") {
+            if let Expr::Member { target, name } = expression {
+                self.bump();
+                let value = self.parse_expression()?;
+                self.expect(";")?;
+                return Ok(Stmt::AssignMember {
+                    target: *target,
+                    name,
+                    value,
+                });
+            }
+            return Err(self.error("only member access can be assigned here"));
+        }
         self.expect(";")?;
         Ok(Stmt::Expression(expression))
     }
@@ -1500,6 +1518,30 @@ impl<'a> FnEmitter<'a> {
                 Ok(())
             }
             Stmt::Assign { name, value } => self.assign(name, value),
+            Stmt::AssignMember {
+                target,
+                name,
+                value,
+            } => {
+                let target_type = self.expr(target)?;
+                let Ty::Class(type_name) = target_type else {
+                    return Err(self.error(format!("type {target_type:?} has no fields")));
+                };
+                let Some(field) = self.field_symbol(&type_name, name) else {
+                    return Err(self.error(format!("unknown field '{type_name}.{name}'")));
+                };
+                if field.is_static {
+                    return Err(self.error(format!("'{type_name}.{name}' is static")));
+                }
+                let actual = self.expr(value)?;
+                Self::require(&actual, &field.ty, &format!("assignment to '{name}'"))
+                    .map_err(|message| self.error(message))?;
+                self.emitter.emit(Instruction::new(
+                    OpCode::Stfld,
+                    Operand::Token(MemberToken::Field(field.entry)),
+                ));
+                Ok(())
+            }
             Stmt::Expression(expression) => {
                 let ty = self.expr(expression)?;
                 if ty != Ty::Void {
