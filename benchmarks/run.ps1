@@ -2,11 +2,13 @@ param(
     [string]$Source = (Join-Path $PSScriptRoot 'corpus/Example.cs'),
     [ValidateRange(1, 1000000)][int]$Iterations = 200,
     [ValidateRange(0, 1000000)][int]$Warmup = 30,
-    [ValidateSet('TreeSitter', 'Subset')][string]$RustMode = 'TreeSitter'
+    [ValidateSet('TreeSitter', 'Subset')][string]$RustMode = 'TreeSitter',
+    [ValidateSet('Parse', 'Compile')][string]$Stage = 'Parse'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $sourcePath = (Resolve-Path -LiteralPath $Source).Path
+if ($Stage -eq 'Compile' -and $RustMode -ne 'Subset') { throw 'Compile stage requires -RustMode Subset.' }
 Push-Location $root
 try {
     $rustBuild = & cargo build --release --locked
@@ -14,15 +16,17 @@ try {
     $dotnetBuild = & dotnet build benchmarks/RoslynBench/RoslynBench.csproj -c Release --nologo
     if ($LASTEXITCODE -ne 0) { throw "Roslyn benchmark build failed: $dotnetBuild" }
     $binary = if ($IsWindows) { 'compiler233-dotnet.exe' } else { 'compiler233-dotnet' }
-    $command = if ($RustMode -eq 'Subset') { 'bench-subset' } else { 'bench' }
+    $command = if ($Stage -eq 'Compile') { 'bench-compile' } elseif ($RustMode -eq 'Subset') { 'bench-subset' } else { 'bench' }
     $rust = & (Join-Path $root "target/release/$binary") $command $sourcePath $Iterations $Warmup | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Rust benchmark failed' }
-    $roslyn = & dotnet (Join-Path $root 'benchmarks/RoslynBench/bin/Release/net10.0/RoslynBench.dll') $sourcePath $Iterations $Warmup | ConvertFrom-Json
+    $roslynArguments = @((Join-Path $root 'benchmarks/RoslynBench/bin/Release/net10.0/RoslynBench.dll'), $sourcePath, $Iterations, $Warmup)
+    if ($Stage -eq 'Compile') { $roslynArguments += 'compile' }
+    $roslyn = & dotnet @roslynArguments | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Roslyn benchmark failed' }
     if ($rust.source_sha256 -ne $roslyn.source_sha256 -or $rust.bytes -ne $roslyn.bytes) { throw 'Input mismatch' }
     if ($rust.has_parse_issues -or $roslyn.has_parse_issues) { throw 'Input has syntax issues in at least one parser; comparisons require clean input' }
     [pscustomobject]@{
-        description = 'Full syntax parse only; grammar and syntax tree representation differ.'
+        description = if ($Stage -eq 'Compile') { 'In-memory parse, binding and DLL emission; supported language and output capabilities differ.' } else { 'Full syntax parse only; grammar and syntax tree representation differ.' }
         dotnet_sdk = (& dotnet --version)
         rustc = (& rustc --version)
         os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription

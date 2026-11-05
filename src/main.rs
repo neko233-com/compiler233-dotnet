@@ -1,17 +1,53 @@
 use compiler233_dotnet::{parse, parser, syntax_issues};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{env, fs, hint::black_box, process::ExitCode, time::Instant};
+use std::{env, fs, hint::black_box, io::Write, path::Path, process::ExitCode, time::Instant};
 
 fn run() -> Result<bool, String> {
     let args: Vec<String> = env::args().collect();
-    let usage = "usage: compiler233-dotnet check|check-subset <file.cs> | bench|bench-subset <file.cs> <iterations> <warmup>";
+    let usage = "usage: compiler233-dotnet compile <file.cs> <output.dll> | check|check-subset <file.cs> | bench|bench-subset|bench-compile <file.cs> <iterations> <warmup>";
     if args.len() < 3 {
         return Err(usage.into());
     }
     let source = fs::read_to_string(&args[2]).map_err(|e| format!("{}: {e}", args[2]))?;
-    let mut parser = parser();
     match args[1].as_str() {
+        "compile" if args.len() == 4 => {
+            let output = Path::new(&args[3]);
+            if !output
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+            {
+                return Err("output must have a .dll extension".into());
+            }
+            if let Ok(destination) = output.canonicalize()
+                && destination
+                    == Path::new(&args[2])
+                        .canonicalize()
+                        .map_err(|e| e.to_string())?
+            {
+                return Err("output cannot overwrite the input".into());
+            }
+            let name = output
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .ok_or("invalid output filename")?;
+            let bytes = match compiler233_dotnet::compile::compile(&source, name) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("{}: {e}", args[2]);
+                    return Ok(false);
+                }
+            };
+            let parent = output
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let mut temporary =
+                tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+            temporary.write_all(&bytes).map_err(|e| e.to_string())?;
+            temporary.persist(output).map_err(|e| e.error.to_string())?;
+            Ok(true)
+        }
         "check-subset" if args.len() == 3 => match compiler233_dotnet::subset::parse(&source) {
             Ok(_) => Ok(true),
             Err(issue) => {
@@ -20,6 +56,7 @@ fn run() -> Result<bool, String> {
             }
         },
         "check" if args.len() == 3 => {
+            let mut parser = parser();
             let tree = parse(&mut parser, &source);
             for issue in syntax_issues(&tree) {
                 eprintln!(
@@ -30,6 +67,7 @@ fn run() -> Result<bool, String> {
             Ok(!tree.root_node().has_error())
         }
         "bench" if args.len() == 5 => {
+            let mut parser = parser();
             let iterations: usize = args[3]
                 .parse()
                 .map_err(|_| "iterations must be an integer")?;
@@ -59,7 +97,7 @@ fn run() -> Result<bool, String> {
             );
             Ok(true)
         }
-        "bench-subset" if args.len() == 5 => {
+        "bench-subset" | "bench-compile" if args.len() == 5 => {
             let iterations: usize = args[3]
                 .parse()
                 .map_err(|_| "iterations must be an integer")?;
@@ -71,6 +109,35 @@ fn run() -> Result<bool, String> {
                 .map_err(|e| format!("unsupported input at byte {}: {}", e.offset, e.message))?;
             let token_count = probe.tokens.len();
             let node_count = probe.nodes.len();
+            if args[1] == "bench-compile" {
+                let probe = compiler233_dotnet::compile::compile(&source, "Benchmark")
+                    .map_err(|e| format!("cannot compile input: {e}"))?;
+                let output_bytes = probe.len();
+                for _ in 0..warmup {
+                    black_box(
+                        compiler233_dotnet::compile::compile(black_box(&source), "Benchmark")
+                            .expect("validated source"),
+                    );
+                }
+                let mut samples = Vec::with_capacity(iterations);
+                for _ in 0..iterations {
+                    let start = Instant::now();
+                    let assembly =
+                        compiler233_dotnet::compile::compile(black_box(&source), "Benchmark")
+                            .expect("validated source");
+                    black_box(&assembly);
+                    samples.push(start.elapsed().as_nanos() as u64);
+                }
+                samples.sort_unstable();
+                let percentile = |percent: usize| {
+                    samples[(samples.len() * percent).div_ceil(100).saturating_sub(1)]
+                };
+                println!(
+                    "{}",
+                    json!({"engine":"native Rust C# subset compiler", "stage":"parse, bind, emit", "source_sha256":format!("{:x}", Sha256::digest(source.as_bytes())), "bytes":source.len(), "iterations":iterations, "warmup":warmup, "has_parse_issues":false, "output_bytes":output_bytes, "p50_ns":percentile(50), "p95_ns":percentile(95), "samples_ns":samples})
+                );
+                return Ok(true);
+            }
             for _ in 0..warmup {
                 black_box(
                     compiler233_dotnet::subset::parse(black_box(&source))

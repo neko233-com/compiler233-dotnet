@@ -13,3 +13,15 @@ On Windows x64 with an AMD Ryzen 9 9950X, Rust 1.99.1 and .NET SDK 10.0.114 (Ros
 The large Rust timing variation shows why a single run is not a reliable result. Both programs parsed the same bytes and reported no parse issues. The Rust parser's token and node arenas were retained through timing. Rust was run before Roslyn in separate processes, without CPU isolation; machine load, frequency and JIT/GC can affect results. Input loading, process startup, allocation totals, peak memory, full compilation and executable correctness are outside this measurement. The generated input is repetitive and does not represent a project workload.
 
 Reproduce using `generate-subset.ps1 -Methods 200`, then run `run.ps1 -RustMode Subset -Iterations 300 -Warmup 100` against the generated file. Save the JSON output to keep all latency samples and the input hash. Run `check-subset.ps1` for the small Roslyn differential smoke test. Broader conformance testing and equivalent functionality are prerequisites for a meaningful speedup claim.
+
+## In-memory subset compilation experiment
+
+On the same machine and source hash, three independent runs timed parsing, limited binding and DLL generation. Each process warmed up 15 times and measured 50 compilations; Roslyn used Release optimization. The Rust output was 10,752 bytes and Roslyn output was 9,216 bytes. A separate runtime test loaded the emitted DLL and compared results of all 200 generated methods with Roslyn for one set of inputs per method.
+
+| Run | Rust p50 (ms) | Rust p95 (ms) | Roslyn p50 (ms) | Roslyn p95 (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 0.5208 | 0.5535 | 6.2393 | 8.0329 |
+| 2 | 0.5374 | 0.5962 | 6.7005 | 10.1216 |
+| 3 | 0.4982 | 0.5804 | 6.2805 | 7.5201 |
+
+Reproduce with `run.ps1 -RustMode Subset -Stage Compile -Source benchmarks/results/generated.cs -Iterations 50 -Warmup 15`, after generating the source with the command above. The timing excludes process startup, file I/O and execution. The compiler supports only a small subset, emits different metadata and omits many checks and features Roslyn performs. The runtime sample is not full correctness or equivalent-work proof; these numbers must not be presented as a full compiler speedup.

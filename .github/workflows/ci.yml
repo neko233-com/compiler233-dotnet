@@ -4,13 +4,23 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Verify macOS ARM64 runner
+        if: runner.os == 'macOS'
+        shell: bash
+        run: test "$(uname -m)" = arm64
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Verify native Apple Silicon tools
+        if: runner.os == 'macOS'
+        shell: pwsh
+        run: |
+          if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') { throw 'PowerShell is not running on ARM64' }
+          if (-not ((rustc -vV) -match 'host: aarch64-apple-darwin')) { throw 'Rust is not using the native ARM64 host' }
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
@@ -22,4 +32,8 @@ jobs:
       - run: ./benchmarks/check-subset.ps1
         shell: pwsh
       - run: ./benchmarks/run.ps1 -RustMode Subset -Source benchmarks/corpus/Subset.cs -Iterations 5 -Warmup 1
+        shell: pwsh
+      - run: ./tests/runtime.ps1
+        shell: pwsh
+      - run: ./benchmarks/run.ps1 -RustMode Subset -Stage Compile -Source tests/fixtures/Arithmetic.cs -Iterations 5 -Warmup 1
         shell: pwsh

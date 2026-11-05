@@ -1,6 +1,9 @@
-//! Experimental C# syntax parsing. This crate does not implement semantic analysis or emit.
+//! Experimental C# syntax frontends and limited .NET DLL compilation.
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+compile_error!("macOS is supported only on ARM64 (aarch64-apple-darwin)");
 use tree_sitter::{Node, Parser, Tree};
 
+pub mod compile;
 pub mod subset;
 
 pub fn parser() -> Parser {
