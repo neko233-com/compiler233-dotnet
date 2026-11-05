@@ -113,4 +113,19 @@ if ($runtimeRoot) {
         Write-Output $listResult.Trim()
     }
 }
+# External base class: System.Exception with an inherited property.
+if ($runtimeRoot) {
+    $coreLibPath = Join-Path (Join-Path $runtimeRoot $runtimeVersion) 'System.Private.CoreLib.dll'
+    if (Test-Path $coreLibPath) {
+        $inheritedSource = Join-Path $root 'tests/fixtures/external/Inherited.cs'
+        $inheritedOutput = Join-Path $work 'Inherited.dll'
+        & $binary csc $inheritedSource "-r:$coreLibPath" "-out:$inheritedOutput"
+        if ($LASTEXITCODE -ne 0) { throw 'external base class compilation failed' }
+        $inheritedManifest = Join-Path $work 'inherited-manifest.txt'
+        [System.IO.File]::WriteAllLines($inheritedManifest, @($inheritedSource), [System.Text.UTF8Encoding]::new($false))
+        $inheritedResult = & dotnet $oracle $inheritedManifest $inheritedOutput 'Demo.ErrorRunner' 'Run' 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "external base comparison failed: $inheritedResult" }
+        Write-Output $inheritedResult.Trim()
+    }
+}
 Write-Output 'Compile and runtime differential checks passed.'

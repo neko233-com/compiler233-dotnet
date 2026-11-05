@@ -115,6 +115,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 数组：`new int[n]`、`a[i]` 读写、`a.Length`、`foreach` 遍历（`int`/`bool`/`string`/类元素）
 - 继承：基类（本地或引用程序集）、`virtual`/`override` 虚调用、`: base(args)` 基类构造、基类方法继承与基类-派生类赋值兼容
 - 接口：`interface` 声明（抽象方法、无方法体）、类实现接口（`InterfaceImpl` + 隐式实现标记为 `virtual final newslot`）、接口类型变量与 `callvirt` 派发
+- 外部基类继承：`class X : System.Exception` 可编译，构造函数 `: base(args)`、继承的字段与属性（`get_X`）沿引用程序集的 `extends` 链解析
 - 静态/实例方法、参数，重载按参数个数解析
 - 语句：局部声明、赋值、`if/else`、`while`、`for`、`return`、`break`/`continue`、`base.M(...)` 基类调用、块
 - 表达式：`int/float/bool/string/object` 与 `null` 字面量、`enum` 常量、算术与比较（含字符串/布尔相等、`== null`）、`&&/||` 短路、`??`、`?:` 三元、`(T)x` 转换与 `as`、`!`、`++`/`--`、`+=`/`-=`（含字段与属性）、字符串 `+` 拼接、赋值表达式、`string.Empty`/`int.MaxValue` 等预定义成员

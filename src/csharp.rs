@@ -307,6 +307,7 @@ struct Externals {
     /// Declaring type full name to methods, because loaded TypeDef rows do not
     /// carry their method list.
     methods: HashMap<String, Vec<(usize, Entry<Method>)>>,
+    fields: HashMap<String, Vec<(usize, Entry<Field>)>>,
 }
 
 impl Externals {
@@ -315,6 +316,7 @@ impl Externals {
         let mut types = HashMap::new();
         let mut by_short_name: HashMap<String, Vec<String>> = HashMap::new();
         let mut methods: HashMap<String, Vec<(usize, Entry<Method>)>> = HashMap::new();
+        let mut fields: HashMap<String, Vec<(usize, Entry<Field>)>> = HashMap::new();
         for path in paths {
             let module = Module::from_path_no_resolve(path).map_err(|error| CompileError {
                 file: sources
@@ -340,6 +342,14 @@ impl Externals {
                     .push(full_name.clone());
                 types.entry(full_name).or_insert((index, entry.clone()));
             }
+            for field in module.all_fields() {
+                if let Some(declaring) = field.get().declaring_type.upgrade() {
+                    fields
+                        .entry(declaring.get().full_name())
+                        .or_default()
+                        .push((index, field.clone()));
+                }
+            }
             for method in module.all_methods() {
                 if let Some(declaring) = method.get().declaring_type.upgrade() {
                     methods
@@ -355,6 +365,7 @@ impl Externals {
             types,
             by_short_name,
             methods,
+            fields,
         })
     }
 
@@ -395,6 +406,66 @@ impl Externals {
             method.name == name && method.signature.params.len() == arity
         })?;
         Some((found.0, found.1.clone()))
+    }
+
+    fn field_in_chain(&self, type_full_name: &str, name: &str) -> Option<(usize, Entry<Field>)> {
+        let mut current = Some(type_full_name.to_string());
+        let mut depth = 0usize;
+        while let Some(type_name) = current {
+            if depth > 12 {
+                return None;
+            }
+            depth += 1;
+            let entry = self.find(&type_name).map(|(_, entry)| entry.clone())?;
+            let full_name = entry.get().full_name();
+            if let Some(found) = self.fields.get(&full_name).and_then(|candidates| {
+                candidates
+                    .iter()
+                    .find(|(_, field)| field.get().name == name)
+            }) {
+                return Some((found.0, found.1.clone()));
+            }
+            let guard = entry.get();
+            let base = guard.extends.as_ref().and_then(|extends| match extends {
+                TypeDefOrRef::TypeDef(def) => Some(def.get().full_name()),
+                TypeDefOrRef::TypeRef(reference) => Some(reference.get().full_name()),
+                TypeDefOrRef::TypeSpec(_) => None,
+            });
+            drop(guard);
+            current = base;
+        }
+        None
+    }
+
+    /// Walks the `extends` chain of a referenced type so inherited methods and
+    /// constructors resolve the way the runtime would see them.
+    fn method_in_chain(
+        &self,
+        type_full_name: &str,
+        name: &str,
+        arity: usize,
+    ) -> Option<(usize, Entry<Method>)> {
+        let mut current = Some(type_full_name.to_string());
+        let mut depth = 0usize;
+        while let Some(type_name) = current {
+            if depth > 12 {
+                return None;
+            }
+            depth += 1;
+            if let Some(found) = self.method(&type_name, name, arity) {
+                return Some(found);
+            }
+            let entry = self.find(&type_name)?.1.clone();
+            let guard = entry.get();
+            let base = guard.extends.as_ref().and_then(|extends| match extends {
+                TypeDefOrRef::TypeDef(def) => Some(def.get().full_name()),
+                TypeDefOrRef::TypeRef(reference) => Some(reference.get().full_name()),
+                TypeDefOrRef::TypeSpec(_) => None,
+            });
+            drop(guard);
+            current = base;
+        }
+        None
     }
 }
 
@@ -2501,6 +2572,23 @@ impl<'a> FnEmitter<'a> {
         false
     }
 
+    /// Follows local base classes until reaching a type owned by a reference
+    /// assembly, which is the entry point for inherited external members.
+    fn external_base_of(&self, type_name: &str) -> Option<String> {
+        let mut current = type_name.to_string();
+        let mut depth = 0usize;
+        loop {
+            if depth > 12 {
+                return None;
+            }
+            depth += 1;
+            match self.symbols.get(&current) {
+                Some(symbol) => current = symbol.base.clone()?,
+                None => return Some(current),
+            }
+        }
+    }
+
     fn require_assignable(&self, actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
         if *expected == Ty::Object && is_reference(actual) {
             return Ok(());
@@ -3596,12 +3684,57 @@ impl<'a> FnEmitter<'a> {
             ));
             return Ok(field.ty);
         }
+        // Inherited external members: fields first, then property getters.
+        let external_owner = self.external_base_of(&type_name);
+        let external_field = external_owner
+            .as_deref()
+            .and_then(|base| self.externals.field_in_chain(base, name));
+        if let Some((index, entry)) = external_field {
+            let signature = {
+                let guard = entry.get();
+                guard.signature.clone()
+            };
+            let token = {
+                let module = &mut *self.module;
+                let foreign = &self.externals.modules[index];
+                module
+                    .import_foreign_field(&entry, foreign)
+                    .map_err(|error| self.error(error.to_string()))?
+            };
+            self.emitter.emit(Instruction::new(
+                OpCode::Ldfld,
+                Operand::Token(token.clone()),
+            ));
+            return Ok(external_ty(&signature.ty));
+        }
         let property = self
             .symbols
             .get(&type_name)
             .and_then(|symbol| symbol.properties.get(name))
             .map(|property| (property.ty.clone(), property.getter.clone()));
         let Some((ty, getter)) = property else {
+            let getter_name = format!("get_{name}");
+            let getter_owner = self
+                .external_base_of(&type_name)
+                .unwrap_or_else(|| type_name.clone());
+            if let Some((index, entry)) =
+                self.externals
+                    .method_in_chain(&getter_owner, &getter_name, 0)
+            {
+                let signature = {
+                    let guard = entry.get();
+                    guard.signature.clone()
+                };
+                let token = {
+                    let module = &mut *self.module;
+                    let foreign = &self.externals.modules[index];
+                    module
+                        .import_foreign_method(&entry, foreign)
+                        .map_err(|error| self.error(error.to_string()))?
+                };
+                self.emitter.callvirt(token);
+                return Ok(external_ty(&signature.ret));
+            }
             return Err(self.error(format!("unknown member '{type_name}.{name}'")));
         };
         let Some(getter) = getter else {
@@ -3809,7 +3942,9 @@ impl<'a> FnEmitter<'a> {
                     self.emitter.call(method.entry);
                     return Ok(method.ret);
                 }
-                if let Some((index, entry)) = self.externals.method(&base, name, args.len()) {
+                if let Some((index, entry)) =
+                    self.externals.method_in_chain(&base, name, args.len())
+                {
                     let signature = {
                         let guard = entry.get();
                         guard.signature.clone()
