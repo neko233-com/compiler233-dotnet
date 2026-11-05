@@ -82,4 +82,20 @@ if ($runtimeLine -and $runtimeLine -match '^Microsoft\.NETCore\.App (\S+) \[(.+)
         Write-Output $frameworkResult.Trim()
     }
 }
+# Generic method call: a Roslyn-built library is referenced with -r.
+$genericProject = Join-Path $root 'tests/fixtures/generic/GenericLib.csproj'
+$genericBuild = & dotnet build $genericProject -c Release --nologo -v quiet
+if ($LASTEXITCODE -ne 0) { throw "generic library build failed: $genericBuild" }
+$genericLib = Join-Path $root 'tests/fixtures/generic/bin/Release/net8.0/GenericLib.dll'
+$genericRunner = Join-Path $root 'tests/fixtures/generic/Runner.cs'
+$genericOutput = Join-Path $work 'GenericRunner.dll'
+& $binary csc $genericRunner "-r:$genericLib" "-out:$genericOutput"
+if ($LASTEXITCODE -ne 0) { throw 'generic method call failed to compile' }
+# The runtime probe resolves referenced assemblies from the output directory.
+Copy-Item $genericLib $work -Force
+$genericManifest = Join-Path $work 'generic-manifest.txt'
+[System.IO.File]::WriteAllLines($genericManifest, @((Join-Path $root 'tests/fixtures/generic/Lib.cs'), $genericRunner), [System.Text.UTF8Encoding]::new($false))
+$genericResult = & dotnet $oracle $genericManifest $genericOutput 'Demo.GenericRunner' 'Run' 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { throw "generic call comparison failed: $genericResult" }
+Write-Output $genericResult.Trim()
 Write-Output 'Compile and runtime differential checks passed.'

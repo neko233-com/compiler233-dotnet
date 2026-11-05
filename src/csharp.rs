@@ -10,7 +10,10 @@ use hao::{
     Module,
     dotnet::entries::Version,
     dotnet::{
-        entries::{Entry, Field, InterfaceImpl, Method, Param, TypeDef, TypeDefOrRef},
+        entries::{
+            Entry, Field, InterfaceImpl, Method, MethodDefOrRef, MethodSpec, Param, TypeDef,
+            TypeDefOrRef,
+        },
         il::{EmitLabel, Emitter, Instruction, MemberToken, MethodBody, OpCode, Operand},
         md::streams::tables_stream::{FieldFlags, MethodFlags, TypeAttributes},
         module::{ModuleKind, TargetRuntime},
@@ -228,6 +231,7 @@ enum Expr {
     Call {
         receiver: Option<Box<Expr>>,
         name: String,
+        generic_args: Vec<Ty>,
         args: Vec<Expr>,
     },
     Member {
@@ -1244,11 +1248,13 @@ impl<'a> Parser<'a> {
             if self.check(".") {
                 self.bump();
                 let name = self.identifier()?;
+                let generic_args = self.parse_generic_arguments()?;
                 if self.check("(") {
                     let args = self.parse_arguments()?;
                     expression = Expr::Call {
                         receiver: Some(Box::new(expression)),
                         name,
+                        generic_args,
                         args,
                     };
                 } else {
@@ -1269,6 +1275,20 @@ impl<'a> Parser<'a> {
                 };
                 continue;
             }
+            if self.check("<") && self.looks_like_generic_call() {
+                let generic_args = self.parse_generic_arguments()?;
+                let Expr::Name(name) = expression else {
+                    return Err(self.error("generic arguments require a method name"));
+                };
+                let args = self.parse_arguments()?;
+                expression = Expr::Call {
+                    receiver: None,
+                    name,
+                    generic_args,
+                    args,
+                };
+                continue;
+            }
             if self.check("(") {
                 let args = self.parse_arguments()?;
                 match expression {
@@ -1276,6 +1296,7 @@ impl<'a> Parser<'a> {
                         expression = Expr::Call {
                             receiver: None,
                             name,
+                            generic_args: Vec::new(),
                             args,
                         };
                     }
@@ -1286,6 +1307,22 @@ impl<'a> Parser<'a> {
             return Ok(expression);
         }
     }
+    fn parse_generic_arguments(&mut self) -> Result<Vec<Ty>, CompileError> {
+        if !self.check("<") {
+            return Ok(Vec::new());
+        }
+        self.bump();
+        let mut types = Vec::new();
+        loop {
+            types.push(self.parse_type_reference()?);
+            if !self.eat(",") {
+                break;
+            }
+        }
+        self.expect(">")?;
+        Ok(types)
+    }
+
     fn parse_arguments(&mut self) -> Result<Vec<Expr>, CompileError> {
         self.expect("(")?;
         let mut args = Vec::new();
@@ -1299,6 +1336,13 @@ impl<'a> Parser<'a> {
         }
         self.expect(")")?;
         Ok(args)
+    }
+
+    fn looks_like_generic_call(&mut self) -> bool {
+        let saved = self.position;
+        let ok = self.parse_generic_arguments().is_ok() && self.check("(");
+        self.position = saved;
+        ok
     }
 
     fn parse_primary(&mut self) -> Result<Expr, CompileError> {
@@ -1531,6 +1575,18 @@ fn external_ty(sig: &TypeSig) -> Ty {
         TypeSig::Class(TypeDefOrRef::TypeRef(entry)) => Ty::Class(entry.get().full_name()),
         TypeSig::SzArray(inner) => Ty::Array(Box::new(external_ty(inner))),
         other => Ty::Named(format!("{other:?}")),
+    }
+}
+
+/// Replaces `MVar` placeholders with the supplied instantiation.
+fn substitute(sig: &TypeSig, instantiation: &[TypeSig]) -> Ty {
+    match sig {
+        TypeSig::MVar(index) => instantiation
+            .get(*index as usize)
+            .map(external_ty)
+            .unwrap_or(Ty::Named("generic argument".to_string())),
+        TypeSig::SzArray(inner) => Ty::Array(Box::new(substitute(inner, instantiation))),
+        other => external_ty(other),
     }
 }
 
@@ -3044,8 +3100,9 @@ impl<'a> FnEmitter<'a> {
             Expr::Call {
                 receiver,
                 name,
+                generic_args,
                 args,
-            } => self.call(receiver.as_deref(), name, args),
+            } => self.call(receiver.as_deref(), name, generic_args, args),
             Expr::NewArray { element, size } => {
                 let size_type = self.expr(size)?;
                 Self::require(&size_type, &Ty::Int, "array size")
@@ -3388,6 +3445,7 @@ impl<'a> FnEmitter<'a> {
         &mut self,
         receiver: Option<&Expr>,
         name: &str,
+        generic_args: &[Ty],
         args: &[Expr],
     ) -> Result<Ty, CompileError> {
         if let Some(receiver) = receiver {
@@ -3411,7 +3469,7 @@ impl<'a> FnEmitter<'a> {
                             return Err(self.error(format!("unknown type '{receiver_name}'")));
                         }
                     }
-                    return self.static_call(receiver_name, name, args);
+                    return self.static_call(receiver_name, name, generic_args, args);
                 }
             }
             // A dotted chain may be a qualified type (`System.Text.Regex`).
@@ -3429,7 +3487,7 @@ impl<'a> FnEmitter<'a> {
                     if let Some(result) = self.bcl_call(&path, name, args)? {
                         return Ok(result);
                     }
-                    return self.static_call(&short, name, args);
+                    return self.static_call(&short, name, generic_args, args);
                 }
             }
             let receiver_type = self.expr(receiver)?;
@@ -3446,6 +3504,9 @@ impl<'a> FnEmitter<'a> {
                     let guard = entry.get();
                     guard.signature.clone()
                 };
+                if !generic_args.is_empty() {
+                    return self.generic_call(index, &entry, &signature, generic_args, args);
+                }
                 let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
                 self.push_arguments(args, &params, "argument")?;
                 let token = {
@@ -3473,13 +3534,14 @@ impl<'a> FnEmitter<'a> {
             }
         }
         let current = self.current.clone();
-        self.static_call(&current, name, args)
+        self.static_call(&current, name, generic_args, args)
     }
 
     fn static_call(
         &mut self,
         type_name: &str,
         name: &str,
+        generic_args: &[Ty],
         args: &[Expr],
     ) -> Result<Ty, CompileError> {
         let short = type_name
@@ -3497,6 +3559,9 @@ impl<'a> FnEmitter<'a> {
                 let guard = entry.get();
                 guard.signature.clone()
             };
+            if !generic_args.is_empty() {
+                return self.generic_call(index, &entry, &signature, generic_args, args);
+            }
             let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
             self.push_arguments(args, &params, "argument")?;
             let token = {
@@ -3513,6 +3578,55 @@ impl<'a> FnEmitter<'a> {
             "no static method '{name}' with {} parameter(s) on '{type_name}'",
             args.len()
         )))
+    }
+
+    /// Emits `call` on a MethodSpec so a generic method can be instantiated.
+    fn generic_call(
+        &mut self,
+        index: usize,
+        entry: &Entry<Method>,
+        signature: &MethodSig,
+        generic_args: &[Ty],
+        args: &[Expr],
+    ) -> Result<Ty, CompileError> {
+        if signature.generic_param_count as usize != generic_args.len() {
+            return Err(self.error(format!(
+                "method expects {} generic argument(s), found {}",
+                signature.generic_param_count,
+                generic_args.len()
+            )));
+        }
+        let instantiation = generic_args
+            .iter()
+            .map(|ty| resolve_type(ty, self.types, self.externals, &mut *self.module))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|message| self.error(message))?;
+        let token = {
+            let module = &mut *self.module;
+            let foreign = &self.externals.modules[index];
+            module
+                .import_foreign_method(entry, foreign)
+                .map_err(|error| self.error(error.to_string()))?
+        };
+        let method = match token {
+            MemberToken::Method(method) => MethodDefOrRef::Method(method),
+            MemberToken::MemberRef(reference) => MethodDefOrRef::MemberRef(reference),
+            _ => return Err(self.error("generic call target is not a method")),
+        };
+        let spec = Entry::new(MethodSpec {
+            method,
+            instantiation: instantiation.clone(),
+            custom_attributes: Vec::new(),
+        });
+        self.module.method_specs.push(spec.clone());
+        let params: Vec<Ty> = signature
+            .params
+            .iter()
+            .map(|param| substitute(param, &instantiation))
+            .collect();
+        self.push_arguments(args, &params, "argument")?;
+        self.emitter.call(MemberToken::MethodSpec(spec));
+        Ok(substitute(&signature.ret, &instantiation))
     }
 
     fn bcl_call(

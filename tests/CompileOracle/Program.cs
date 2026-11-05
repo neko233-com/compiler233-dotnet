@@ -48,8 +48,13 @@ var expected = Invoke(
     new AssemblyLoadContext("roslyn", true).LoadFromStream(stream),
     typeName,
     methodName);
+var sourceDirectories = sources
+    .Select(tree => Path.GetDirectoryName(Path.GetFullPath(tree.FilePath))!)
+    .Distinct()
+    .ToArray();
+
 var actual = Invoke(
-    LoadWithDependencies(assemblyPath),
+    LoadWithDependencies(assemblyPath, sourceDirectories),
     typeName,
     methodName);
 
@@ -61,15 +66,20 @@ if (expected != actual)
 }
 return 0;
 
-static Assembly LoadWithDependencies(string path)
+static Assembly LoadWithDependencies(string path, IEnumerable<string> searchDirectories)
 {
     var full = Path.GetFullPath(path);
-    var directory = Path.GetDirectoryName(full)!;
+    var directories = new List<string> { Path.GetDirectoryName(full)! };
+    directories.AddRange(searchDirectories);
     var context = new AssemblyLoadContext("compiler233", true);
     context.Resolving += (loader, name) =>
     {
-        var candidate = Path.Combine(directory, name.Name + ".dll");
-        return File.Exists(candidate) ? loader.LoadFromAssemblyPath(candidate) : null;
+        foreach (var directory in directories)
+        {
+            var candidate = Path.Combine(directory, name.Name + ".dll");
+            if (File.Exists(candidate)) return loader.LoadFromAssemblyPath(candidate);
+        }
+        return null;
     };
     return context.LoadFromAssemblyPath(full);
 }
