@@ -104,6 +104,20 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 本机基线（`-Mode frontend`，`tuanjie-project-sf` 全部 8530 个 `.cs`，C# 9）：`accept 8530 / false_reject 0 / false_accept 0`；前端单独处理全量耗时约 0.85 秒，差分端到端约 9 秒（含构建检查与 Roslyn 侧分析），报告约 1.8 MB。语法通过不代表语义或产物正确，产物正确性由 `-Mode compile` 与 `tests/runtime.ps1` 负责。
 
+## 真实编译（M3/M4 起点）
+
+`csc` 模式不再只做子集校验：它构建 AST、解析名字与类型、发射可执行 CIL，并把多个源文件合并为一个程序集。当前支持的核心：
+
+- 命名空间（块式与文件级）、类（含静态类）、静态/实例字段与初始化器（实例初始化器在构造函数，静态初始化器在 `.cctor`）
+- 静态/实例方法、参数，重载按参数个数解析
+- 语句：局部声明、赋值、`if/else`、`while`、`for`、`return`、块
+- 表达式：`int/bool/string` 字面量、标识符、算术、比较、`&&/||` 短路、`!`、字符串 `+` 拼接、赋值表达式
+- 调用：本程序集的静态/实例方法；BCL 的 `System.Math.Max/Min/Abs`、`System.Convert.ToString`、`System.String.Concat`、`System.Console.Write/WriteLine`（按需添加 `System.Console` 程序集引用）
+
+尚未支持、会被明确拒绝而不是静默降级：`new`/对象、数组、泛型、接口与继承、属性、lambda、`try`/`async`/`foreach`/`switch`、第三方程序集引用。
+
+验收方式：`./tests/compile.ps1` 用 Roslyn 编译同一批源码，分别加载两个程序集并执行 `Demo.Program.Run()`，结果不一致即失败。
+
 ## 发布
 
 发布由 GitHub tag 触发，本地也可直接打包：
@@ -130,7 +144,8 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - **M0（已完成）**：csc 兼容命令行前端、诊断与退出码、`-report` 报告、CLI 契约测试、tag 驱动的多平台发布。
 - **M1（已完成）**：Roslyn 差分门禁——同输入双编译，输出 accept / reject / false_reject / false_accept 分类与覆盖率，false_accept 默认上限 0；语料可指向任意 `.cs` 目录。
 - **M2（进行中）**：自研词法 + 递归下降解析已落地，覆盖预处理/条件编译、命名空间、类型、成员、语句与表达式；真实 Unity 脚本语法层 8530/8530 通过，误接受 0。剩余工作：trivia/span 保真、增量解析，以及换更大语料后的长尾构造。
-- **M3**：绑定与类型系统（重载决议、泛型与类型推断、lambda/查询/模式匹配、可空引用类型）。
+- **M3（进行中）**：名字/类型检查与 CIL 发射已打通（类、静态/实例字段与方法、控制流、BCL 调用），由 	ests/compile.ps1 与 Roslyn 执行结果对照；待办：
+ew/对象与数组、泛型、接口继承、属性、lambda、异常与 async。
 - **M4**：CIL、元数据、便携 PDB、引用程序集，以及目标框架矩阵（netstandard2.0/2.1、net472、net8/9/10）。
 - **M5**：性能对标（冷启动、全量/增量 p50/p95、峰值内存）与 GitHub tag 发布（win-x64、linux-x64、macos-arm64）。
 

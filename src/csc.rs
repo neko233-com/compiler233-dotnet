@@ -16,11 +16,9 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::{compile, subset};
+use crate::csharp;
 
 const MAX_RESPONSE_DEPTH: usize = 16;
-const MAX_FRONTEND_EXAMPLES: usize = 20;
-const FRONTEND_ENGINE: &str = "tree-sitter-c-sharp";
 
 const USAGE: &str = concat!(
     "compiler233-dotnet csc -- Roslyn csc compatible front end (M0)\n",
@@ -446,17 +444,6 @@ fn is_known_langversion(value: &str) -> bool {
     }
 }
 
-fn line_column(source: &str, offset: usize) -> (usize, usize) {
-    let end = offset.min(source.len());
-    let prefix = &source[..end];
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let column = match prefix.rfind('\n') {
-        Some(index) => prefix.len() - index,
-        None => prefix.len() + 1,
-    };
-    (line, column)
-}
-
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -472,7 +459,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 fn compile_assembly(
     options: &Options,
     diagnostics: &mut Vec<Diagnostic>,
-    frontend_scan: &mut Option<Value>,
+    _frontend_scan: &mut Option<Value>,
 ) -> Option<Vec<u8>> {
     let target = options.target();
     if !target.eq_ignore_ascii_case("library") {
@@ -512,43 +499,19 @@ fn compile_assembly(
         return None;
     }
 
-    if options.sources.len() > 1 {
-        *frontend_scan = Some(scan_frontend(&options.sources));
-        diagnostics.push(Diagnostic::error(
-            options.sources[0].clone(),
-            "CD2330003",
-            format!(
-                "multi-file compilation is not implemented ({} source files); no assembly was produced",
-                options.sources.len()
-            ),
-        ));
-        return None;
-    }
-
-    let source_path = &options.sources[0];
-    let source = match fs::read_to_string(source_path) {
-        Ok(source) => source,
-        Err(error) => {
-            diagnostics.push(Diagnostic::error(
-                source_path.clone(),
-                "CD2330004",
-                format!("source file is not readable UTF-8 text: {error}"),
-            ));
-            return None;
+    let mut sources = Vec::with_capacity(options.sources.len());
+    for source_path in &options.sources {
+        match fs::read_to_string(source_path) {
+            Ok(text) => sources.push((source_path.clone(), text)),
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    source_path.clone(),
+                    "CD2330004",
+                    format!("source file is not readable UTF-8 text: {error}"),
+                ));
+                return None;
+            }
         }
-    };
-
-    if let Err(issue) = subset::parse(&source) {
-        let (line, column) = line_column(&source, issue.offset);
-        diagnostics.push(Diagnostic::at(
-            source_path.clone(),
-            line,
-            column,
-            Severity::Error,
-            "CD2330010",
-            issue.message,
-        ));
-        return None;
     }
 
     let output = options.output_path();
@@ -560,10 +523,21 @@ fn compile_assembly(
         ));
         return None;
     };
-    let bytes = match compile::compile(&source, assembly_name) {
+    let bytes = match csharp::compile(&sources, assembly_name) {
         Ok(bytes) => bytes,
-        Err(message) => {
-            diagnostics.push(Diagnostic::error(source_path.clone(), "CD2330011", message));
+        Err(error) => {
+            diagnostics.push(Diagnostic::at(
+                error.file.clone(),
+                error.line,
+                error.column,
+                Severity::Error,
+                if error.syntax {
+                    "CD2330010"
+                } else {
+                    "CD2330011"
+                },
+                error.message,
+            ));
             return None;
         }
     };
@@ -595,51 +569,6 @@ fn compile_assembly(
         }
     }
     Some(bytes)
-}
-
-/// Measured, not claimed: how the current syntax front end fares on every
-/// source file of a request it cannot compile yet.
-fn scan_frontend(sources: &[String]) -> Value {
-    let mut parser = crate::parser();
-    let mut files = 0usize;
-    let mut unreadable = 0usize;
-    let mut files_with_issues = 0usize;
-    let mut issue_count = 0usize;
-    let mut examples = Vec::new();
-    for source in sources {
-        let Ok(text) = fs::read_to_string(source) else {
-            unreadable += 1;
-            continue;
-        };
-        files += 1;
-        let tree = crate::parse(&mut parser, &text);
-        let issues = crate::syntax_issues(&tree);
-        if issues.is_empty() {
-            continue;
-        }
-        files_with_issues += 1;
-        issue_count += issues.len();
-        if examples.len() < MAX_FRONTEND_EXAMPLES {
-            let first = &issues[0];
-            examples.push(json!({
-                "file": source,
-                "issue_count": issues.len(),
-                "first": {
-                    "line": first.line,
-                    "column": first.column,
-                    "kind": first.kind,
-                },
-            }));
-        }
-    }
-    json!({
-        "engine": FRONTEND_ENGINE,
-        "files": files,
-        "unreadable_files": unreadable,
-        "files_with_syntax_issues": files_with_issues,
-        "issue_count": issue_count,
-        "examples": examples,
-    })
 }
 
 fn write_report(
@@ -885,6 +814,17 @@ mod tests {
         let offset = source.find("void").unwrap();
         assert_eq!(line_column(source, offset), (2, 5));
         assert_eq!(line_column(source, 0), (1, 1));
+    }
+
+    fn line_column(source: &str, offset: usize) -> (usize, usize) {
+        let end = offset.min(source.len());
+        let prefix = &source[..end];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = match prefix.rfind('\n') {
+            Some(index) => prefix.len() - index,
+            None => prefix.len() + 1,
+        };
+        (line, column)
     }
 
     #[test]

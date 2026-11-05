@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $binaryName = if ($IsWindows) { 'compiler233-dotnet.exe' } else { 'compiler233-dotnet' }
 $binary = Join-Path $root "target/release/$binaryName"
@@ -76,15 +76,15 @@ $result = Invoke-Csc @($broken)
 Assert-True ($result.ExitCode -eq 1) 'broken source was accepted'
 Assert-True ($result.Output -match 'Broken\.cs\(\d+,\d+\): error CD2330010') "syntax diagnostic is not csc shaped: $($result.Output)"
 
-# Multi-file requests are refused, and the report measures the current front end.
+# Multi-file requests compile into a single assembly.
 $multiReport = Join-Path $work 'multi-report.json'
-$result = Invoke-Csc @('-target:library', "-out:$work/Multi.dll", $fixture, $second, "-report:$multiReport")
-Assert-True ($result.ExitCode -eq 1) 'multi-file request was accepted'
-Assert-True ($result.Output -match 'CD2330003') 'multi-file request did not report the unsupported case'
-Assert-True (-not (Test-Path (Join-Path $work 'Multi.dll'))) 'multi-file request produced an assembly'
+$multiOutput = Join-Path $work 'Multi.dll'
+$result = Invoke-Csc @('-target:library', "-out:$multiOutput", $fixture, $second, "-report:$multiReport")
+Assert-True ($result.ExitCode -eq 0) "multi-file request failed: $($result.Output)"
+Assert-True (Test-Path $multiOutput) 'multi-file request produced no assembly'
 $multi = Get-Content $multiReport -Raw | ConvertFrom-Json
-Assert-True ($multi.frontend_scan.files -eq 2) 'frontend scan did not cover every source file'
-Assert-True ($multi.frontend_scan.files_with_syntax_issues -eq 0) 'frontend scan reported issues in valid sources'
+Assert-True ($multi.source_count -eq 2) 'report did not record both sources'
+Assert-True ($multi.outcome -eq 'success') 'report outcome is not success'
 
 # Contract errors: csc codes for csc concepts, compiler233 codes for missing features.
 $result = Invoke-Csc @('-frobnicate:yes', $fixture)

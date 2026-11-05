@@ -37,6 +37,8 @@ jobs:
         shell: pwsh
       - run: ./tests/csc.ps1
         shell: pwsh
+      - run: ./tests/compile.ps1
+        shell: pwsh
       - run: ./tests/differential.ps1
         shell: pwsh
       - run: ./tests/differential.ps1 -Mode compile
