@@ -39,6 +39,17 @@ namespace Demo
             }
             first.Bonus = 5;
             total = total + first.Bonus;
+
+            int[] values = new int[3];
+            values[0] = 1;
+            values[1] = 2;
+            values[2] = 3;
+            int sum = 0;
+            foreach (int value in values)
+            {
+                sum = sum + value;
+            }
+            total = total + sum + values.Length;
             return total;
         }
     }

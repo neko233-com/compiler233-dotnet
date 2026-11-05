@@ -71,6 +71,7 @@ enum Ty {
     Bool,
     String,
     Class(String),
+    Array(Box<Ty>),
     Named(String),
 }
 
@@ -161,6 +162,17 @@ enum Stmt {
         name: String,
         value: Expr,
     },
+    AssignIndex {
+        target: Expr,
+        index: Expr,
+        value: Expr,
+    },
+    ForEach {
+        ty: Ty,
+        name: String,
+        collection: Expr,
+        body: Block,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +213,14 @@ enum Expr {
     New {
         type_name: String,
         args: Vec<Expr>,
+    },
+    NewArray {
+        element: Ty,
+        size: Box<Expr>,
+    },
+    Index {
+        target: Box<Expr>,
+        index: Box<Expr>,
     },
     Assign {
         name: String,
@@ -380,6 +400,16 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(types)
+    }
+
+    fn parse_new_type(&mut self) -> Result<Ty, CompileError> {
+        let name = self.parse_qualified_name()?;
+        Ok(match name.as_str() {
+            "int" => Ty::Int,
+            "bool" => Ty::Bool,
+            "string" | "String" => Ty::String,
+            other => Ty::Class(other.to_string()),
+        })
     }
 
     fn parse_qualified_name(&mut self) -> Result<String, CompileError> {
@@ -609,7 +639,7 @@ impl<'a> Parser<'a> {
         }
         while self.eat("[") {
             self.expect("]")?;
-            ty = Ty::Named(format!("{name}[]"));
+            ty = Ty::Array(Box::new(ty.clone()));
         }
         Ok(ty)
     }
@@ -723,8 +753,24 @@ impl<'a> Parser<'a> {
                 self.expect(";")?;
                 return Ok(Stmt::Continue);
             }
-            "throw" | "try" | "foreach" | "switch" | "do" | "case" | "default" | "goto"
-            | "lock" | "using" | "yield" | "checked" | "unchecked" | "fixed" | "unsafe" => {
+            "foreach" => {
+                self.bump();
+                self.expect("(")?;
+                let ty = self.parse_type_reference()?;
+                let name = self.identifier()?;
+                self.expect("in")?;
+                let collection = self.parse_expression()?;
+                self.expect(")")?;
+                let body = self.parse_statement_block()?;
+                return Ok(Stmt::ForEach {
+                    ty,
+                    name,
+                    collection,
+                    body,
+                });
+            }
+            "throw" | "try" | "switch" | "do" | "case" | "default" | "goto" | "lock" | "using"
+            | "yield" | "checked" | "unchecked" | "fixed" | "unsafe" => {
                 return Err(self.error(format!(
                     "'{}' statements are not supported by the bounded core yet",
                     self.text()
@@ -768,6 +814,16 @@ impl<'a> Parser<'a> {
         }
         let expression = self.parse_expression()?;
         if self.check("=") {
+            if let Expr::Index { target, index } = expression {
+                self.bump();
+                let value = self.parse_expression()?;
+                self.expect(";")?;
+                return Ok(Stmt::AssignIndex {
+                    target: *target,
+                    index: *index,
+                    value,
+                });
+            }
             if let Expr::Member { target, name } = expression {
                 self.bump();
                 let value = self.parse_expression()?;
@@ -956,6 +1012,16 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
+            if self.check("[") {
+                self.bump();
+                let index = self.parse_expression()?;
+                self.expect("]")?;
+                expression = Expr::Index {
+                    target: Box::new(expression),
+                    index: Box::new(index),
+                };
+                continue;
+            }
             if self.check("(") {
                 let args = self.parse_arguments()?;
                 match expression {
@@ -991,7 +1057,18 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Result<Expr, CompileError> {
         if self.check("new") {
             self.bump();
-            let type_name = self.parse_qualified_name()?;
+            let element = self.parse_new_type()?;
+            if self.eat("[") {
+                let size = self.parse_expression()?;
+                self.expect("]")?;
+                return Ok(Expr::NewArray {
+                    element,
+                    size: Box::new(size),
+                });
+            }
+            let Ty::Class(type_name) = element else {
+                return Err(self.error("only classes can be constructed with 'new Type(...)'"));
+            };
             let args = self.parse_arguments()?;
             return Ok(Expr::New { type_name, args });
         }
@@ -1142,6 +1219,10 @@ fn type_error(
     CompileError::new(&decl.file, source, decl.offset, message)
 }
 
+fn is_reference(ty: &Ty) -> bool {
+    matches!(ty, Ty::String | Ty::Class(_) | Ty::Array(_))
+}
+
 fn resolve_type(ty: &Ty, types: &HashMap<String, Entry<TypeDef>>) -> Result<TypeSig, String> {
     Ok(match ty {
         Ty::Void => TypeSig::VOID,
@@ -1152,6 +1233,7 @@ fn resolve_type(ty: &Ty, types: &HashMap<String, Entry<TypeDef>>) -> Result<Type
             Some(entry) => TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone())),
             None => return Err(format!("unknown type '{name}'")),
         },
+        Ty::Array(element) => TypeSig::sz_array(resolve_type(element, types)?),
         Ty::Named(name) => return Err(format!("type '{name}' is not supported yet")),
     })
 }
@@ -1706,6 +1788,94 @@ impl<'a> FnEmitter<'a> {
                 Ok(())
             }
             Stmt::Assign { name, value } => self.assign(name, value),
+            Stmt::AssignIndex {
+                target,
+                index,
+                value,
+            } => {
+                let target_type = self.expr(target)?;
+                let Ty::Array(element) = target_type else {
+                    return Err(self.error("index assignment requires an array"));
+                };
+                let index_type = self.expr(index)?;
+                Self::require(&index_type, &Ty::Int, "array index")
+                    .map_err(|message| self.error(message))?;
+                let value_type = self.expr(value)?;
+                Self::require(&value_type, &element, "array element")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.op(if is_reference(&element) {
+                    OpCode::Stelem_Ref
+                } else {
+                    OpCode::Stelem_I4
+                });
+                Ok(())
+            }
+            Stmt::ForEach {
+                ty,
+                name,
+                collection,
+                body,
+            } => {
+                let collection_type = self.expr(collection)?;
+                let Ty::Array(element) = &collection_type else {
+                    return Err(self.error("foreach requires an array"));
+                };
+                if **element != *ty {
+                    return Err(self.error(format!(
+                        "foreach variable is {ty:?} but elements are {element:?}"
+                    )));
+                }
+                let array_signature = resolve_type(&collection_type, self.types)
+                    .map_err(|message| self.error(message))?;
+                let array_local = self.emitter.declare_local(array_signature);
+                self.emitter.stloc(array_local);
+                let index_local = self.emitter.declare_local(TypeSig::INT32);
+                self.emitter.ldc_i4(0);
+                self.emitter.stloc(index_local);
+                let element_signature =
+                    resolve_type(ty, self.types).map_err(|message| self.error(message))?;
+                let element_local = self.emitter.declare_local(element_signature);
+                let previous = self
+                    .locals
+                    .insert(name.clone(), (element_local, ty.clone()));
+                let top = self.emitter.label();
+                let step = self.emitter.label();
+                let end = self.emitter.label();
+                self.emitter.mark(top);
+                self.emitter.ldloc(index_local);
+                self.emitter.ldloc(array_local);
+                self.emitter.op(OpCode::Ldlen);
+                self.emitter.op(OpCode::Conv_I4);
+                self.emitter.op(OpCode::Clt);
+                self.emitter.branch(OpCode::Brfalse, end);
+                self.emitter.ldloc(array_local);
+                self.emitter.ldloc(index_local);
+                self.emitter.op(if is_reference(ty) {
+                    OpCode::Ldelem_Ref
+                } else {
+                    OpCode::Ldelem_I4
+                });
+                self.emitter.stloc(element_local);
+                self.loops.push((end, step));
+                self.block(body)?;
+                self.loops.pop();
+                self.emitter.mark(step);
+                self.emitter.ldloc(index_local);
+                self.emitter.ldc_i4(1);
+                self.emitter.op(OpCode::Add);
+                self.emitter.stloc(index_local);
+                self.emitter.branch(OpCode::Br, top);
+                self.emitter.mark(end);
+                match previous {
+                    Some(entry) => {
+                        self.locals.insert(name.clone(), entry);
+                    }
+                    None => {
+                        self.locals.remove(name);
+                    }
+                }
+                Ok(())
+            }
             Stmt::AssignMember {
                 target,
                 name,
@@ -2093,6 +2263,66 @@ impl<'a> FnEmitter<'a> {
                 name,
                 args,
             } => self.call(receiver.as_deref(), name, args),
+            Expr::NewArray { element, size } => {
+                let size_type = self.expr(size)?;
+                Self::require(&size_type, &Ty::Int, "array size")
+                    .map_err(|message| self.error(message))?;
+                let token = self.element_token(element)?;
+                self.emitter
+                    .emit(Instruction::new(OpCode::Newarr, Operand::Token(token)));
+                Ok(Ty::Array(Box::new(element.clone())))
+            }
+            Expr::Index { target, index } => {
+                let target_type = self.expr(target)?;
+                let Ty::Array(element) = target_type else {
+                    return Err(self.error("indexing requires an array"));
+                };
+                let index_type = self.expr(index)?;
+                Self::require(&index_type, &Ty::Int, "array index")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.op(if is_reference(&element) {
+                    OpCode::Ldelem_Ref
+                } else {
+                    OpCode::Ldelem_I4
+                });
+                Ok(*element)
+            }
+        }
+    }
+
+    fn element_token(&mut self, element: &Ty) -> Result<MemberToken, CompileError> {
+        match element {
+            Ty::Class(type_name) => {
+                let Some(entry) = self.types.get(type_name) else {
+                    return Err(self.error(format!("unknown type '{type_name}'")));
+                };
+                Ok(MemberToken::TypeDef(entry.clone()))
+            }
+            Ty::Int => match self
+                .module
+                .corlib_type("System.Int32")
+                .map_err(|error| self.error(error.to_string()))?
+            {
+                TypeDefOrRef::TypeRef(entry) => Ok(MemberToken::TypeRef(entry)),
+                _ => Err(self.error("System.Int32 is not a type reference")),
+            },
+            Ty::Bool => match self
+                .module
+                .corlib_type("System.Boolean")
+                .map_err(|error| self.error(error.to_string()))?
+            {
+                TypeDefOrRef::TypeRef(entry) => Ok(MemberToken::TypeRef(entry)),
+                _ => Err(self.error("System.Boolean is not a type reference")),
+            },
+            Ty::String => match self
+                .module
+                .corlib_type("System.String")
+                .map_err(|error| self.error(error.to_string()))?
+            {
+                TypeDefOrRef::TypeRef(entry) => Ok(MemberToken::TypeRef(entry)),
+                _ => Err(self.error("System.String is not a type reference")),
+            },
+            other => Err(self.error(format!("arrays of {other:?} are not supported"))),
         }
     }
 
@@ -2117,6 +2347,14 @@ impl<'a> FnEmitter<'a> {
             return Err(self.error(format!("unknown static member '{type_name}.{name}'")));
         }
         let target_type = self.expr(target)?;
+        if let Ty::Array(_) = target_type {
+            if name == "Length" {
+                self.emitter.op(OpCode::Ldlen);
+                self.emitter.op(OpCode::Conv_I4);
+                return Ok(Ty::Int);
+            }
+            return Err(self.error(format!("arrays have no member '{name}'")));
+        }
         let Ty::Class(type_name) = target_type else {
             return Err(self.error(format!("type {target_type:?} has no members")));
         };
