@@ -1854,6 +1854,25 @@ fn is_reference(ty: &Ty) -> bool {
     )
 }
 
+/// Select the CLR array instruction for the physical element representation.
+fn array_element_opcode(ty: &Ty, store: bool) -> Option<OpCode> {
+    match (ty, store) {
+        (Ty::Int, false) => Some(OpCode::Ldelem_I4),
+        (Ty::Int, true) => Some(OpCode::Stelem_I4),
+        (Ty::Float, false) => Some(OpCode::Ldelem_R4),
+        (Ty::Float, true) => Some(OpCode::Stelem_R4),
+        (Ty::Bool, false) => Some(OpCode::Ldelem_U1),
+        (Ty::Bool, true) => Some(OpCode::Stelem_I1),
+        (Ty::Object | Ty::String | Ty::Class(_) | Ty::Array(_) | Ty::Generic(_, _), false) => {
+            Some(OpCode::Ldelem_Ref)
+        }
+        (Ty::Object | Ty::String | Ty::Class(_) | Ty::Array(_) | Ty::Generic(_, _), true) => {
+            Some(OpCode::Stelem_Ref)
+        }
+        _ => None,
+    }
+}
+
 fn external_ty(sig: &TypeSig) -> Ty {
     match sig {
         TypeSig::Primitive(PrimitiveType::I4) => Ty::Int,
@@ -2853,13 +2872,11 @@ impl<'a> FnEmitter<'a> {
                 Self::require(&index_type, &Ty::Int, "array index")
                     .map_err(|message| self.error(message))?;
                 let value_type = self.expr(value)?;
-                Self::require(&value_type, &element, "array element")
+                self.require_assignable(&value_type, &element, "array element")
                     .map_err(|message| self.error(message))?;
-                self.emitter.op(if is_reference(&element) {
-                    OpCode::Stelem_Ref
-                } else {
-                    OpCode::Stelem_I4
-                });
+                let opcode = array_element_opcode(&element, true)
+                    .ok_or_else(|| self.error(format!("unsupported array element {element:?}")))?;
+                self.emitter.op(opcode);
                 Ok(())
             }
             Stmt::ForEach {
@@ -2908,11 +2925,9 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.branch(OpCode::Brfalse, end);
                 self.emitter.ldloc(array_local);
                 self.emitter.ldloc(index_local);
-                self.emitter.op(if is_reference(ty) {
-                    OpCode::Ldelem_Ref
-                } else {
-                    OpCode::Ldelem_I4
-                });
+                let opcode = array_element_opcode(ty, false)
+                    .ok_or_else(|| self.error(format!("unsupported array element {ty:?}")))?;
+                self.emitter.op(opcode);
                 self.emitter.stloc(element_local);
                 self.loops.push((end, step));
                 self.block(body)?;
@@ -3687,11 +3702,9 @@ impl<'a> FnEmitter<'a> {
                 let index_type = self.expr(index)?;
                 Self::require(&index_type, &Ty::Int, "array index")
                     .map_err(|message| self.error(message))?;
-                self.emitter.op(if is_reference(&element) {
-                    OpCode::Ldelem_Ref
-                } else {
-                    OpCode::Ldelem_I4
-                });
+                let opcode = array_element_opcode(&element, false)
+                    .ok_or_else(|| self.error(format!("unsupported array element {element:?}")))?;
+                self.emitter.op(opcode);
                 Ok(*element)
             }
         }
@@ -3699,6 +3712,14 @@ impl<'a> FnEmitter<'a> {
 
     fn element_token(&mut self, element: &Ty) -> Result<MemberToken, CompileError> {
         match element {
+            Ty::Object => match self
+                .module
+                .corlib_type("System.Object")
+                .map_err(|error| self.error(error.to_string()))?
+            {
+                TypeDefOrRef::TypeRef(entry) => Ok(MemberToken::TypeRef(entry)),
+                _ => Err(self.error("System.Object is not a type reference")),
+            },
             Ty::Class(type_name) => {
                 let Some(entry) = self.types.get(type_name) else {
                     return Err(self.error(format!("unknown type '{type_name}'")));

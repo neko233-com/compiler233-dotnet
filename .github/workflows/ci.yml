@@ -43,6 +43,8 @@ jobs:
         shell: pwsh
       - run: ./tests/primitives.ps1
         shell: pwsh
+      - run: ./tests/arrays.ps1
+        shell: pwsh
       - run: ./tests/preprocessor.ps1
         shell: pwsh
       - run: ./tests/output-safety.ps1
