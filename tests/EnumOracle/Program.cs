@@ -103,7 +103,7 @@ var specs = new (string Name, Type Underlying, bool Public, (string Name, object
     ("EnumFixture.UnsignedShort", typeof(ushort), true, [("Zero", (ushort)0), ("Maximum", (ushort)65535)]),
     ("EnumFixture.SignedInt", typeof(int), true, [("Minimum", int.MinValue), ("Maximum", int.MaxValue)]),
     ("EnumFixture.UnsignedInt", typeof(uint), true, [("Zero", 0U), ("One", 1U), ("Two", 2U), ("Maximum", uint.MaxValue)]),
-    ("EnumFixture.SignedLong", typeof(long), true, [("Minimum", long.MinValue), ("Maximum", long.MaxValue)]),
+    ("EnumFixture.SignedLong", typeof(long), true, [("Minimum", long.MinValue), ("Zero", 0L), ("Maximum", long.MaxValue)]),
     ("EnumFixture.UnsignedLong", typeof(ulong), true, [("Zero", 0UL), ("Maximum", ulong.MaxValue)]),
     ("EnumFixture.Empty", typeof(int), true, []),
     ("EnumFixture.InternalCode", typeof(int), false, [("One", 1)]),
@@ -181,7 +181,7 @@ if (api.GetField("ZeroField")!.FieldType.FullName != "EnumFixture.UnsignedLong" 
     Convert.ToUInt64(api.GetField("ZeroField")!.GetValue(null)) != 0) throw new Exception("Invalid zero field");
 foreach (var test in new[] {
     ("EnumFixture.Api", "Run", 2), ("EnumFixture.Api", "RoundTrip", -2),
-    ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143), ("EnumFixture.Api", "FlagOperations", 42), ("EnumFixture.Api", "FlagSwitch", 19), ("EnumFixture.Api", "IncrementEnums", 44), ("EnumFixture.Api", "IncrementExceptions", 2),
+    ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143), ("EnumFixture.Api", "FlagOperations", 42), ("EnumFixture.Api", "FlagSwitch", 19), ("EnumFixture.Api", "IncrementEnums", 44), ("EnumFixture.Api", "IncrementExceptions", 2), ("EnumFixture.Api", "EnumArithmetic", 45),
     ("EnumFixture.Api", "SwitchEnums", 43), ("EnumFixture.Api", "SwitchAll", 36), ("EnumFixture.Api", "SwitchUnsignedDense", 15), ("EnumFixture.Api", "SwitchNoDefault", 13),
     ("EnumOne.Holder", "Run", 1), ("EnumTwo.OtherHolder", "Run", 2),
     ("EnumImported.ImportedHolder", "Run", 1), ("EnumAliased.AliasHolder", "Run", 2)

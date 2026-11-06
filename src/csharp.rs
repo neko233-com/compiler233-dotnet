@@ -4635,6 +4635,13 @@ impl<'a> FnEmitter<'a> {
     fn constant_int(expression: &Expr) -> Option<i32> {
         match expression {
             Expr::Int(value, true) => Some(*value),
+            Expr::Member { target, name } if matches!(target.as_ref(), Expr::Name(type_name) if type_name == "int") => {
+                match name.as_str() {
+                    "MaxValue" => Some(i32::MAX),
+                    "MinValue" => Some(i32::MIN),
+                    _ => None,
+                }
+            }
             Expr::Negate(value) => Self::constant_int(value)?.checked_neg(),
             Expr::Complement(value) => Some(!Self::constant_int(value)?),
             Expr::Binary(op, left, right) => {
@@ -4671,6 +4678,64 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    fn int_constant_syntax(expression: &Expr) -> bool {
+        match expression {
+            Expr::Int(_, true) => true,
+            Expr::Member { target, name } => {
+                matches!(target.as_ref(), Expr::Name(type_name) if type_name == "int")
+                    && matches!(name.as_str(), "MinValue" | "MaxValue")
+            }
+            Expr::Negate(inner) | Expr::Complement(inner) => Self::int_constant_syntax(inner),
+            Expr::Binary(op, left, right) => {
+                matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Remainder
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                ) && Self::int_constant_syntax(left)
+                    && Self::int_constant_syntax(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn enum_integer_allowed(expression: &Expr, base: EnumBase) -> bool {
+        if Self::has_non_int_literal(expression) {
+            return false;
+        }
+        if Self::int_constant_syntax(expression) && Self::constant_int(expression).is_none() {
+            return false;
+        }
+        match base {
+            EnumBase::I4 | EnumBase::I8 => true,
+            _ => Self::constant_int(expression).is_some_and(|value| {
+                let (min, max) = base.bounds();
+                (min..=max).contains(&i128::from(value))
+            }),
+        }
+    }
+
+    fn convert_enum_integer(&mut self, base: EnumBase) {
+        if base.width() == 8 {
+            self.emitter.op(if base == EnumBase::U8 {
+                OpCode::Conv_U8
+            } else {
+                OpCode::Conv_I8
+            });
+        }
+    }
+
+    fn finish_enum_arithmetic(&mut self, base: EnumBase) {
+        if base.width() < 4 {
+            self.emitter.op(base.conversion());
+        }
+    }
+
     fn convert_expression(
         &mut self,
         actual: &Ty,
@@ -4692,7 +4757,8 @@ impl<'a> FnEmitter<'a> {
 
     fn validate_compound(&self, ty: &Ty, op: &str) -> Result<(), CompileError> {
         let valid = match op {
-            "+=" | "-=" | "*=" | "/=" | "%=" => matches!(ty, Ty::Int | Ty::Float),
+            "+=" | "-=" => matches!(ty, Ty::Int | Ty::Float | Ty::Enum(_, _)),
+            "*=" | "/=" | "%=" => matches!(ty, Ty::Int | Ty::Float),
             "&=" | "|=" | "^=" => matches!(ty, Ty::Int | Ty::Bool | Ty::Enum(_, _)),
             _ => false,
         };
@@ -4700,6 +4766,35 @@ impl<'a> FnEmitter<'a> {
             Ok(())
         } else {
             Err(self.error(format!("operator '{op}' is not supported for {ty:?}")))
+        }
+    }
+
+    fn convert_compound(
+        &mut self,
+        actual: &Ty,
+        expected: &Ty,
+        expression: &Expr,
+        op: &str,
+    ) -> Result<(), String> {
+        if let Ty::Enum(_, base) = expected
+            && matches!(op, "+=" | "-=")
+        {
+            if *actual != Ty::Int || !Self::enum_integer_allowed(expression, *base) {
+                return Err(
+                    "integer operand cannot convert to the enum underlying type".to_string()
+                );
+            }
+            self.convert_enum_integer(*base);
+            return Ok(());
+        }
+        self.convert_expression(actual, expected, expression, "compound assignment")
+    }
+
+    fn finish_compound(&mut self, ty: &Ty, op: &str) {
+        if let Ty::Enum(_, base) = ty
+            && matches!(op, "+=" | "-=")
+        {
+            self.finish_enum_arithmetic(*base);
         }
     }
 
@@ -5287,9 +5382,10 @@ impl<'a> FnEmitter<'a> {
                         Operand::Token(MemberToken::Field(field.entry.clone())),
                     ));
                     let rhs = self.expr(value)?;
-                    self.convert_expression(&rhs, &field.ty, value, "compound assignment")
+                    self.convert_compound(&rhs, &field.ty, value, op)
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
+                    self.finish_compound(&field.ty, op);
                     self.emitter.emit(Instruction::new(
                         OpCode::Stfld,
                         Operand::Token(MemberToken::Field(field.entry)),
@@ -5328,9 +5424,10 @@ impl<'a> FnEmitter<'a> {
                         self.emitter.ldarg(0).callvirt(getter);
                     }
                     let rhs = self.expr(value)?;
-                    self.convert_expression(&rhs, &ty, value, "compound assignment")
+                    self.convert_compound(&rhs, &ty, value, op)
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
+                    self.finish_compound(&ty, op);
                     if is_static {
                         self.emitter.call(setter);
                         return Ok(());
@@ -5348,9 +5445,10 @@ impl<'a> FnEmitter<'a> {
                 let ty = self.load(name)?;
                 self.validate_compound(&ty, op)?;
                 let rhs = self.expr(value)?;
-                self.convert_expression(&rhs, &ty, value, "compound assignment")
+                self.convert_compound(&rhs, &ty, value, op)
                     .map_err(|message| self.error(message))?;
                 self.emitter.op(opcode);
+                self.finish_compound(&ty, op);
                 self.store_top(name)?;
                 Ok(())
             }
@@ -5479,9 +5577,10 @@ impl<'a> FnEmitter<'a> {
                         Operand::Token(MemberToken::Field(field.entry.clone())),
                     ));
                     let rhs = self.expr(value)?;
-                    self.convert_expression(&rhs, &field.ty, value, "compound assignment")
+                    self.convert_compound(&rhs, &field.ty, value, op)
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
+                    self.finish_compound(&field.ty, op);
                     self.emitter.emit(Instruction::new(
                         OpCode::Stfld,
                         Operand::Token(MemberToken::Field(field.entry)),
@@ -5507,9 +5606,10 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.dup();
                 self.emitter.callvirt(getter);
                 let rhs = self.expr(value)?;
-                self.convert_expression(&rhs, &property.ty, value, "compound assignment")
+                self.convert_compound(&rhs, &property.ty, value, op)
                     .map_err(|message| self.error(message))?;
                 self.emitter.op(opcode);
+                self.finish_compound(&property.ty, op);
                 self.emitter.callvirt(setter);
                 Ok(())
             }
@@ -6895,6 +6995,35 @@ impl<'a> FnEmitter<'a> {
                 let (info, value) = self.enum_constant(inner)?;
                 Some((info, info.base.from_bits(!(value as u64))))
             }
+            Expr::Binary(op @ (BinaryOp::Add | BinaryOp::Subtract), left, right) => {
+                let (info, enum_value, number, add) =
+                    if let Some((info, value)) = self.enum_constant(left) {
+                        if !Self::enum_integer_allowed(right, info.base) {
+                            return None;
+                        }
+                        (
+                            info,
+                            value,
+                            Self::constant_int(right)?,
+                            matches!(op, BinaryOp::Add),
+                        )
+                    } else if matches!(op, BinaryOp::Add) {
+                        let (info, value) = self.enum_constant(right)?;
+                        if !Self::enum_integer_allowed(left, info.base) {
+                            return None;
+                        }
+                        (info, value, Self::constant_int(left)?, true)
+                    } else {
+                        return None;
+                    };
+                let result = if add {
+                    enum_value + i128::from(number)
+                } else {
+                    enum_value - i128::from(number)
+                };
+                let (min, max) = info.base.bounds();
+                (min..=max).contains(&result).then_some((info, result))
+            }
             Expr::Binary(
                 op @ (BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor),
                 left,
@@ -7206,6 +7335,103 @@ impl<'a> FnEmitter<'a> {
 
         let mut left_ty = self.expr(left)?;
         let mut right_ty = self.expr(right)?;
+        if matches!(op, BinaryOp::Add | BinaryOp::Subtract) {
+            match (&left_ty, &right_ty) {
+                (Ty::Enum(_, base), Ty::Int) => {
+                    if Self::enum_integer_allowed(right, *base) {
+                        if let (Some((_, enum_value)), Some(number)) =
+                            (self.enum_constant(left), Self::constant_int(right))
+                        {
+                            let result = if matches!(op, BinaryOp::Add) {
+                                enum_value + i128::from(number)
+                            } else {
+                                enum_value - i128::from(number)
+                            };
+                            let (min, max) = base.bounds();
+                            if !(min..=max).contains(&result) {
+                                return Err(self.error(
+                                    "constant enum arithmetic exceeds the underlying type",
+                                ));
+                            }
+                        }
+                        self.convert_enum_integer(*base);
+                        self.emitter.op(if matches!(op, BinaryOp::Add) {
+                            OpCode::Add
+                        } else {
+                            OpCode::Sub
+                        });
+                        self.finish_enum_arithmetic(*base);
+                        return Ok(left_ty);
+                    }
+                    if matches!(op, BinaryOp::Subtract)
+                        && *base == EnumBase::I4
+                        && Self::is_enum_zero(right)
+                    {
+                        self.emitter.op(OpCode::Sub);
+                        return Ok(Ty::Int);
+                    }
+                    return Err(
+                        self.error("integer operand cannot convert to the enum underlying type")
+                    );
+                }
+                (Ty::Int, Ty::Enum(_, base)) => {
+                    if matches!(op, BinaryOp::Add) && Self::enum_integer_allowed(left, *base) {
+                        if let (Some(number), Some((_, enum_value))) =
+                            (Self::constant_int(left), self.enum_constant(right))
+                        {
+                            let result = i128::from(number) + enum_value;
+                            let (min, max) = base.bounds();
+                            if !(min..=max).contains(&result) {
+                                return Err(self.error(
+                                    "constant enum arithmetic exceeds the underlying type",
+                                ));
+                            }
+                        }
+                        let signature =
+                            resolve_type(&right_ty, self.types, self.externals, &mut *self.module)
+                                .map_err(|message| self.error(message))?;
+                        let temporary = self.emitter.declare_local(signature);
+                        self.emitter.stloc(temporary);
+                        self.convert_enum_integer(*base);
+                        self.emitter.ldloc(temporary).op(OpCode::Add);
+                        self.finish_enum_arithmetic(*base);
+                        return Ok(right_ty);
+                    }
+                    if matches!(op, BinaryOp::Subtract)
+                        && *base == EnumBase::I4
+                        && Self::is_enum_zero(left)
+                    {
+                        if let Some((_, value)) = self.enum_constant(right)
+                            && !(i32::MIN as i128..=i32::MAX as i128).contains(&-value)
+                        {
+                            return Err(
+                                self.error("constant enum difference exceeds the underlying type")
+                            );
+                        }
+                        self.emitter.op(OpCode::Sub);
+                        return Ok(Ty::Int);
+                    }
+                    return Err(self.error("integer operand cannot be used with this enum"));
+                }
+                (Ty::Enum(left_name, base), Ty::Enum(right_name, _))
+                    if matches!(op, BinaryOp::Subtract)
+                        && left_name == right_name
+                        && *base == EnumBase::I4 =>
+                {
+                    if let (Some((_, left)), Some((_, right))) =
+                        (self.enum_constant(left), self.enum_constant(right))
+                        && !(i32::MIN as i128..=i32::MAX as i128).contains(&(left - right))
+                    {
+                        return Err(
+                            self.error("constant enum difference exceeds the underlying type")
+                        );
+                    }
+                    self.emitter.op(OpCode::Sub);
+                    return Ok(Ty::Int);
+                }
+                _ => {}
+            }
+        }
         if matches!(
             op,
             BinaryOp::Equal

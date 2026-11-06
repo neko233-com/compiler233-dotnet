@@ -12,7 +12,7 @@ namespace EnumFixture {
     public enum UnsignedShort : ushort { Zero = 0, Maximum = 65535 }
     public enum SignedInt : int { Minimum = -2147483648, Maximum = 2147483647 }
     public enum UnsignedInt : uint { Zero = 0, One = 1, Two = 2, Maximum = 4294967295U }
-    public enum SignedLong : long { Minimum = -9223372036854775808L, Maximum = 9223372036854775807L }
+    public enum SignedLong : long { Minimum = -9223372036854775808L, Zero = 0, Maximum = 9223372036854775807L }
     public enum UnsignedLong : ulong { Zero = 0, Maximum = 18446744073709551615UL }
     public enum Empty { }
     internal enum InternalCode { One = 1 }
@@ -58,6 +58,12 @@ namespace EnumFixture {
         public static bool FalseTick() { Calls = Calls + 10; return false; }
         public static CounterBox GetCounter() { Calls = Calls + 1; return SharedCounter; }
         public static Direction NextDirection(Direction value) { return ++value; }
+        public static int NextAmount() { Calls = Calls + 1; return 1; }
+        public static Direction NextValue() { Calls = Calls * 10 + 2; return Direction.Zero; }
+        public static Direction AddDirection(Direction value, int amount) { return value + amount; }
+        public static Direction AddFromLeft(int amount, Direction value) { return amount + value; }
+        public static int Difference(Direction left, Direction right) { return left - right; }
+        public static int SignedDifference(SignedInt left, SignedInt right) { return left - right; }
         public static int Run() {
             Direction value = Direction.Positive;
             if (value == Direction.Positive) return (int)Echo(value);
@@ -167,12 +173,57 @@ namespace EnumFixture {
             try { ++empty[0]; } catch (System.IndexOutOfRangeException) { seen = seen + 1; }
             return seen;
         }
+        public static int EnumArithmetic() {
+            Direction x = AddDirection(Direction.Positive, 1);
+            if (x != Direction.Next || AddFromLeft(1, Direction.Positive) != Direction.Next) return -1;
+            if (Difference(Direction.Positive, Direction.Negative) != 4) return -2;
+            if (SignedDifference(SignedInt.Maximum, SignedInt.Minimum) != -1) return -16;
+            if ((0 - Direction.Positive) != -2 || (Direction.Positive - 0U) != 2) return -3;
+            Direction same = Direction.Positive - 0;
+            if (same != Direction.Positive) return -4;
+            SignedByte a = SignedByte.Maximum; a = a + 1;
+            UnsignedByte b = UnsignedByte.Maximum; b = b + 1;
+            SignedShort c = SignedShort.Maximum; c = c + 1;
+            UnsignedShort d = UnsignedShort.Maximum; d = d + 1;
+            SignedInt e = SignedInt.Maximum; e = e + 1;
+            UnsignedInt f = UnsignedInt.Maximum; f = f + 1;
+            SignedLong g = SignedLong.Maximum; g = g + 1;
+            UnsignedLong h = UnsignedLong.Maximum; h = h + 1;
+            if (a != SignedByte.Minimum || b != UnsignedByte.Zero) return -5;
+            if (c != SignedShort.Minimum || d != UnsignedShort.Zero) return -6;
+            if (e != SignedInt.Minimum || f != UnsignedInt.Zero) return -7;
+            if (g != SignedLong.Minimum || h != UnsignedLong.Zero) return -8;
+            b = b - 1;
+            if (b != UnsignedByte.Maximum) return -9;
+            int negative = -1;
+            g = SignedLong.Zero + negative;
+            if ((int)g != -1) return -10;
+            Calls = 0;
+            Direction ordered = NextAmount() + NextValue();
+            if ((int)ordered != 1 || Calls != 12) return -11;
+            a = SignedByte.Maximum; a += 1;
+            if (a != SignedByte.Minimum) return -12;
+            b = UnsignedByte.Zero; b -= 1;
+            if (b != UnsignedByte.Maximum) return -13;
+            h = UnsignedLong.Maximum; h += 1;
+            if (h != UnsignedLong.Zero) return -14;
+            FlagBox box = new FlagBox();
+            box.Property = Bits.Read;
+            box.Field -= 1;
+            box.Property += 1;
+            if (box.Field != Bits.Write || box.Property != Bits.Write) return -15;
+            SharedCounter.Value = UnsignedByte.Maximum;
+            Calls = 0;
+            GetCounter().Value += 1;
+            if (SharedCounter.Value != UnsignedByte.Zero || Calls != 1) return -17;
+            return 45;
+        }
         public static int Classify(Direction value) {
             switch (value) {
                 case Direction.Negative: return 3;
                 case (1 & 0): return 4;
                 case Direction.Positive: return 5;
-                case (Direction)3: return 7;
+                case Direction.Positive + 1: return 7;
                 default: return 6;
             }
         }
