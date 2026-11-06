@@ -2076,7 +2076,12 @@ impl<'a> Parser<'a> {
                     virtual_kind = VirtualKind::Override;
                     self.bump();
                 }
-                "readonly" | "const" | "sealed" | "unsafe" | "extern" | "async" | "partial" => {
+                "readonly" | "const" => {
+                    return Err(
+                        self.error(format!("'{}' members are not supported yet", self.text()))
+                    );
+                }
+                "sealed" | "unsafe" | "extern" | "async" | "partial" => {
                     if self.text() != "unsafe" {
                         invalid_constructor_modifier = true;
                     }
@@ -3593,8 +3598,10 @@ fn array_element_opcode(ty: &Ty, store: bool) -> Option<OpCode> {
 fn external_ty(sig: &TypeSig, enums: &EnumValues, allow_local: bool) -> Ty {
     match sig {
         TypeSig::Primitive(PrimitiveType::I4) => Ty::Int,
+        TypeSig::Primitive(PrimitiveType::R4) => Ty::Float,
         TypeSig::Primitive(PrimitiveType::Boolean) => Ty::Bool,
         TypeSig::Primitive(PrimitiveType::String) => Ty::String,
+        TypeSig::Primitive(PrimitiveType::Object) => Ty::Object,
         TypeSig::Primitive(PrimitiveType::Void) => Ty::Void,
         TypeSig::Class(TypeDefOrRef::TypeDef(entry)) => Ty::Class(entry.get().full_name()),
         TypeSig::Class(TypeDefOrRef::TypeRef(entry)) => Ty::Class(entry.get().full_name()),
@@ -4785,6 +4792,155 @@ impl<'a> FnEmitter<'a> {
             })
     }
 
+    fn shadows_type_root(&self, path: &str) -> bool {
+        let root = path.split('.').next().unwrap_or(path);
+        self.locals.contains_key(root)
+            || self.params.iter().any(|(name, _)| name == root)
+            || self.field_symbol(&self.current, root).is_some()
+            || self
+                .symbols
+                .get(&self.current)
+                .is_some_and(|symbol| symbol.properties.contains_key(root))
+    }
+
+    /// Resolve a type-qualified field without evaluating the type name as a value.
+    fn static_field(
+        &mut self,
+        receiver: &Expr,
+        name: &str,
+        writing: bool,
+    ) -> Result<Option<(Ty, MemberToken)>, CompileError> {
+        let Some(path) = Self::type_path(receiver) else {
+            return Ok(None);
+        };
+        if self.shadows_type_root(&path) {
+            return Ok(None);
+        }
+        let mut parts = path.splitn(2, '.');
+        let root = parts.next().unwrap_or(&path);
+        let alias = self.enum_imports.aliases.get(root);
+        let path = if let Some(alias) = alias {
+            let alias = alias.strip_prefix("global::").unwrap_or(alias);
+            match parts.next() {
+                Some(rest) => format!("{alias}.{rest}"),
+                None => alias.to_string(),
+            }
+        } else {
+            path
+        };
+        let lookup = |full: &str| -> Option<(bool, String)> {
+            let short = full.rsplit('.').next().unwrap_or(full);
+            if let Some(entry) = self.types.get(full).or_else(|| self.types.get(short))
+                && entry.get().full_name() == full
+            {
+                return Some((true, entry.get().name.clone()));
+            }
+            self.externals
+                .types
+                .contains_key(full)
+                .then(|| (false, full.to_string()))
+        };
+        let owner = if alias.is_some() {
+            lookup(&path)
+        } else {
+            let mut namespace = self.namespace.as_str();
+            let mut found = None;
+            while !namespace.is_empty() {
+                if let Some(candidate) = lookup(&format!("{namespace}.{path}")) {
+                    found = Some(candidate);
+                    break;
+                }
+                namespace = namespace.rsplit_once('.').map_or("", |(parent, _)| parent);
+            }
+            if found.is_none() {
+                found = lookup(&path);
+            }
+            if found.is_none() {
+                for namespace in &self.enum_imports.namespaces {
+                    if let Some(candidate) = lookup(&format!("{namespace}.{path}")) {
+                        if found
+                            .as_ref()
+                            .is_some_and(|previous| previous != &candidate)
+                        {
+                            return Err(self.error(format!("type name '{path}' is ambiguous")));
+                        }
+                        found = Some(candidate);
+                    }
+                }
+            }
+            found
+        };
+        let Some((local, owner)) = owner else {
+            return Ok(None);
+        };
+        let (ty, token, flags) = if local {
+            let Some(field) = self.field_symbol(&owner, name) else {
+                return Ok(None);
+            };
+            self.require_field_access(&field.entry, true, None)?;
+            let flags = field.entry.get().flags;
+            (field.ty, MemberToken::Field(field.entry), flags)
+        } else {
+            let short = owner.rsplit('.').next().unwrap_or(&owner);
+            if self
+                .externals
+                .by_short_name
+                .get(short)
+                .is_some_and(|names| {
+                    names
+                        .iter()
+                        .filter(|candidate| *candidate == &owner)
+                        .count()
+                        > 1
+                })
+            {
+                return Err(self.error(format!("referenced type '{owner}' is ambiguous")));
+            }
+            let Some((index, field)) = self.externals.field_in_chain(&owner, name) else {
+                return Ok(None);
+            };
+            self.require_field_access(&field, false, None)?;
+            let (flags, signature) = {
+                let field = field.get();
+                (field.flags, field.signature.ty.clone())
+            };
+            let ty = external_ty(&signature, self.enums, false);
+            fn supported(ty: &Ty) -> bool {
+                match ty {
+                    Ty::Int
+                    | Ty::Float
+                    | Ty::Bool
+                    | Ty::String
+                    | Ty::Object
+                    | Ty::Enum(_, _)
+                    | Ty::Class(_) => true,
+                    Ty::Array(element) => supported(element),
+                    _ => false,
+                }
+            }
+            if !supported(&ty) {
+                return Err(self.error(format!("field '{owner}.{name}' has an unsupported type")));
+            }
+            let token = self
+                .module
+                .import_foreign_field(&field, &self.externals.modules[index])
+                .map_err(|error| self.error(error.to_string()))?;
+            (ty, token, flags)
+        };
+        if !flags.contains(FieldFlags::Static) {
+            return Err(self.error(format!("'{owner}.{name}' is not static")));
+        }
+        if flags.contains(FieldFlags::Literal) {
+            return Err(self.error("referenced constant fields are not supported yet"));
+        }
+        if writing && flags.contains(FieldFlags::InitOnly) {
+            return Err(self.error(format!(
+                "readonly field '{owner}.{name}' cannot be assigned"
+            )));
+        }
+        Ok(Some((ty, token)))
+    }
+
     fn method_symbol(
         &self,
         type_name: &str,
@@ -5906,6 +6062,21 @@ impl<'a> FnEmitter<'a> {
                     "^=" => OpCode::Xor,
                     other => return Err(self.error(format!("unsupported operator '{other}'"))),
                 };
+                if let Some((ty, token)) = self.static_field(target, name, true)? {
+                    self.validate_compound(&ty, op)?;
+                    self.emitter.emit(Instruction::new(
+                        OpCode::Ldsfld,
+                        Operand::Token(token.clone()),
+                    ));
+                    let rhs = self.expr(value)?;
+                    self.convert_compound(&rhs, &ty, value, op)
+                        .map_err(|message| self.error(message))?;
+                    self.emitter.op(opcode);
+                    self.finish_compound(&ty, op);
+                    self.emitter
+                        .emit(Instruction::new(OpCode::Stsfld, Operand::Token(token)));
+                    return Ok(());
+                }
                 let target_type = self.expr(target)?;
                 let Ty::Class(type_name) = target_type else {
                     return Err(self.error("compound assignment requires a class instance"));
@@ -5960,6 +6131,19 @@ impl<'a> FnEmitter<'a> {
                 name,
                 value,
             } => {
+                if let Some((ty, token)) = self.static_field(target, name, true)? {
+                    let actual = self.expr(value)?;
+                    self.convert_expression(
+                        &actual,
+                        &ty,
+                        value,
+                        &format!("assignment to '{name}'"),
+                    )
+                    .map_err(|message| self.error(message))?;
+                    self.emitter
+                        .emit(Instruction::new(OpCode::Stsfld, Operand::Token(token)));
+                    return Ok(());
+                }
                 let target_type = self.expr(target)?;
                 let Ty::Class(type_name) = target_type else {
                     return Err(self.error(format!("type {target_type:?} has no fields")));
@@ -6692,6 +6876,22 @@ impl<'a> FnEmitter<'a> {
         delta: i32,
         prefix: bool,
     ) -> Result<Ty, CompileError> {
+        if let Some((ty, token)) = self.static_field(target, name, true)? {
+            self.emitter.emit(Instruction::new(
+                OpCode::Ldsfld,
+                Operand::Token(token.clone()),
+            ));
+            if !prefix {
+                self.emitter.dup();
+            }
+            self.increment_top(&ty, delta)?;
+            if prefix {
+                self.emitter.dup();
+            }
+            self.emitter
+                .emit(Instruction::new(OpCode::Stsfld, Operand::Token(token)));
+            return Ok(ty);
+        }
         if let Some(type_name) = Self::type_path(target)
             && self.types.contains_key(&type_name)
             && !self.locals.contains_key(&type_name)
@@ -7508,9 +7708,15 @@ impl<'a> FnEmitter<'a> {
                 }
             }
         }
+        if let Some((ty, token)) = self.static_field(target, name, false)? {
+            self.emitter
+                .emit(Instruction::new(OpCode::Ldsfld, Operand::Token(token)));
+            return Ok(ty);
+        }
         // `Type.StaticProperty` does not evaluate the type name as a value.
         if let Expr::Name(type_name) = target
             && self.types.contains_key(type_name)
+            && !self.shadows_type_root(type_name)
         {
             if let Some(property) = self
                 .symbols

@@ -18,11 +18,34 @@ $oracle = Join-Path $root 'tests/EnumOracle/bin/Release/net10.0/EnumOracle.dll'
 if ($LASTEXITCODE -ne 0) { throw 'Static metadata or execution validation failed' }
 $consumerSource = Join-Path $work 'StaticConsumer.cs'
 $consumerOutput = Join-Path $work 'StaticConsumer.dll'
-[IO.File]::WriteAllText($consumerSource, 'using StaticFixture; public static class StaticConsumer { public static int Run() { return Operations.Run() + Plain.Add(3); } }')
+[IO.File]::WriteAllText($consumerSource, 'using StaticFixture; using Values = StaticFixture.FieldAccess; public static class StaticConsumer { public static int Run() { Values.Number = 10; Values.Number += 3; int previous = Values.Number++; if (previous != 13 || StaticFixture.FieldAccess.Number != 14) return -1; Values.Code = FieldCode.A; Values.Code |= FieldCode.B; if (Values.Code != FieldCode.Both) return -2; Values.Text = "ok"; Values.Enabled = true; Values.Rate = 2f; if (Values.Text != "ok" || !Values.Enabled || Values.Rate != 2f || Values.Value != null) return -3; return Operations.Run() + Plain.Add(3) + Values.Number; } }')
 & $binary csc $consumerSource "-reference:$reference" "-out:$consumerOutput"
 if ($LASTEXITCODE -ne 0) { throw 'Static reference consumer failed to compile' }
-& dotnet $oracle --invoke $consumerOutput 'StaticConsumer' 'Run' '1241'
+& dotnet $oracle --invoke $consumerOutput 'StaticConsumer' 'Run' '1255'
 if ($LASTEXITCODE -ne 0) { throw 'Static reference consumer failed to execute' }
+& dotnet build (Join-Path $root 'tests/StaticForeign/StaticForeign.csproj') -c Release --nologo -v quiet
+if ($LASTEXITCODE -ne 0) { throw 'Foreign static field fixture failed to build' }
+$foreign = Join-Path $work 'StaticForeign.dll'
+Copy-Item -LiteralPath (Join-Path $root 'tests/StaticForeign/bin/Release/net10.0/StaticForeign.dll') -Destination $foreign
+$foreignSource = Join-Path $work 'ForeignConsumer.cs'
+$foreignOutput = Join-Path $work 'ForeignConsumer.dll'
+[IO.File]::WriteAllText($foreignSource, 'using ForeignFieldFixture; public static class ForeignConsumer { public static int Run() { Values.Counter = 3; Values.Counter += 4; int old = Values.Counter++; Values.Mode = Status.One; Values.Mode |= Status.Two; Values.Rate = 2f; Values.Text = "ok"; Values.Ready = true; Values.Numbers = new int[1]; Values.Numbers[0] = 9; Values.Codes = new Status[1]; Values.Codes[0] = Status.One; if (old != 7 || Values.Counter != 8 || Values.Mode != Status.Both) return -1; if (Values.Rate != 2f || Values.Text != "ok" || !Values.Ready || Values.Value != null || Values.Numbers[0] != 9 || Values.Codes[0] != Status.One) return -2; return Values.Counter + Values.ReadOnly; } }')
+& $binary csc $foreignSource "-reference:$foreign" "-out:$foreignOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Foreign static field consumer failed to compile' }
+& dotnet $oracle --invoke $foreignOutput 'ForeignConsumer' 'Run' '14'
+if ($LASTEXITCODE -ne 0) { throw 'Foreign static field consumer failed to execute' }
+$runtime = & dotnet --list-runtimes | Where-Object { $_ -match '^Microsoft\.NETCore\.App ' } | Select-Object -Last 1
+if ($runtime -notmatch '^Microsoft\.NETCore\.App (\S+) \[(.+)\]$') { throw 'No .NET runtime found' }
+$core = Join-Path (Join-Path $Matches[2] $Matches[1]) 'System.Private.CoreLib.dll'
+$frameworkSource = Join-Path $work 'FrameworkField.cs'
+$frameworkOutput = Join-Path $work 'FrameworkField.dll'
+[IO.File]::WriteAllText($frameworkSource, 'public static class FrameworkField { public static int Run() { if (System.String.Empty == "") return 1; return 0; } }')
+& $binary csc $frameworkSource "-reference:$core" "-out:$frameworkOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Framework static field consumer failed to compile' }
+& dotnet $oracle --invoke $frameworkOutput 'FrameworkField' 'Run' '1'
+if ($LASTEXITCODE -ne 0) { throw 'Framework static field consumer failed to execute' }
+& dotnet $oracle --static-framework $frameworkOutput
+if ($LASTEXITCODE -ne 0) { throw 'Framework static field assembly identity was incorrect' }
 $before = (Get-FileHash -Algorithm SHA256 $output).Hash
 $referenceBefore = (Get-FileHash -Algorithm SHA256 $reference).Hash
 $bad = Join-Path $work 'Bad.cs'
@@ -51,6 +74,10 @@ foreach ($invalid in @(
     'static class S { } class C { void M(S value) { } }',
     'static class S { } class C { void M() { S value = null; } }',
     'static class S { } class C { void M() { new S(); } }',
+    'class S { public int Field; } class C { int M() { return S.Field; } }',
+    'class S { private static int Field; } class C { int M() { return S.Field; } }',
+    'static class S { public static readonly int Field = 1; }',
+    'class S { public const int Field = 1; }',
     'class C { static Different() { } }'
 )) {
     [IO.File]::WriteAllText($bad, $invalid)
@@ -71,5 +98,19 @@ if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before -or
     (Get-FileHash -Algorithm SHA256 $reference).Hash -ne $referenceBefore) {
     throw 'Invalid external static compilation changed a previous output'
 }
-Write-Output 'Invalid static class and constructor declarations rejected; previous outputs preserved.'
+foreach ($invalid in @(
+    'using ForeignFieldFixture; class C { void M() { Values.ReadOnly = 1; } }',
+    'using ForeignFieldFixture; class C { void M() { Values.ReadOnly++; } }',
+    'using ForeignFieldFixture; class C { int M() { return Values.Literal; } }',
+    'using ForeignFieldFixture; class C { int M() { return Values.Hidden; } }',
+    'using ForeignFieldFixture; class C { int M() { return Instance.Number; } }',
+    'class C { int M() { return Values.Counter; } }',
+    'using ForeignFieldFixture; using OtherForeign; class C { int M() { return Values.Counter; } }'
+)) {
+    [IO.File]::WriteAllText($bad, $invalid)
+    $null = & $binary csc $bad "-reference:$foreign" "-out:$output" 2>&1
+    if ($LASTEXITCODE -ne 1) { throw "Invalid foreign field access was accepted: $invalid" }
+    if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Invalid field access changed a previous output.' }
+}
+Write-Output 'Invalid static declarations and field accesses rejected; previous outputs preserved.'
 exit 0

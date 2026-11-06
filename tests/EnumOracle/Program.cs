@@ -53,7 +53,7 @@ if (args.Length == 3 && args[0] == "--static")
         using var pe = new PEReader(stream);
         var reader = pe.GetMetadataReader();
         foreach (var (name, explicitCtor) in new[] {
-            ("Operations", true), ("Plain", false), ("NoFields", true), ("ExpressionBody", true), ("Failing", true), ("Runner", false)
+            ("Operations", true), ("Plain", false), ("NoFields", true), ("ExpressionBody", true), ("Failing", true), ("FieldAccess", false), ("OrderTracker", false), ("LateStore", true), ("EarlyRead", true), ("Runner", false)
         })
         {
             var type = reader.TypeDefinitions.Select(reader.GetTypeDefinition)
@@ -89,6 +89,23 @@ if (args.Length == 3 && args[0] == "--static")
     object? steps = assembly.GetType("StaticFixture.Ordinary", true)!.GetField("Steps")!.GetValue(null);
     if (!Equals(steps, 175)) throw new Exception($"Static constructors did not run once each: {steps}");
     Console.WriteLine("Static class metadata, initialization order, exception caching and reference image passed.");
+    return;
+}
+if (args.Length == 2 && args[0] == "--static-framework")
+{
+    using var stream = File.OpenRead(args[1]);
+    using var pe = new PEReader(stream);
+    var reader = pe.GetMetadataReader();
+    var frameworkReference = reader.AssemblyReferences.Select(reader.GetAssemblyReference)
+        .Single(item => reader.GetString(item.Name) == "System.Private.CoreLib");
+    byte[] keyOrToken = reader.GetBlobBytes(frameworkReference.PublicKeyOrToken);
+    byte[] token = frameworkReference.Flags.HasFlag(AssemblyFlags.PublicKey)
+        ? System.Security.Cryptography.SHA1.HashData(keyOrToken)[^8..].Reverse().ToArray()
+        : keyOrToken;
+    if (!token.SequenceEqual(Convert.FromHexString("7CEC85D7BEA7798E")) ||
+        frameworkReference.Version != typeof(string).Assembly.GetName().Version)
+        throw new Exception("Framework field assembly reference has an incorrect public-key token");
+    Console.WriteLine("Framework static field assembly identity passed.");
     return;
 }
 if (args.Length == 2 && args[0] == "--make-framework-bridge")
