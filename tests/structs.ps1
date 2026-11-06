@@ -21,8 +21,10 @@ $bad = Join-Path $work 'Bad.cs'
 foreach ($invalid in @(
     'readonly struct S { public int X; }',
     '[System.Serializable] struct S { public int X; }',
-    'struct S { private int X; }',
-    'struct S { public float X; }',
+    'struct S { protected int X; }',
+    'struct S { private int X; } class C { static int F() { S x = default(S); return x.X; } }',
+    'struct S { public S Child; }',
+    'enum E { Value } public struct S { public E Field; }',
     'struct S { public int X = 1; }',
     'struct S { public int X; public S(int x) { X = x; } }',
     'struct S { public int X; public int Read() { return X; } }',
@@ -30,6 +32,11 @@ foreach ($invalid in @(
     'struct S { public int X; } class C { static int F() { S x; return x.X; } }',
     'struct S { public int X; } class C { static int F() { S x = x; return x.X; } }',
     'struct S { public int X; } class C { static object F() { S x = default(S); return x; } }',
+    'struct S { public int X; } class C { S F() { return new S(1); } }',
+    'struct S { public int X; } class C { S F() { return new S { X = 1, X = 2 }; } }',
+    'struct S { public int X; } class C { S F() { return new S { Missing = 1 }; } }',
+    'struct S { private int X; } class C { S F() { return new S { X = 1 }; } }',
+    'struct S { public int X; } class C { S F() { return new S { X = "wrong" }; } }',
     'struct S { public int X; } class C { static S[] F() { return new S[1]; } }',
     'struct S { public int X; } class C { static int F() { S x = default(S); x.X++; return x.X; } }',
     'struct S { public int X; } class C { S x; void F() { x.X = 1; } }',
@@ -49,5 +56,23 @@ foreach ($invalid in @(
         throw 'Invalid struct compilation changed a previous output'
     }
 }
+$foreign = Join-Path $work 'StructCollisionReference.dll'
+& dotnet $oracle --make-struct-collision $foreign
+if ($LASTEXITCODE -ne 0) { throw 'Collision reference build failed' }
+[IO.File]::WriteAllText($bad, 'using StructLibrary; namespace StructLibrary { public struct Same { public int X; } } namespace StructCollision { public class C { public static Same Echo(Same value) { return value; } } }')
+$null = & $binary csc $bad "-r:$foreign" "-out:$output" "-refout:$reference" 2>&1
+if ($LASTEXITCODE -ne 1 -or (Get-FileHash -Algorithm SHA256 $output).Hash -ne $before -or
+    (Get-FileHash -Algorithm SHA256 $reference).Hash -ne $referenceBefore) {
+    throw 'Referenced class collision was accepted or changed an output'
+}
+$qualified = Join-Path $work 'Qualified.cs'
+$qualifiedOutput = Join-Path $work 'Qualified.dll'
+[IO.File]::WriteAllText($qualified, 'using Alias = StructLibrary.Same; namespace StructLibrary { public struct Same { public int X; } } namespace StructCollision { public class C { public static int Qualified() { StructLibrary.Same x = default(StructLibrary.Same); x.X = 8; return x.X; } public static int Aliased() { Alias x = default(Alias); x.X = 9; return x.X; } } }')
+& $binary csc $qualified "-r:$foreign" "-out:$qualifiedOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Qualified or aliased struct should remain resolvable' }
+& dotnet $oracle --invoke $qualifiedOutput 'StructCollision.C' 'Qualified' '8'
+if ($LASTEXITCODE -ne 0) { throw 'Qualified struct runtime failed' }
+& dotnet $oracle --invoke $qualifiedOutput 'StructCollision.C' 'Aliased' '9'
+if ($LASTEXITCODE -ne 0) { throw 'Aliased struct runtime failed' }
 Write-Output 'Unsupported struct forms rejected; previous outputs preserved.'
 exit 0

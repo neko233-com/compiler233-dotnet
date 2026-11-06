@@ -862,7 +862,7 @@ pub fn compile(
     let mut structs = HashMap::new();
     let empty_structs = HashMap::new();
     for (file, text) in sources {
-        let (types, enums) = parse_file(file, text, &program.enums, &empty_structs)?;
+        let (types, enums) = parse_file(file, text, &program.enums, &empty_structs, &externals)?;
         program.enums.extend(enums);
         for decl in types.into_iter().filter(|decl| decl.is_struct) {
             let full_name = if decl.namespace.is_empty() {
@@ -874,7 +874,7 @@ pub fn compile(
         }
     }
     for (file, text) in sources {
-        let (types, _) = parse_file(file, text, &program.enums, &structs)?;
+        let (types, _) = parse_file(file, text, &program.enums, &structs, &externals)?;
         program.types.extend(types);
     }
     emit(&program, assembly_name, sources, &externals)
@@ -1172,6 +1172,7 @@ impl Externals {
 struct Parser<'a> {
     enums: EnumValues,
     structs: &'a HashMap<String, bool>,
+    externals: &'a Externals,
     current_namespace: String,
     root_imports: EnumImports,
     scope_imports: EnumImports,
@@ -1315,6 +1316,7 @@ fn parse_file(
     source: &str,
     enums: &EnumValues,
     structs: &HashMap<String, bool>,
+    externals: &Externals,
 ) -> Result<(Vec<TypeDecl>, EnumValues), CompileError> {
     let tokens = syntax::lex(source).map_err(|error: SyntaxError| {
         CompileError::new(file, source, error.offset, error.message)
@@ -1322,6 +1324,7 @@ fn parse_file(
     let mut parser = Parser {
         enums: enums.clone(),
         structs,
+        externals,
         current_namespace: String::new(),
         root_imports: EnumImports::default(),
         scope_imports: EnumImports::default(),
@@ -1655,9 +1658,47 @@ impl<'a> Parser<'a> {
                 "type name '{name}' resolves to both an enum and a struct"
             ))),
             (Some(info), None) => Ok(Ty::Enum(info.full_name(), info.base)),
+            (None, Some(full_name)) if self.struct_conflicts_with_external(name, full_name) => {
+                Err(self.error(format!(
+                    "struct name '{name}' conflicts with a referenced type in scope"
+                )))
+            }
             (None, Some(full_name)) => Ok(Ty::Struct(full_name.to_string())),
             (None, None) => Ok(Ty::Class(name.to_string())),
         }
+    }
+
+    fn struct_conflicts_with_external(&self, name: &str, selected: &str) -> bool {
+        let imports = self.enum_imports();
+        let root = name.split('.').next().unwrap_or(name);
+        if imports.aliases.contains_key(root) {
+            return false;
+        }
+        let short = name.rsplit('.').next().unwrap_or(name);
+        let Some(candidates) = self.externals.by_short_name.get(short) else {
+            return false;
+        };
+        candidates.iter().any(|candidate| {
+            if candidate == selected {
+                return false;
+            }
+            if candidate == name
+                || imports
+                    .namespaces
+                    .iter()
+                    .any(|import| *candidate == format!("{import}.{name}"))
+            {
+                return true;
+            }
+            let mut scope = self.current_namespace.as_str();
+            while !scope.is_empty() {
+                if *candidate == format!("{scope}.{name}") {
+                    return true;
+                }
+                scope = scope.rsplit_once('.').map_or("", |(parent, _)| parent);
+            }
+            false
+        })
     }
 
     fn enum_imports(&self) -> EnumImports {
@@ -2109,17 +2150,24 @@ impl<'a> Parser<'a> {
         self.expect("{")?;
         while !self.check("}") && !self.at_end() {
             if is_struct {
-                self.expect("public")?;
-                self.expect("int")?;
+                let visibility = if self.eat("public") {
+                    Visibility::Public
+                } else if self.eat("internal") {
+                    Visibility::Internal
+                } else {
+                    self.eat("private");
+                    Visibility::Private
+                };
+                let ty = self.parse_type_reference()?;
                 let name = self.identifier()?;
                 self.expect(";")?;
                 decl.fields.push(FieldDecl {
                     name,
-                    ty: Ty::Int,
+                    ty,
                     is_static: false,
                     is_readonly: false,
                     is_const: false,
-                    visibility: Visibility::Public,
+                    visibility,
                     init: None,
                 });
             } else {
@@ -4149,6 +4197,25 @@ fn emit(
     validate_enum_flags(program, externals, sources)?;
     validate_enum_api_accessibility(program, sources)?;
     for decl in &program.types {
+        if decl.is_struct {
+            let scalar = |ty: &Ty| {
+                matches!(
+                    ty,
+                    Ty::Int | Ty::Float | Ty::Bool | Ty::String | Ty::Object | Ty::Enum(_, _)
+                )
+            };
+            for field in &decl.fields {
+                let supported =
+                    scalar(&field.ty) || matches!(&field.ty, Ty::Array(element) if scalar(element));
+                if !supported {
+                    return Err(type_error(
+                        decl,
+                        sources,
+                        format!("type of struct field '{}' is not supported yet", field.name),
+                    ));
+                }
+            }
+        }
         let mut names = std::collections::HashSet::new();
         for field in &decl.fields {
             if field.name == decl.name
@@ -7393,7 +7460,7 @@ impl<'a> FnEmitter<'a> {
         Some(type_name)
     }
 
-    fn default_struct(&mut self, ty: &Ty) -> Result<(), CompileError> {
+    fn initialized_struct_local(&mut self, ty: &Ty) -> Result<u16, CompileError> {
         let signature = resolve_type(ty, self.types, self.externals, &mut *self.module)
             .map_err(|message| self.error(message))?;
         let TypeSig::ValueType(TypeDefOrRef::TypeDef(entry)) = &signature else {
@@ -7405,6 +7472,11 @@ impl<'a> FnEmitter<'a> {
             OpCode::Initobj,
             Operand::Token(MemberToken::TypeDef(entry.clone())),
         ));
+        Ok(local)
+    }
+
+    fn default_struct(&mut self, ty: &Ty) -> Result<(), CompileError> {
+        let local = self.initialized_struct_local(ty)?;
         self.emitter.ldloc(local);
         Ok(())
     }
@@ -8163,12 +8235,36 @@ impl<'a> FnEmitter<'a> {
                 prefix,
             } => self.increment_index(target, index, *delta, *prefix),
             Expr::New { ty, args, fields } => match ty {
-                Ty::Struct(_) => {
-                    if !args.is_empty() || !fields.is_empty() {
-                        return Err(self
-                            .error("struct constructors and initializers are not supported yet"));
+                Ty::Struct(type_name) => {
+                    if !args.is_empty() {
+                        return Err(self.error("struct constructors are not supported yet"));
                     }
-                    self.default_struct(ty)?;
+                    let local = self.initialized_struct_local(ty)?;
+                    let short = type_name.rsplit('.').next().unwrap_or(type_name);
+                    let mut initialized = std::collections::HashSet::new();
+                    for (name, value) in fields {
+                        if !initialized.insert(name) {
+                            return Err(self.error(format!("duplicate initializer for '{name}'")));
+                        }
+                        let field = self.field_symbol(short, name).ok_or_else(|| {
+                            self.error(format!("unknown member '{type_name}.{name}'"))
+                        })?;
+                        self.require_field_access(&field.entry, true, Some(short))?;
+                        self.emitter.ldloca(local);
+                        let actual = self.expr(value)?;
+                        self.convert_expression(
+                            &actual,
+                            &field.ty,
+                            value,
+                            &format!("initializer of '{name}'"),
+                        )
+                        .map_err(|message| self.error(message))?;
+                        self.emitter.emit(Instruction::new(
+                            OpCode::Stfld,
+                            Operand::Token(MemberToken::Field(field.entry)),
+                        ));
+                    }
+                    self.emitter.ldloc(local);
                     Ok(ty.clone())
                 }
                 Ty::Class(type_name) => {

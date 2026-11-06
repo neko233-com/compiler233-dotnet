@@ -45,6 +45,18 @@ static HashSet<ushort> ReadOpcodes(MethodInfo method)
     }
     return result;
 }
+if (args.Length == 2 && args[0] == "--make-struct-collision")
+{
+    var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
+        .Select(path => MetadataReference.CreateFromFile(path));
+    const string collisionSource = "namespace StructCollision { public class Same { public int Value; } }";
+    var collisionCompilation = CSharpCompilation.Create("StructCollisionReference", [CSharpSyntaxTree.ParseText(collisionSource)],
+        references, new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+    using var collisionOutput = File.Create(args[1]);
+    var result = collisionCompilation.Emit(collisionOutput);
+    if (!result.Success) throw new Exception("Collision fixture failed: " + string.Join("\n", result.Diagnostics));
+    return;
+}
 if (args.Length == 3 && args[0] == "--structs")
 {
     foreach (string path in args[1..])
@@ -67,6 +79,21 @@ if (args.Length == 3 && args[0] == "--structs")
                 !reader.GetBlobBytes(field.Signature).SequenceEqual(new byte[] { 0x06, 0x08 })) ||
             point.GetMethods().Select(reader.GetMethodDefinition).Any(method => reader.GetString(method.Name) == ".ctor"))
             throw new Exception($"Incorrect struct fields or synthetic constructor in {path}");
+        var mixed = reader.TypeDefinitions.Select(reader.GetTypeDefinition)
+            .Single(item => reader.GetString(item.Namespace) == "StructFixture" && reader.GetString(item.Name) == "Mixed");
+        var mixedFields = mixed.GetFields().Select(reader.GetFieldDefinition).ToArray();
+        if (!mixedFields.Select(field => reader.GetString(field.Name)).SequenceEqual(
+                ["Count", "Enabled", "Ratio", "Name", "Token", "Data", "State", "Internal", "Secret", "Hidden"]) ||
+            mixedFields.Take(7).Any(field => field.Attributes != FieldAttributes.Public) ||
+            mixedFields[7].Attributes != FieldAttributes.Assembly ||
+            mixedFields.Skip(8).Any(field => field.Attributes != FieldAttributes.Private) ||
+            !reader.GetBlobBytes(mixedFields[1].Signature).SequenceEqual(new byte[] { 0x06, 0x02 }) ||
+            !reader.GetBlobBytes(mixedFields[2].Signature).SequenceEqual(new byte[] { 0x06, 0x0c }) ||
+            !reader.GetBlobBytes(mixedFields[3].Signature).SequenceEqual(new byte[] { 0x06, 0x0e }) ||
+            !reader.GetBlobBytes(mixedFields[4].Signature).SequenceEqual(new byte[] { 0x06, 0x1c }) ||
+            !reader.GetBlobBytes(mixedFields[5].Signature).SequenceEqual(new byte[] { 0x06, 0x1d, 0x08 }) ||
+            reader.GetBlobBytes(mixedFields[6].Signature)[1] != 0x11)
+            throw new Exception($"Incorrect mixed struct field metadata or value-type layout in {path}");
     }
     var assembly = LoadAssembly(args[1]);
     var type = assembly.GetType("StructFixture.Point", true)!;
@@ -77,6 +104,8 @@ if (args.Length == 3 && args[0] == "--structs")
         runner.GetMethod("ChangeCopy")!.GetParameters().Single().ParameterType != type ||
         !Equals(runner.GetMethod("Run")!.Invoke(null, null), 12797) ||
         !Equals(runner.GetMethod("ContainerCopy")!.Invoke(null, null), 384) ||
+        !Equals(runner.GetMethod("MixedCopy")!.Invoke(null, null), 2974) ||
+        !Equals(runner.GetMethod("InitializerOrder")!.Invoke(null, null), 1212) ||
         !Equals(assembly.GetType("StructConsumer.AliasRunner", true)!.GetMethod("Run")!.Invoke(null, null), 17))
         throw new Exception("Struct layout, signatures, copying or runtime result was incorrect");
     if (!ReadOpcodes(runner.GetMethod("Make")!).Contains(unchecked((ushort)OpCodes.Initobj.Value)) ||
@@ -84,7 +113,7 @@ if (args.Length == 3 && args[0] == "--structs")
         throw new Exception("Struct initialization or parameter address instruction missing");
     var framework = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
         .Select(path => MetadataReference.CreateFromFile(path));
-    const string source = "using StructFixture; public static class StructDownstream { public static int Run() { Point p = Runner.Make(); Point q = p; q.X = 8; if (Runner.ChangeCopy(p) != 9 || p.X != 3) return -1; return p.X * 100 + q.X * 10 + p.Y; } }";
+    const string source = "using StructFixture; public static class StructDownstream { public static int Run() { Point p = Runner.Make(); Point q = p; q.X = 8; if (Runner.ChangeCopy(p) != 9 || p.X != 3) return -1; Mixed m = default; m.Name = \"first\"; m.Enabled = true; m.Data = new int[] { 1 }; m.State = State.Ready; Mixed n = m; n.Name = \"second\"; n.Data[0] = 7; if (m.Name != \"first\" || n.Name != \"second\" || m.Data[0] != 7 || !n.Enabled || n.State != State.Ready) return -2; return p.X * 100 + q.X * 10 + p.Y; } }";
     var structCompilation = CSharpCompilation.Create("StructDownstream", [CSharpSyntaxTree.ParseText(source)],
         framework.Concat([MetadataReference.CreateFromFile(args[2])]),
         new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
