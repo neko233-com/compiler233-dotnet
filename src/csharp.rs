@@ -7959,6 +7959,32 @@ impl<'a> FnEmitter<'a> {
         if !generic_args.is_empty() {
             return Err(self.error(format!("unsupported enum method '{name}'")));
         }
+        if name == "HasFlag" && args.len() == 1 {
+            return self.enum_has_flag(receiver, &args[0]);
+        }
+        if matches!(name, "Equals" | "CompareTo") && args.len() == 1 {
+            let token = self
+                .enum_type_token(receiver)
+                .map_err(|message| self.error(message))?;
+            self.emitter
+                .emit(Instruction::new(OpCode::Box, Operand::Token(token)));
+            let argument = self.expr(&args[0])?;
+            self.convert_assignable(&argument, &Ty::Object, "argument")
+                .map_err(|message| self.error(message))?;
+            let (ty, signature) = if name == "Equals" {
+                (Ty::Bool, TypeSig::BOOL)
+            } else {
+                (Ty::Int, TypeSig::INT32)
+            };
+            let method = self.import_bcl_method(
+                "System.Runtime",
+                "System.Enum",
+                name,
+                MethodSig::new_instance(signature, vec![TypeSig::OBJECT]),
+            )?;
+            self.emitter.callvirt(method);
+            return Ok(ty);
+        }
         if name == "ToString" && args.len() == 1 {
             let token = self
                 .enum_type_token(receiver)
@@ -8007,6 +8033,71 @@ impl<'a> FnEmitter<'a> {
         )?;
         self.emitter.callvirt(method);
         Ok(ty)
+    }
+
+    fn enum_has_flag(&mut self, receiver: &Ty, argument: &Expr) -> Result<Ty, CompileError> {
+        let argument_type = self.expr(argument)?;
+        if argument_type == *receiver {
+            let signature = resolve_type(receiver, self.types, self.externals, &mut *self.module)
+                .map_err(|message| self.error(message))?;
+            let temporary = self.emitter.declare_local(signature);
+            self.emitter
+                .dup()
+                .stloc(temporary)
+                .op(OpCode::And)
+                .ldloc(temporary)
+                .op(OpCode::Ceq);
+            return Ok(Ty::Bool);
+        }
+        let enum_reference = self
+            .module
+            .corlib_type("System.Enum")
+            .map_err(|error| self.error(error.to_string()))?;
+        let argument_signature = match &argument_type {
+            Ty::Enum(_, _) => resolve_type(
+                &argument_type,
+                self.types,
+                self.externals,
+                &mut *self.module,
+            )
+            .map_err(|message| self.error(message))?,
+            Ty::Null => TypeSig::Class(enum_reference.clone()),
+            Ty::Class(_) if self.enum_boxing_cost(&argument_type) == Some(1) => resolve_type(
+                &argument_type,
+                self.types,
+                self.externals,
+                &mut *self.module,
+            )
+            .map_err(|message| self.error(message))?,
+            _ => return Err(self.error("HasFlag requires an enum argument")),
+        };
+        let temporary = self.emitter.declare_local(argument_signature);
+        self.emitter.stloc(temporary);
+        let receiver_token = self
+            .enum_type_token(receiver)
+            .map_err(|message| self.error(message))?;
+        self.emitter.emit(Instruction::new(
+            OpCode::Box,
+            Operand::Token(receiver_token),
+        ));
+        self.emitter.ldloc(temporary);
+        if matches!(argument_type, Ty::Enum(_, _)) {
+            let argument_token = self
+                .enum_type_token(&argument_type)
+                .map_err(|message| self.error(message))?;
+            self.emitter.emit(Instruction::new(
+                OpCode::Box,
+                Operand::Token(argument_token),
+            ));
+        }
+        let method = self.import_bcl_method(
+            "System.Runtime",
+            "System.Enum",
+            "HasFlag",
+            MethodSig::new_instance(TypeSig::BOOL, vec![TypeSig::Class(enum_reference)]),
+        )?;
+        self.emitter.callvirt(method);
+        Ok(Ty::Bool)
     }
 
     fn primitive_call(

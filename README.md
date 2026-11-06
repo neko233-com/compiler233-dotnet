@@ -125,7 +125,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 数值：支持部分 `int` 到 `float` 的隐式转换与混合运算；测试覆盖舍入、求值顺序和 `NaN` 的大小比较。完整数值类型与转换规则仍未实现。
 - 异常处理：支持部分 `try`/`catch`/`finally`、`throw`、重新抛出及 `catch ... when` 筛选器；测试覆盖筛选器在栈展开前执行、筛选器抛异常、变量修改、嵌套异常及跨保护区的返回、`break`、`continue`。完整异常类型解析和语言语义仍未覆盖。
 - 数组：一维数组构造、`a[i]` 读写、`a.Length` 和 `foreach` 遍历；`int`、`float`、`bool`、`string`、`object` 的元素指令与部分边界异常有运行时对照测试。
-- 枚举：支持八种整数底层类型、具名成员、前向引用及部分常量表达式，生成真实 CLR 枚举元数据；支持本程序集和外部引用中的顶层公共枚举签名、常量、数组和部分方法调用，以及比较、按位运算、与受支持整数的加减和复合赋值、自增自减、`object`/`System.Enum`/`System.ValueType` 装箱拆箱、`ToString`/`GetHashCode`、显式转换、部分零值隐式转换及全限定的 `System.Flags` 特性。`System.Enum` 和 `System.ValueType` 需要引用对应的框架程序集。两个枚举值相减目前仅支持 `int` 底层类型；`uint`/`long`/`ulong` 底层类型的成员初始化常量算术、外部嵌套枚举、类型转发、其他枚举特性及完整运算规则尚未实现。
+- 枚举：支持八种整数底层类型、具名成员、前向引用及部分常量表达式，生成真实 CLR 枚举元数据；支持本程序集和外部引用中的顶层公共枚举签名、常量、数组和部分方法调用，以及比较、按位运算、与受支持整数的加减和复合赋值、自增自减、`object`/`System.Enum`/`System.ValueType` 装箱拆箱、`ToString`/`GetHashCode`/`HasFlag`/`Equals`/`CompareTo`、显式转换、部分零值隐式转换及全限定的 `System.Flags` 特性。`System.Enum` 和 `System.ValueType` 需要引用对应的框架程序集。两个枚举值相减目前仅支持 `int` 底层类型；`uint`/`long`/`ulong` 底层类型的成员初始化常量算术、外部嵌套枚举、类型转发、其他枚举特性及完整运算规则尚未实现。
 - 继承：基类（本地或引用程序集）、`virtual`/`override` 虚调用、`: base(args)` 基类构造、基类方法继承与基类-派生类赋值兼容
 - 接口：`interface` 声明（抽象方法、无方法体）、类实现接口（`InterfaceImpl` + 隐式实现标记为 `virtual final newslot`）、接口类型变量与 `callvirt` 派发
 - 外部基类继承：`class X : System.Exception` 可编译，构造函数 `: base(args)`、继承的字段与属性（`get_X`）沿引用程序集的 `extends` 链解析

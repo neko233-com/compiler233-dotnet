@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
+using System.Reflection.Emit;
 using System.Runtime.Loader;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -14,6 +15,35 @@ static Assembly LoadAssembly(string path)
         return File.Exists(dependency) ? context.LoadFromAssemblyPath(dependency) : null;
     };
     return loader.LoadFromAssemblyPath(assemblyPath);
+}
+static HashSet<ushort> ReadOpcodes(MethodInfo method)
+{
+    var definitions = typeof(OpCodes).GetFields(BindingFlags.Public | BindingFlags.Static)
+        .Select(field => (OpCode)field.GetValue(null)!)
+        .GroupBy(opcode => unchecked((ushort)opcode.Value))
+        .ToDictionary(group => group.Key, group => group.First());
+    byte[] bytes = method.GetMethodBody()?.GetILAsByteArray() ?? throw new Exception("Method body missing");
+    var result = new HashSet<ushort>();
+    int position = 0;
+    while (position < bytes.Length)
+    {
+        ushort code = bytes[position++];
+        if (code == 0xfe) code = (ushort)(0xfe00 | bytes[position++]);
+        if (!definitions.TryGetValue(code, out var opcode)) throw new Exception($"Unknown IL opcode {code:X4}");
+        result.Add(code);
+        position += opcode.OperandType switch {
+            OperandType.InlineNone => 0,
+            OperandType.ShortInlineBrTarget or OperandType.ShortInlineI or OperandType.ShortInlineVar => 1,
+            OperandType.InlineVar => 2,
+            OperandType.InlineI or OperandType.InlineBrTarget or OperandType.InlineField or OperandType.InlineMethod or
+                OperandType.InlineSig or OperandType.InlineString or OperandType.InlineTok or OperandType.InlineType or OperandType.ShortInlineR => 4,
+            OperandType.InlineI8 or OperandType.InlineR => 8,
+            OperandType.InlineSwitch => 4 + checked(BitConverter.ToInt32(bytes, position) * 4),
+            _ => throw new Exception($"Unsupported IL operand {opcode.OperandType}")
+        };
+        if (position > bytes.Length) throw new Exception("Invalid IL operand length");
+    }
+    return result;
 }
 if (args.Length == 2 && args[0] == "--make-framework-bridge")
 {
@@ -176,6 +206,10 @@ CheckMethod("EnumTwo.OtherHolder", "Echo", "EnumTwo.Shared", "EnumTwo.Shared");
 CheckMethod("EnumImported.ImportedHolder", "Echo", "EnumOne.Shared", "EnumOne.Shared");
 CheckMethod("EnumAliased.AliasHolder", "Echo", "EnumTwo.Shared", "EnumTwo.Shared");
 var api = actual.GetType("EnumFixture.Api", true)!;
+var flagOpcodes = ReadOpcodes(api.GetMethod("HasFlagFast")!);
+if (!flagOpcodes.Contains(unchecked((ushort)OpCodes.And.Value)) || !flagOpcodes.Contains(unchecked((ushort)OpCodes.Ceq.Value)) ||
+    flagOpcodes.Contains(unchecked((ushort)OpCodes.Box.Value)) || flagOpcodes.Contains(unchecked((ushort)OpCodes.Callvirt.Value)))
+    throw new Exception("Same-type HasFlag did not use the allocation-free bitwise path");
 if (api.GetField("Current")!.FieldType.FullName != "EnumFixture.Direction") throw new Exception("Invalid Current field type");
 if (api.GetField("ZeroField")!.FieldType.FullName != "EnumFixture.UnsignedLong" ||
     Convert.ToUInt64(api.GetField("ZeroField")!.GetValue(null)) != 0) throw new Exception("Invalid zero field");
@@ -200,9 +234,16 @@ var formatDirection = api.GetMethod("FormatDirection")!;
 if (!Equals(formatDirection.Invoke(null, [null]), "Positive")) throw new Exception("Null format was not treated as general format");
 try { formatDirection.Invoke(null, ["invalid"]); throw new Exception("Invalid enum format unexpectedly succeeded"); }
 catch (TargetInvocationException exception) when (exception.InnerException is FormatException) { }
+var bitsValue = Enum.ToObject(actual.GetType("EnumFixture.Bits", true)!, 1);
+try { api.GetMethod("HasNull")!.Invoke(null, [bitsValue]); throw new Exception("HasFlag(null) unexpectedly succeeded"); }
+catch (TargetInvocationException exception) when (exception.InnerException is ArgumentNullException) { }
+try { api.GetMethod("HasOther")!.Invoke(null, [bitsValue, directionValue]); throw new Exception("HasFlag with another enum type unexpectedly succeeded"); }
+catch (TargetInvocationException exception) when (exception.InnerException is ArgumentException) { }
+try { api.GetMethod("CompareOther")!.Invoke(null, [bitsValue, directionValue]); throw new Exception("CompareTo with another enum type unexpectedly succeeded"); }
+catch (TargetInvocationException exception) when (exception.InnerException is ArgumentException) { }
 foreach (var test in new[] {
     ("EnumFixture.Api", "Run", 2), ("EnumFixture.Api", "RoundTrip", -2),
-    ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143), ("EnumFixture.Api", "FlagOperations", 42), ("EnumFixture.Api", "FlagSwitch", 19), ("EnumFixture.Api", "IncrementEnums", 44), ("EnumFixture.Api", "IncrementExceptions", 2), ("EnumFixture.Api", "EnumArithmetic", 45), ("EnumFixture.Api", "EnumBoxing", 46),
+    ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143), ("EnumFixture.Api", "FlagOperations", 42), ("EnumFixture.Api", "FlagSwitch", 19), ("EnumFixture.Api", "IncrementEnums", 44), ("EnumFixture.Api", "IncrementExceptions", 2), ("EnumFixture.Api", "EnumArithmetic", 45), ("EnumFixture.Api", "EnumBoxing", 46), ("EnumFixture.Api", "EnumMethods", 47),
     ("EnumFixture.Api", "SwitchEnums", 43), ("EnumFixture.Api", "SwitchAll", 36), ("EnumFixture.Api", "SwitchUnsignedDense", 15), ("EnumFixture.Api", "SwitchNoDefault", 13),
     ("EnumOne.Holder", "Run", 1), ("EnumTwo.OtherHolder", "Run", 2),
     ("EnumImported.ImportedHolder", "Run", 1), ("EnumAliased.AliasHolder", "Run", 2)

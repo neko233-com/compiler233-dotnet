@@ -40,6 +40,7 @@ public static class ExternalConsumer {
         if (wrapped != UnsignedLong.Zero) return -16;
         object boxed = UnsignedLong.Maximum;
         if ((UnsignedLong)boxed != UnsignedLong.Maximum || Direction.Positive.ToString() != "Positive" || Direction.Positive.ToString("D") != "2") return -17;
+        if (!UnsignedLong.Maximum.HasFlag(UnsignedLong.Zero) || !Direction.Positive.Equals(Direction.Positive)) return -18;
         if ((UnsignedLong.Maximum ^ UnsignedLong.Maximum) != UnsignedLong.Zero) return -13;
         h[0] = UnsignedLong.Zero;
         if (h[0]-- != UnsignedLong.Zero || h[0] != UnsignedLong.Maximum) return -14;

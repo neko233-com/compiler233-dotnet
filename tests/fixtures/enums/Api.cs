@@ -65,6 +65,12 @@ namespace EnumFixture {
         public static Direction NextDirection(Direction value) { return ++value; }
         public static int NextAmount() { Calls = Calls + 1; return 1; }
         public static Direction NextValue() { Calls = Calls * 10 + 2; return Direction.Zero; }
+        public static Bits LeftFlag() { Calls = Calls * 10 + 1; return Bits.Both; }
+        public static Bits RightFlag() { Calls = Calls * 10 + 2; return Bits.Read; }
+        public static bool HasOther(Bits value, Direction other) { return value.HasFlag(other); }
+        public static bool HasNull(Bits value) { return value.HasFlag(null); }
+        public static bool HasFlagFast(Bits value, Bits mask) { return value.HasFlag(mask); }
+        public static int CompareOther(Bits value, Direction other) { return value.CompareTo(other); }
         public static Direction AddDirection(Direction value, int amount) { return value + amount; }
         public static Direction AddFromLeft(int amount, Direction value) { return amount + value; }
         public static int Difference(Direction left, Direction right) { return left - right; }
@@ -243,6 +249,17 @@ namespace EnumFixture {
             Calls = 0;
             if (NextValue().ToString() != "Zero" || Calls != 2) return -11;
             return 46;
+        }
+        public static int EnumMethods() {
+            if (!Bits.Both.HasFlag(Bits.Read) || Bits.Read.HasFlag(Bits.Write) || !Bits.Read.HasFlag((Bits)0)) return -1;
+            if (!Bits.Read.Equals(Bits.Read) || Bits.Read.Equals(Bits.Write) || Bits.Read.Equals(null)) return -2;
+            if (Bits.Read.CompareTo(Bits.Write) >= 0 || Bits.Write.CompareTo(Bits.Read) <= 0 || Bits.Read.CompareTo(null) != 1) return -3;
+            Calls = 0;
+            if (!LeftFlag().HasFlag(RightFlag()) || Calls != 12) return -4;
+            if (!UnsignedLong.Maximum.HasFlag(UnsignedLong.Zero)) return -5;
+            if (!HasFlagFast(Bits.Both, Bits.Write)) return -6;
+            if (Bits.Read.Equals(Direction.Positive)) return -7;
+            return 47;
         }
         public static int Classify(Direction value) {
             switch (value) {
