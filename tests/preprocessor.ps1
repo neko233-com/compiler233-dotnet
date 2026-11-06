@@ -33,3 +33,4 @@ $result = & $binary csc "-out:$output" '-define:FLAG' $errorSource 2>&1 | Out-St
 if ($LASTEXITCODE -ne 1 -or $result -notmatch 'CD2330010') { throw "Active #error was not rejected: $result" }
 if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Failed compilation overwrote the previous DLL' }
 Write-Output 'Preprocessor runtime and output-preservation checks passed.'
+exit 0

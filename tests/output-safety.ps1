@@ -39,3 +39,4 @@ foreach ($option in @('-checked+', '-debug:portable', '-deterministic+', '-warna
     if (Test-Path $out) { throw "Unsupported option $option produced an artifact" }
 }
 Write-Output 'Output, report and input path collision checks passed.'
+exit 0
