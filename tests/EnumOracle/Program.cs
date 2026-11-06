@@ -45,6 +45,52 @@ static HashSet<ushort> ReadOpcodes(MethodInfo method)
     }
     return result;
 }
+if (args.Length == 3 && args[0] == "--static")
+{
+    foreach (string path in args[1..])
+    {
+        using var stream = File.OpenRead(path);
+        using var pe = new PEReader(stream);
+        var reader = pe.GetMetadataReader();
+        foreach (var (name, explicitCtor) in new[] {
+            ("Operations", true), ("Plain", false), ("NoFields", true), ("ExpressionBody", true), ("Failing", true), ("Runner", false)
+        })
+        {
+            var type = reader.TypeDefinitions.Select(reader.GetTypeDefinition)
+                .Single(definition => reader.GetString(definition.Namespace) == "StaticFixture" && reader.GetString(definition.Name) == name);
+            if (!type.Attributes.HasFlag(TypeAttributes.Abstract) || !type.Attributes.HasFlag(TypeAttributes.Sealed) ||
+                type.Attributes.HasFlag(TypeAttributes.BeforeFieldInit) == explicitCtor)
+                throw new Exception($"Incorrect static class attributes: {name} in {path}");
+            var methods = type.GetMethods().Select(reader.GetMethodDefinition).ToArray();
+            if (methods.Any(method => reader.GetString(method.Name) == ".ctor") ||
+                methods.Any(method => !method.Attributes.HasFlag(MethodAttributes.Static)))
+                throw new Exception($"Static class has instance members: {name} in {path}");
+            if (path == args[1] && explicitCtor && methods.Count(method => reader.GetString(method.Name) == ".cctor") != 1)
+                throw new Exception($"Static constructor missing: {name}");
+        }
+        var ordinary = reader.TypeDefinitions.Select(reader.GetTypeDefinition)
+            .Single(definition => reader.GetString(definition.Namespace) == "StaticFixture" && reader.GetString(definition.Name) == "Ordinary");
+        if (ordinary.Attributes.HasFlag(TypeAttributes.BeforeFieldInit)) throw new Exception("Explicit constructor did not remove BeforeFieldInit");
+        var marker = reader.TypeDefinitions.Select(reader.GetTypeDefinition)
+            .Single(definition => reader.GetString(definition.Namespace) == "StaticFixture" && reader.GetString(definition.Name) == "Marker");
+        if (!marker.Attributes.HasFlag(TypeAttributes.Interface) || marker.Attributes.HasFlag(TypeAttributes.BeforeFieldInit))
+            throw new Exception("Interface with a static constructor has incorrect attributes");
+    }
+    var assembly = LoadAssembly(args[1]);
+    object? result = assembly.GetType("StaticFixture.Runner", true)!.GetMethod("Run")!.Invoke(null, null);
+    if (!Equals(result, 49)) throw new Exception($"Static initialization returned {result}");
+    System.Runtime.CompilerServices.RuntimeHelpers.RunClassConstructor(assembly.GetType("StaticFixture.Marker", true)!.TypeHandle);
+    var failing = assembly.GetType("StaticFixture.Failing", true)!.GetMethod("Read")!;
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        try { failing.Invoke(null, null); throw new Exception("Failed static initialization unexpectedly succeeded"); }
+        catch (TargetInvocationException exception) when (exception.InnerException is TypeInitializationException { InnerException: InvalidOperationException }) { }
+    }
+    object? steps = assembly.GetType("StaticFixture.Ordinary", true)!.GetField("Steps")!.GetValue(null);
+    if (!Equals(steps, 175)) throw new Exception($"Static constructors did not run once each: {steps}");
+    Console.WriteLine("Static class metadata, initialization order, exception caching and reference image passed.");
+    return;
+}
 if (args.Length == 2 && args[0] == "--make-framework-bridge")
 {
     var bridgeReferences = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)

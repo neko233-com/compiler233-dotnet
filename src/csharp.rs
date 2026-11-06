@@ -275,7 +275,9 @@ struct TypeDecl {
     base: Option<String>,
     interfaces: Vec<String>,
     is_interface: bool,
+    is_static: bool,
     is_public: bool,
+    static_ctor: Option<Block>,
     fields: Vec<FieldDecl>,
     methods: Vec<MethodDecl>,
     properties: Vec<PropertyDecl>,
@@ -1491,9 +1493,27 @@ impl<'a> Parser<'a> {
                     )?;
                 }
                 "class" | "struct" | "interface" | "record" => {
+                    let is_static = type_modifiers.iter().any(|modifier| modifier == "static");
+                    if is_static
+                        && (text != "class"
+                            || type_modifiers
+                                .iter()
+                                .filter(|modifier| *modifier == "static")
+                                .count()
+                                != 1
+                            || type_modifiers.iter().any(|modifier| {
+                                matches!(modifier.as_str(), "abstract" | "sealed" | "readonly")
+                            }))
+                    {
+                        return Err(self.error("invalid static type declaration"));
+                    }
                     type_modifiers.clear();
                     type_attributes.clear();
-                    types.push(self.parse_type(&namespace, type_access.take().unwrap_or(false))?);
+                    types.push(self.parse_type(
+                        &namespace,
+                        type_access.take().unwrap_or(false),
+                        is_static,
+                    )?);
                     if self.check("}") && !namespace.is_empty() {
                         self.bump();
                         namespace.clear();
@@ -1939,7 +1959,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_type(&mut self, namespace: &str, is_public: bool) -> Result<TypeDecl, CompileError> {
+    fn parse_type(
+        &mut self,
+        namespace: &str,
+        is_public: bool,
+        is_static: bool,
+    ) -> Result<TypeDecl, CompileError> {
         let class_offset = self.token().start;
         let is_interface = self.check("interface");
         self.bump(); // class / struct / interface / record
@@ -1950,6 +1975,9 @@ impl<'a> Parser<'a> {
         let mut base = None;
         let mut interfaces = Vec::new();
         if self.eat(":") {
+            if is_static {
+                return Err(self.error("static classes cannot declare base types or interfaces"));
+            }
             // The first entry is the base class, the rest are interfaces.
             loop {
                 let entry = self.parse_qualified_name()?;
@@ -1979,7 +2007,9 @@ impl<'a> Parser<'a> {
             base,
             interfaces,
             is_interface,
+            is_static,
             is_public,
+            static_ctor: None,
             fields: Vec::new(),
             methods: Vec::new(),
             properties: Vec::new(),
@@ -2015,6 +2045,7 @@ impl<'a> Parser<'a> {
         let mut is_static = false;
         let mut access_bits = 0;
         let mut virtual_kind = VirtualKind::None;
+        let mut invalid_constructor_modifier = false;
         loop {
             match self.text() {
                 "public" | "private" | "internal" | "protected" => {
@@ -2031,6 +2062,9 @@ impl<'a> Parser<'a> {
                     self.bump();
                 }
                 "static" => {
+                    if is_static {
+                        return Err(self.error("duplicate static modifier"));
+                    }
                     is_static = true;
                     self.bump();
                 }
@@ -2043,6 +2077,9 @@ impl<'a> Parser<'a> {
                     self.bump();
                 }
                 "readonly" | "const" | "sealed" | "unsafe" | "extern" | "async" | "partial" => {
+                    if self.text() != "unsafe" {
+                        invalid_constructor_modifier = true;
+                    }
                     self.bump();
                 }
                 _ => break,
@@ -2067,6 +2104,40 @@ impl<'a> Parser<'a> {
         // Constructor: `Name(...)`.
         if self.token().kind == syntax::TokenKind::Identifier && self.peek(1) == Some("(") {
             let name = self.identifier()?;
+            if name != decl.name {
+                return Err(self.error("constructor name must match its declaring type"));
+            }
+            if invalid_constructor_modifier || virtual_kind != VirtualKind::None {
+                return Err(self.error("invalid constructor modifier"));
+            }
+            if decl.is_interface && !is_static {
+                return Err(self.error("interfaces cannot declare instance constructors"));
+            }
+            if is_static {
+                if access_bits != 0 {
+                    return Err(
+                        self.error("static constructors cannot have access or virtual modifiers")
+                    );
+                }
+                if decl.static_ctor.is_some() {
+                    return Err(self.error("duplicate static constructor"));
+                }
+                self.expect("(")?;
+                self.expect(")")?;
+                if self.check(":") {
+                    return Err(self.error("static constructors cannot have initializers"));
+                }
+                let body = if self.eat("=>") {
+                    self.parse_expression_body(true)?
+                } else {
+                    self.parse_block()?
+                };
+                decl.static_ctor = Some(body);
+                return Ok(());
+            }
+            if decl.is_static {
+                return Err(self.error("static classes cannot declare instance constructors"));
+            }
             let params = self.parse_parameter_list()?;
             let mut base_args = None;
             if self.eat(":") {
@@ -2105,6 +2176,13 @@ impl<'a> Parser<'a> {
                 base_args,
             });
             return Ok(());
+        }
+
+        if decl.is_static && !is_static {
+            return Err(self.error("static classes cannot declare instance members"));
+        }
+        if is_static && virtual_kind != VirtualKind::None {
+            return Err(self.error("static members cannot be virtual or override"));
         }
 
         let ty = self.parse_type_reference()?;
@@ -3542,6 +3620,12 @@ fn substitute(sig: &TypeSig, instantiation: &[TypeSig], enums: &EnumValues) -> T
     }
 }
 
+fn is_static_type(entry: &Entry<TypeDef>) -> bool {
+    let flags = entry.get().flags;
+    flags.contains(TypeAttributes::Abstract | TypeAttributes::Sealed)
+        && !flags.contains(TypeAttributes::Interface)
+}
+
 fn resolve_type(
     ty: &Ty,
     types: &HashMap<String, Entry<TypeDef>>,
@@ -3578,6 +3662,11 @@ fn resolve_type(
             }
         }
         Ty::Class(name) => match types.get(name) {
+            Some(entry) if is_static_type(entry) => {
+                return Err(format!(
+                    "static type '{name}' cannot be used as a value type"
+                ));
+            }
             Some(entry) => TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone())),
             None if core_exception_name(name).is_some() && externals.find(name).is_none() => {
                 TypeSig::Class(
@@ -3590,6 +3679,11 @@ fn resolve_type(
                 Some((index, entry)) => {
                     if !entry.get().is_visible() {
                         return Err(format!("referenced type '{name}' is inaccessible"));
+                    }
+                    if is_static_type(entry) {
+                        return Err(format!(
+                            "static type '{name}' cannot be used as a value type"
+                        ));
                     }
                     if entry
                         .get()
@@ -3865,7 +3959,15 @@ fn emit(
             }) | if decl.is_interface {
                 TypeAttributes::Interface | TypeAttributes::Abstract
             } else {
-                TypeAttributes::BeforeFieldInit
+                (if decl.is_static {
+                    TypeAttributes::Abstract | TypeAttributes::Sealed
+                } else {
+                    TypeAttributes::empty()
+                }) | if decl.static_ctor.is_none() {
+                    TypeAttributes::BeforeFieldInit
+                } else {
+                    TypeAttributes::empty()
+                }
             },
             &decl.namespace,
             &decl.name,
@@ -3953,8 +4055,22 @@ fn emit(
             continue;
         };
         let resolved = if let Some(local) = types.get(base_name) {
+            if is_static_type(local) {
+                return Err(type_error(
+                    decl,
+                    sources,
+                    format!("cannot derive from static type '{base_name}'"),
+                ));
+            }
             TypeDefOrRef::TypeDef(local.clone())
         } else if let Some((index, foreign)) = externals.find(base_name) {
+            if is_static_type(foreign) {
+                return Err(type_error(
+                    decl,
+                    sources,
+                    format!("cannot derive from static type '{base_name}'"),
+                ));
+            }
             module
                 .import_foreign_type(
                     &TypeDefOrRef::TypeDef(foreign.clone()),
@@ -3985,8 +4101,22 @@ fn emit(
         };
         for interface_name in &effective[index].1 {
             let resolved = if let Some(local) = types.get(interface_name) {
+                if is_static_type(local) {
+                    return Err(type_error(
+                        decl,
+                        sources,
+                        format!("static type '{interface_name}' cannot be an interface"),
+                    ));
+                }
                 TypeDefOrRef::TypeDef(local.clone())
             } else if let Some((index, foreign)) = externals.find(interface_name) {
+                if is_static_type(foreign) {
+                    return Err(type_error(
+                        decl,
+                        sources,
+                        format!("static type '{interface_name}' cannot be an interface"),
+                    ));
+                }
                 module
                     .import_foreign_type(
                         &TypeDefOrRef::TypeDef(foreign.clone()),
@@ -4238,7 +4368,7 @@ fn emit(
                 .insert(property.name.clone(), property_symbol);
         }
 
-        if !decl.is_interface && symbol.ctors.is_empty() {
+        if !decl.is_interface && !decl.is_static && symbol.ctors.is_empty() {
             let flags = MethodFlags::Public
                 | MethodFlags::HideBySig
                 | MethodFlags::SpecialName
@@ -4265,12 +4395,13 @@ fn emit(
         symbols.insert(decl.name.clone(), symbol);
     }
 
-    // Static constructors exist only when a static field has an initializer.
+    // An explicit static constructor follows the static field initializers.
     for (index, decl) in program.types.iter().enumerate() {
-        if !decl
-            .fields
-            .iter()
-            .any(|field| field.is_static && field.init.is_some())
+        if decl.static_ctor.is_none()
+            && !decl
+                .fields
+                .iter()
+                .any(|field| field.is_static && field.init.is_some())
         {
             continue;
         }
@@ -4471,6 +4602,10 @@ fn emit_body(
                 if let Some(initializer) = &field.init {
                     context.field_store(field, initializer)?;
                 }
+            }
+            if let Some(body) = &decl.static_ctor {
+                context.validate_do_scopes(body)?;
+                context.block(body)?;
             }
             context.emitter.ret();
         }
