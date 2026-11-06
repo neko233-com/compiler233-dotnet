@@ -53,6 +53,8 @@ jobs:
         shell: pwsh
       - run: ./tests/accessibility.ps1
         shell: pwsh
+      - run: ./tests/exceptions.ps1
+        shell: pwsh
       - run: ./tests/preprocessor.ps1
         shell: pwsh
       - run: ./tests/output-safety.ps1

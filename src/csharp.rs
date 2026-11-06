@@ -215,6 +215,38 @@ struct Block {
 }
 
 #[derive(Debug)]
+struct CatchClause {
+    ty: Option<Ty>,
+    name: Option<String>,
+    body: Block,
+}
+
+fn block_terminates(block: &Block) -> bool {
+    block
+        .statements
+        .last()
+        .is_some_and(|statement| match statement {
+            Stmt::Return(_) | Stmt::Throw(_) => true,
+            Stmt::Block(block) => block_terminates(block),
+            Stmt::If {
+                then_branch,
+                else_branch: Some(otherwise),
+                ..
+            } => block_terminates(then_branch) && block_terminates(otherwise),
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                finally.as_ref().is_some_and(block_terminates)
+                    || (block_terminates(body)
+                        && catches.iter().all(|clause| block_terminates(&clause.body)))
+            }
+            _ => false,
+        })
+}
+
+#[derive(Debug)]
 enum Stmt {
     Local {
         ty: Ty,
@@ -227,6 +259,12 @@ enum Stmt {
     },
     Expression(Expr),
     Return(Option<Expr>),
+    Throw(Option<Expr>),
+    Try {
+        body: Block,
+        catches: Vec<CatchClause>,
+        finally: Option<Block>,
+    },
     If {
         condition: Expr,
         then_branch: Block,
@@ -1300,6 +1338,58 @@ impl<'a> Parser<'a> {
                 self.expect(";")?;
                 return Ok(Stmt::Return(Some(value)));
             }
+            "throw" => {
+                self.bump();
+                if self.eat(";") {
+                    return Ok(Stmt::Throw(None));
+                }
+                let value = self.parse_expression()?;
+                self.expect(";")?;
+                return Ok(Stmt::Throw(Some(value)));
+            }
+            "try" => {
+                self.bump();
+                let body = self.parse_block()?;
+                let mut catches = Vec::new();
+                while self.eat("catch") {
+                    if catches
+                        .last()
+                        .is_some_and(|clause: &CatchClause| clause.ty.is_none())
+                    {
+                        return Err(self.error("a general catch must be the last catch clause"));
+                    }
+                    let (ty, name) = if self.eat("(") {
+                        let ty = self.parse_type_reference()?;
+                        let name = if self.check(")") {
+                            None
+                        } else {
+                            Some(self.identifier()?)
+                        };
+                        self.expect(")")?;
+                        (Some(ty), name)
+                    } else {
+                        (None, None)
+                    };
+                    if self.check("when") {
+                        return Err(self.error("exception filters are not supported yet"));
+                    }
+                    let body = self.parse_block()?;
+                    catches.push(CatchClause { ty, name, body });
+                }
+                let finally = if self.eat("finally") {
+                    Some(self.parse_block()?)
+                } else {
+                    None
+                };
+                if catches.is_empty() && finally.is_none() {
+                    return Err(self.error("try requires a catch or finally clause"));
+                }
+                return Ok(Stmt::Try {
+                    body,
+                    catches,
+                    finally,
+                });
+            }
             "break" => {
                 self.bump();
                 self.expect(";")?;
@@ -1326,8 +1416,8 @@ impl<'a> Parser<'a> {
                     body,
                 });
             }
-            "throw" | "try" | "switch" | "do" | "case" | "default" | "goto" | "lock" | "using"
-            | "yield" | "checked" | "unchecked" | "fixed" | "unsafe" => {
+            "switch" | "do" | "case" | "default" | "goto" | "lock" | "using" | "yield"
+            | "checked" | "unchecked" | "fixed" | "unsafe" => {
                 return Err(self.error(format!(
                     "'{}' statements are not supported by the bounded core yet",
                     self.text()
@@ -1998,6 +2088,51 @@ fn is_reference(ty: &Ty) -> bool {
     )
 }
 
+fn core_exception_name(name: &str) -> Option<&'static str> {
+    match name {
+        "Exception" | "System.Exception" => Some("System.Exception"),
+        "SystemException" | "System.SystemException" => Some("System.SystemException"),
+        "ArithmeticException" | "System.ArithmeticException" => Some("System.ArithmeticException"),
+        "DivideByZeroException" | "System.DivideByZeroException" => {
+            Some("System.DivideByZeroException")
+        }
+        "OverflowException" | "System.OverflowException" => Some("System.OverflowException"),
+        "InvalidOperationException" | "System.InvalidOperationException" => {
+            Some("System.InvalidOperationException")
+        }
+        "NullReferenceException" | "System.NullReferenceException" => {
+            Some("System.NullReferenceException")
+        }
+        "IndexOutOfRangeException" | "System.IndexOutOfRangeException" => {
+            Some("System.IndexOutOfRangeException")
+        }
+        "ArgumentException" | "System.ArgumentException" => Some("System.ArgumentException"),
+        "ArgumentNullException" | "System.ArgumentNullException" => {
+            Some("System.ArgumentNullException")
+        }
+        "ApplicationException" | "System.ApplicationException" => {
+            Some("System.ApplicationException")
+        }
+        _ => None,
+    }
+}
+
+fn core_exception_base(name: &str) -> Option<&'static str> {
+    match core_exception_name(name)? {
+        "System.SystemException" | "System.ApplicationException" => Some("System.Exception"),
+        "System.ArithmeticException"
+        | "System.InvalidOperationException"
+        | "System.NullReferenceException"
+        | "System.IndexOutOfRangeException"
+        | "System.ArgumentException" => Some("System.SystemException"),
+        "System.DivideByZeroException" | "System.OverflowException" => {
+            Some("System.ArithmeticException")
+        }
+        "System.ArgumentNullException" => Some("System.ArgumentException"),
+        _ => None,
+    }
+}
+
 /// Select the CLR array instruction for the physical element representation.
 fn array_element_opcode(ty: &Ty, store: bool) -> Option<OpCode> {
     match (ty, store) {
@@ -2058,6 +2193,13 @@ fn resolve_type(
         Ty::String => TypeSig::STRING,
         Ty::Class(name) => match types.get(name) {
             Some(entry) => TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone())),
+            None if core_exception_name(name).is_some() && externals.find(name).is_none() => {
+                TypeSig::Class(
+                    module
+                        .corlib_type(core_exception_name(name).unwrap())
+                        .map_err(|error| error.to_string())?,
+                )
+            }
             None => match externals.find(name) {
                 Some((index, entry)) => {
                     if !entry.get().is_visible() {
@@ -2206,6 +2348,10 @@ fn emit(
                     &TypeDefOrRef::TypeDef(foreign.clone()),
                     &externals.modules[*index],
                 )
+                .map_err(|error| type_error(decl, sources, error.to_string()))?
+        } else if let Some(name) = core_exception_name(base_name) {
+            module
+                .corlib_type(name)
                 .map_err(|error| type_error(decl, sources, error.to_string()))?
         } else {
             return Err(type_error(
@@ -2597,6 +2743,10 @@ fn emit_body(
         locals: HashMap::new(),
         params: Vec::new(),
         loops: Vec::new(),
+        protected_depth: 0,
+        finally_depth: 0,
+        catches: Vec::new(),
+        return_target: None,
         emitter: Emitter::new(),
         file: decl.file.clone(),
         source,
@@ -2636,11 +2786,7 @@ fn emit_body(
             if method.is_ctor || method.ret == Ty::Void {
                 context.emitter.ret();
             } else {
-                let ends_with_return = body
-                    .statements
-                    .last()
-                    .is_some_and(|statement| matches!(statement, Stmt::Return(_)));
-                if !ends_with_return {
+                if !block_terminates(body) {
                     return Err(context.error(format!(
                         "method '{}' must end with a return statement",
                         method.name
@@ -2668,11 +2814,7 @@ fn emit_body(
             match &property.getter {
                 Some(body) => {
                     context.block(body)?;
-                    let ends = body
-                        .statements
-                        .last()
-                        .is_some_and(|statement| matches!(statement, Stmt::Return(_)));
-                    if !ends {
+                    if !block_terminates(body) {
                         return Err(context.error("a getter must return a value"));
                     }
                 }
@@ -2713,7 +2855,22 @@ fn emit_body(
             context.emitter.ret();
         }
     }
+    if let Some((target, local)) = context.return_target {
+        context.emitter.mark(target);
+        if let Some(local) = local {
+            context.emitter.ldloc(local);
+        }
+        context.emitter.ret();
+    }
     Ok(context.emitter.finish())
+}
+
+#[derive(Clone, Copy)]
+struct LoopTarget {
+    end: EmitLabel,
+    next: EmitLabel,
+    protected_depth: usize,
+    finally_depth: usize,
 }
 
 struct FnEmitter<'a> {
@@ -2728,7 +2885,11 @@ struct FnEmitter<'a> {
     base: Option<String>,
     locals: HashMap<String, (u16, Ty)>,
     params: Vec<(String, Ty)>,
-    loops: Vec<(EmitLabel, EmitLabel)>,
+    loops: Vec<LoopTarget>,
+    protected_depth: usize,
+    finally_depth: usize,
+    catches: Vec<usize>,
+    return_target: Option<(EmitLabel, Option<u16>)>,
     emitter: Emitter,
     file: String,
     source: String,
@@ -3032,22 +3193,259 @@ impl<'a> FnEmitter<'a> {
         Ok(())
     }
 
+    fn scoped_block(&mut self, block: &Block) -> Result<(), CompileError> {
+        let locals = self.locals.clone();
+        let result = self.block(block);
+        self.locals = locals;
+        result
+    }
+
+    fn is_exception_class(&self, name: &str) -> bool {
+        let mut current = name.to_string();
+        for _ in 0..64 {
+            if let Some(local) = self.symbols.get(&current) {
+                let Some(base) = &local.base else {
+                    return false;
+                };
+                current = base.clone();
+                continue;
+            }
+            if core_exception_name(&current).is_some() {
+                return true;
+            }
+            let Some((_, external)) = self.externals.find(&current) else {
+                return false;
+            };
+            let next = external.get().extends.as_ref().map(|base| base.full_name());
+            let Some(next) = next else { return false };
+            current = next;
+        }
+        false
+    }
+
+    fn exception_derives_from(&self, name: &str, ancestor: &str) -> bool {
+        let mut current = name.to_string();
+        let target = if self.symbols.contains_key(ancestor) {
+            ancestor.to_string()
+        } else {
+            core_exception_name(ancestor)
+                .unwrap_or(ancestor)
+                .to_string()
+        };
+        for _ in 0..64 {
+            let local = self.symbols.get(&current);
+            let normalized = if local.is_some() {
+                current.as_str()
+            } else {
+                core_exception_name(&current).unwrap_or(&current)
+            };
+            if normalized == target {
+                return true;
+            }
+            if let Some(local) = local {
+                let Some(base) = &local.base else {
+                    return false;
+                };
+                current = base.clone();
+            } else if let Some(base) = core_exception_base(&current) {
+                current = base.to_string();
+            } else if let Some((_, external)) = self.externals.find(&current) {
+                let Some(base) = external.get().extends.as_ref().map(|base| base.full_name())
+                else {
+                    return false;
+                };
+                current = base;
+            } else {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn exception_reference(&mut self, ty: &Ty) -> Result<TypeDefOrRef, CompileError> {
+        let Ty::Class(name) = ty else {
+            return Err(self.error("catch type must derive from System.Exception"));
+        };
+        if !self.is_exception_class(name) {
+            return Err(self.error(format!("'{name}' does not derive from System.Exception")));
+        }
+        match resolve_type(ty, self.types, self.externals, &mut *self.module)
+            .map_err(|message| self.error(message))?
+        {
+            TypeSig::Class(reference) => Ok(reference),
+            _ => Err(self.error("catch type must be a class")),
+        }
+    }
+
+    fn try_statement(
+        &mut self,
+        body: &Block,
+        catches: &[CatchClause],
+        finally: Option<&Block>,
+    ) -> Result<(), CompileError> {
+        let mut previous: Vec<&str> = Vec::new();
+        for clause in catches {
+            if let Some(Ty::Class(name)) = &clause.ty {
+                if previous
+                    .iter()
+                    .any(|base| self.exception_derives_from(name, base))
+                {
+                    return Err(self.error(format!(
+                        "catch for '{name}' is unreachable after a base exception"
+                    )));
+                }
+                previous.push(name);
+            }
+        }
+        let outer_start = self.emitter.label();
+        let inner_start = self.emitter.label();
+        let inner_end = self.emitter.label();
+        let after_catches = self.emitter.label();
+        self.emitter.mark(outer_start);
+        self.emitter.mark(inner_start);
+        self.protected_depth += 1;
+        self.scoped_block(body)?;
+        self.protected_depth -= 1;
+        if !catches.is_empty() {
+            self.emitter.branch(OpCode::Leave, after_catches);
+        }
+        self.emitter.mark(inner_end);
+        for clause in catches {
+            let reference = match &clause.ty {
+                Some(ty) => self.exception_reference(ty)?,
+                None => self
+                    .module
+                    .corlib_type("System.Object")
+                    .map_err(|error| self.error(error.to_string()))?,
+            };
+            let start = self.emitter.label();
+            let end = self.emitter.label();
+            self.emitter.mark(start);
+            let previous = if let Some(name) = &clause.name {
+                if self.locals.contains_key(name)
+                    || self.params.iter().any(|(parameter, _)| parameter == name)
+                {
+                    return Err(self.error(format!(
+                        "catch variable '{name}' conflicts with an existing variable"
+                    )));
+                }
+                let ty = clause.ty.as_ref().expect("named catch has a type").clone();
+                let local = self
+                    .emitter
+                    .declare_local(TypeSig::Class(reference.clone()));
+                self.emitter.stloc(local);
+                Some((name.clone(), self.locals.insert(name.clone(), (local, ty))))
+            } else {
+                self.emitter.pop();
+                None
+            };
+            self.protected_depth += 1;
+            self.catches.push(self.finally_depth);
+            self.scoped_block(&clause.body)?;
+            self.catches.pop();
+            self.protected_depth -= 1;
+            if let Some((name, prior)) = previous {
+                if let Some(prior) = prior {
+                    self.locals.insert(name, prior);
+                } else {
+                    self.locals.remove(&name);
+                }
+            }
+            self.emitter.branch(OpCode::Leave, after_catches);
+            self.emitter.mark(end);
+            self.emitter
+                .exception_handler(Some(reference), inner_start, inner_end, start, end);
+        }
+        self.emitter.mark(after_catches);
+        if let Some(finally) = finally {
+            let after = self.emitter.label();
+            let start = self.emitter.label();
+            let end = self.emitter.label();
+            self.emitter.branch(OpCode::Leave, after);
+            self.emitter.mark(start);
+            self.finally_depth += 1;
+            self.protected_depth += 1;
+            self.scoped_block(finally)?;
+            self.protected_depth -= 1;
+            self.finally_depth -= 1;
+            self.emitter.op(OpCode::Endfinally);
+            self.emitter.mark(end);
+            self.emitter
+                .exception_handler(None, outer_start, start, start, end);
+            self.emitter.mark(after);
+        }
+        Ok(())
+    }
+
     fn statement(&mut self, statement: &Stmt) -> Result<(), CompileError> {
         match statement {
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => self.try_statement(body, catches, finally.as_ref()),
+            Stmt::Throw(value) => {
+                if let Some(value) = value {
+                    let actual = self.expr(value)?;
+                    if actual != Ty::Null {
+                        let Ty::Class(name) = &actual else {
+                            return Err(
+                                self.error("thrown expression must derive from System.Exception")
+                            );
+                        };
+                        if !self.is_exception_class(name) {
+                            return Err(
+                                self.error("thrown expression must derive from System.Exception")
+                            );
+                        }
+                    }
+                    self.emitter.op(OpCode::Throw);
+                } else {
+                    if self
+                        .catches
+                        .last()
+                        .is_none_or(|depth| self.finally_depth > *depth)
+                    {
+                        return Err(self.error("rethrow is only allowed inside a catch block"));
+                    }
+                    self.emitter.op(OpCode::Rethrow);
+                }
+                Ok(())
+            }
             Stmt::Block(block) => self.block(block),
             Stmt::Empty => Ok(()),
             Stmt::Break => {
-                let Some((end, _)) = self.loops.last().copied() else {
+                let Some(target) = self.loops.last().copied() else {
                     return Err(self.error("'break' outside of a loop"));
                 };
-                self.emitter.branch(OpCode::Br, end);
+                if self.finally_depth > target.finally_depth {
+                    return Err(self.error("cannot leave a finally block"));
+                }
+                self.emitter.branch(
+                    if self.protected_depth > target.protected_depth {
+                        OpCode::Leave
+                    } else {
+                        OpCode::Br
+                    },
+                    target.end,
+                );
                 Ok(())
             }
             Stmt::Continue => {
-                let Some((_, next)) = self.loops.last().copied() else {
+                let Some(target) = self.loops.last().copied() else {
                     return Err(self.error("'continue' outside of a loop"));
                 };
-                self.emitter.branch(OpCode::Br, next);
+                if self.finally_depth > target.finally_depth {
+                    return Err(self.error("cannot leave a finally block"));
+                }
+                self.emitter.branch(
+                    if self.protected_depth > target.protected_depth {
+                        OpCode::Leave
+                    } else {
+                        OpCode::Br
+                    },
+                    target.next,
+                );
                 Ok(())
             }
             Stmt::Local { ty, name, init } => {
@@ -3234,7 +3632,12 @@ impl<'a> FnEmitter<'a> {
                     .ok_or_else(|| self.error(format!("unsupported array element {ty:?}")))?;
                 self.emitter.op(opcode);
                 self.emitter.stloc(element_local);
-                self.loops.push((end, step));
+                self.loops.push(LoopTarget {
+                    end,
+                    next: step,
+                    protected_depth: self.protected_depth,
+                    finally_depth: self.finally_depth,
+                });
                 self.block(body)?;
                 self.loops.pop();
                 self.emitter.mark(step);
@@ -3403,6 +3806,9 @@ impl<'a> FnEmitter<'a> {
                 Ok(())
             }
             Stmt::Return(value) => {
+                if self.finally_depth > 0 {
+                    return Err(self.error("cannot return from a finally block"));
+                }
                 match value {
                     Some(expression) => {
                         let actual = self.expr(expression)?;
@@ -3416,7 +3822,34 @@ impl<'a> FnEmitter<'a> {
                         }
                     }
                 }
-                self.emitter.ret();
+                if self.protected_depth > 0 {
+                    let (target, local) = match self.return_target {
+                        Some(target) => target,
+                        None => {
+                            let target = self.emitter.label();
+                            let local = if self.return_ty == Ty::Void {
+                                None
+                            } else {
+                                let signature = resolve_type(
+                                    &self.return_ty,
+                                    self.types,
+                                    self.externals,
+                                    &mut *self.module,
+                                )
+                                .map_err(|message| self.error(message))?;
+                                Some(self.emitter.declare_local(signature))
+                            };
+                            self.return_target = Some((target, local));
+                            (target, local)
+                        }
+                    };
+                    if let Some(local) = local {
+                        self.emitter.stloc(local);
+                    }
+                    self.emitter.branch(OpCode::Leave, target);
+                } else {
+                    self.emitter.ret();
+                }
                 Ok(())
             }
             Stmt::If {
@@ -3447,7 +3880,12 @@ impl<'a> FnEmitter<'a> {
                 self.convert_assignable(&actual, &Ty::Bool, "while condition")
                     .map_err(|message| self.error(message))?;
                 self.emitter.branch(OpCode::Brfalse, end);
-                self.loops.push((end, top));
+                self.loops.push(LoopTarget {
+                    end,
+                    next: top,
+                    protected_depth: self.protected_depth,
+                    finally_depth: self.finally_depth,
+                });
                 self.block(body)?;
                 self.loops.pop();
                 self.emitter.branch(OpCode::Br, top);
@@ -3473,7 +3911,12 @@ impl<'a> FnEmitter<'a> {
                         .map_err(|message| self.error(message))?;
                     self.emitter.branch(OpCode::Brfalse, end);
                 }
-                self.loops.push((end, step_label));
+                self.loops.push(LoopTarget {
+                    end,
+                    next: step_label,
+                    protected_depth: self.protected_depth,
+                    finally_depth: self.finally_depth,
+                });
                 self.block(body)?;
                 self.loops.pop();
                 self.emitter.mark(step_label);
@@ -3777,6 +4220,32 @@ impl<'a> FnEmitter<'a> {
             self.emitter.call(ctor);
             return Ok(());
         }
+        if let Some(name) = core_exception_name(&base_name)
+            && self.externals.find(&base_name).is_none()
+        {
+            let actual = args.unwrap_or(&[]);
+            let params = match actual.len() {
+                0 => Vec::new(),
+                1 => vec![Ty::String],
+                _ => {
+                    return Err(self.error(format!(
+                        "unsupported exception constructor '{name}' with {} arguments",
+                        actual.len()
+                    )));
+                }
+            };
+            self.push_arguments(actual, &params, "base argument")?;
+            let signature = MethodSig::new_instance(
+                TypeSig::VOID,
+                params.iter().map(|_| TypeSig::STRING).collect(),
+            );
+            let ctor = self
+                .module
+                .import_corlib_method(name, ".ctor", signature)
+                .map_err(|error| self.error(error.to_string()))?;
+            self.emitter.call(ctor);
+            return Ok(());
+        }
         if let Some((index, entry)) = self.externals.method(&base_name, ".ctor", arity) {
             self.require_method_access(&entry, false, None)?;
             let signature = {
@@ -4061,6 +4530,36 @@ impl<'a> FnEmitter<'a> {
             }
             Expr::New { ty, args, fields } => match ty {
                 Ty::Class(type_name) => {
+                    if !self.types.contains_key(type_name)
+                        && self.externals.find(type_name).is_none()
+                        && let Some(name) = core_exception_name(type_name)
+                    {
+                        if !fields.is_empty() {
+                            return Err(
+                                self.error("exception object initializers are not supported yet")
+                            );
+                        }
+                        let params =
+                            match args.len() {
+                                0 => Vec::new(),
+                                1 => vec![Ty::String],
+                                _ => return Err(self.error(format!(
+                                    "unsupported exception constructor '{name}' with {} arguments",
+                                    args.len()
+                                ))),
+                            };
+                        self.push_arguments(args, &params, "argument")?;
+                        let signature = MethodSig::new_instance(
+                            TypeSig::VOID,
+                            params.iter().map(|_| TypeSig::STRING).collect(),
+                        );
+                        let constructor = self
+                            .module
+                            .import_corlib_method(name, ".ctor", signature)
+                            .map_err(|error| self.error(error.to_string()))?;
+                        self.emitter.newobj(constructor);
+                        return Ok(Ty::Class(type_name.clone()));
+                    }
                     let Some(constructor) = self.constructor(type_name, args.len()) else {
                         return Err(self.error(format!(
                             "no constructor for '{type_name}' taking {} argument(s)",
