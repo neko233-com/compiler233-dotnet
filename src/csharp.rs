@@ -11,13 +11,13 @@ use hao::{
     dotnet::entries::Version,
     dotnet::{
         entries::{
-            Entry, Field, InterfaceImpl, Method, MethodDefOrRef, MethodSpec, Param, TypeDef,
-            TypeDefOrRef, TypeSpec,
+            Constant, CustomAttribute, Entry, Field, InterfaceImpl, Method, MethodDefOrRef,
+            MethodSpec, Param, TypeDef, TypeDefOrRef, TypeSpec,
         },
         il::{EmitLabel, Emitter, Instruction, MemberToken, MethodBody, OpCode, Operand},
         md::streams::tables_stream::{FieldFlags, MethodFlags, TypeAttributes},
         module::{ModuleKind, TargetRuntime},
-        signature::PrimitiveType,
+        signature::{ElementType, PrimitiveType},
         signature::{FieldSig, MethodSig, TypeSig},
     },
 };
@@ -78,10 +78,121 @@ enum Ty {
     Bool,
     String,
     Null,
+    Enum(String, EnumBase),
     Class(String),
     Array(Box<Ty>),
     Generic(String, Vec<Ty>),
     Named(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnumBase {
+    I1,
+    U1,
+    I2,
+    U2,
+    I4,
+    U4,
+    I8,
+    U8,
+}
+
+impl EnumBase {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "sbyte" | "System.SByte" => Some(Self::I1),
+            "byte" | "System.Byte" => Some(Self::U1),
+            "short" | "System.Int16" => Some(Self::I2),
+            "ushort" | "System.UInt16" => Some(Self::U2),
+            "int" | "System.Int32" => Some(Self::I4),
+            "uint" | "System.UInt32" => Some(Self::U4),
+            "long" | "System.Int64" => Some(Self::I8),
+            "ulong" | "System.UInt64" => Some(Self::U8),
+            _ => None,
+        }
+    }
+    fn bounds(self) -> (i128, i128) {
+        match self {
+            Self::I1 => (i8::MIN as i128, i8::MAX as i128),
+            Self::U1 => (0, u8::MAX as i128),
+            Self::I2 => (i16::MIN as i128, i16::MAX as i128),
+            Self::U2 => (0, u16::MAX as i128),
+            Self::I4 => (i32::MIN as i128, i32::MAX as i128),
+            Self::U4 => (0, u32::MAX as i128),
+            Self::I8 => (i64::MIN as i128, i64::MAX as i128),
+            Self::U8 => (0, u64::MAX as i128),
+        }
+    }
+    fn primitive(self) -> PrimitiveType {
+        match self {
+            Self::I1 => PrimitiveType::I1,
+            Self::U1 => PrimitiveType::U1,
+            Self::I2 => PrimitiveType::I2,
+            Self::U2 => PrimitiveType::U2,
+            Self::I4 => PrimitiveType::I4,
+            Self::U4 => PrimitiveType::U4,
+            Self::I8 => PrimitiveType::I8,
+            Self::U8 => PrimitiveType::U8,
+        }
+    }
+    fn element_type(self) -> ElementType {
+        match self {
+            Self::I1 => ElementType::I1,
+            Self::U1 => ElementType::U1,
+            Self::I2 => ElementType::I2,
+            Self::U2 => ElementType::U2,
+            Self::I4 => ElementType::I4,
+            Self::U4 => ElementType::U4,
+            Self::I8 => ElementType::I8,
+            Self::U8 => ElementType::U8,
+        }
+    }
+    fn width(self) -> usize {
+        match self {
+            Self::I1 | Self::U1 => 1,
+            Self::I2 | Self::U2 => 2,
+            Self::I4 | Self::U4 => 4,
+            Self::I8 | Self::U8 => 8,
+        }
+    }
+    fn conversion(self) -> OpCode {
+        match self {
+            Self::I1 => OpCode::Conv_I1,
+            Self::U1 => OpCode::Conv_U1,
+            Self::I2 => OpCode::Conv_I2,
+            Self::U2 => OpCode::Conv_U2,
+            Self::I4 => OpCode::Conv_I4,
+            Self::U4 => OpCode::Conv_U4,
+            Self::I8 => OpCode::Conv_I8,
+            Self::U8 => OpCode::Conv_U8,
+        }
+    }
+    fn is_unsigned(self) -> bool {
+        matches!(self, Self::U1 | Self::U2 | Self::U4 | Self::U8)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EnumInfo {
+    file: String,
+    offset: usize,
+    namespace: String,
+    name: String,
+    is_public: bool,
+    is_flags: bool,
+    base: EnumBase,
+    members: Vec<(String, i128)>,
+    values: HashMap<String, i128>,
+}
+
+impl EnumInfo {
+    fn full_name(&self) -> String {
+        if self.namespace.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}.{}", self.namespace, self.name)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -95,6 +206,7 @@ struct TypeDecl {
     file: String,
     offset: usize,
     namespace: String,
+    enum_imports: EnumImports,
     name: String,
     base: Option<String>,
     interfaces: Vec<String>,
@@ -349,9 +461,9 @@ enum SwitchConstant {
 
 fn switch_constant(value: &Expr) -> Option<SwitchConstant> {
     match value {
-        Expr::Int(value) => Some(SwitchConstant::Int(*value)),
+        Expr::Int(value, _) => Some(SwitchConstant::Int(*value)),
         Expr::Negate(value) => match value.as_ref() {
-            Expr::Int(value) => value.checked_neg().map(SwitchConstant::Int),
+            Expr::Int(value, _) => value.checked_neg().map(SwitchConstant::Int),
             _ => None,
         },
         Expr::Bool(value) => Some(SwitchConstant::Bool(*value)),
@@ -594,7 +706,7 @@ enum BinaryOp {
 
 #[derive(Debug)]
 enum Expr {
-    Int(i32),
+    Int(i32, bool),
     Float(f32),
     Null,
     Bool(bool),
@@ -842,24 +954,117 @@ impl Externals {
 
 struct Parser<'a> {
     enums: EnumValues,
+    current_namespace: String,
+    root_imports: EnumImports,
+    scope_imports: EnumImports,
     file: &'a str,
     source: &'a str,
     tokens: Vec<syntax::Token>,
     position: usize,
 }
 
-type EnumValues = HashMap<String, HashMap<String, i32>>;
+type EnumValues = HashMap<String, EnumInfo>;
+
+#[derive(Debug, Clone, Default)]
+struct EnumImports {
+    namespaces: Vec<String>,
+    aliases: HashMap<String, String>,
+}
+
+fn find_enum<'a>(
+    enums: &'a EnumValues,
+    name: &str,
+    namespace: &str,
+    imports: &EnumImports,
+) -> Option<&'a EnumInfo> {
+    let mut parts = name.splitn(2, '.');
+    let root = parts.next()?;
+    if let Some(alias) = imports.aliases.get(root) {
+        let expanded = match parts.next() {
+            Some(rest) => format!("{alias}.{rest}"),
+            None => alias.clone(),
+        };
+        return enums.get(&expanded);
+    }
+    let mut scope = namespace;
+    while !scope.is_empty() {
+        if let Some(found) = enums.get(&format!("{scope}.{name}")) {
+            return Some(found);
+        }
+        scope = scope.rsplit_once('.').map_or("", |(parent, _)| parent);
+    }
+    if let Some(found) = enums.get(name) {
+        return Some(found);
+    }
+    let mut matches = imports
+        .namespaces
+        .iter()
+        .filter_map(|import| enums.get(&format!("{import}.{name}")));
+    let first = matches.next()?;
+    if matches.any(|other| other.full_name() != first.full_name()) {
+        None
+    } else {
+        Some(first)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IntegerLiteralType {
+    I32,
+    U32,
+    I64,
+    U64,
+}
+
+#[derive(Debug)]
+enum EnumConstantExpr {
+    Int(i32),
+    Name(String),
+    Negate(Box<EnumConstantExpr>),
+    Complement(Box<EnumConstantExpr>),
+    Binary(EnumConstantOp, Box<EnumConstantExpr>, Box<EnumConstantExpr>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EnumConstantOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    And,
+    Or,
+    Xor,
+    ShiftLeft,
+    ShiftRight,
+}
+
+#[derive(Debug)]
+enum EnumInitializer {
+    Literal(i128),
+    Expression(EnumConstantExpr),
+    Implicit,
+}
+
+#[derive(Debug)]
+struct PendingEnumMember {
+    name: String,
+    initializer: EnumInitializer,
+}
 
 fn parse_file(
     file: &str,
     source: &str,
-    enums: &HashMap<String, HashMap<String, i32>>,
+    enums: &EnumValues,
 ) -> Result<(Vec<TypeDecl>, EnumValues), CompileError> {
     let tokens = syntax::lex(source).map_err(|error: SyntaxError| {
         CompileError::new(file, source, error.offset, error.message)
     })?;
     let mut parser = Parser {
         enums: enums.clone(),
+        current_namespace: String::new(),
+        root_imports: EnumImports::default(),
+        scope_imports: EnumImports::default(),
         file,
         source,
         tokens,
@@ -961,22 +1166,49 @@ impl<'a> Parser<'a> {
         let mut types = Vec::new();
         let mut namespace = String::new();
         let mut type_access = None;
+        let mut type_modifiers = Vec::new();
+        let mut type_attributes = String::new();
         while !self.at_end() {
+            let attribute_start = self.position;
             self.skip_attribute_lists()?;
+            for token in &self.tokens[attribute_start..self.position] {
+                type_attributes.push_str(&self.source[token.start..token.end]);
+            }
             if self.eat(";") {
                 continue;
             }
             let text = self.text().to_string();
             match text.as_str() {
                 "using" => {
+                    self.bump();
+                    let mut parts = Vec::new();
                     while !self.at_end() && !self.check(";") {
+                        parts.push(self.text().to_string());
                         self.bump();
                     }
                     self.expect(";")?;
+                    let imports = if namespace.is_empty() {
+                        &mut self.root_imports
+                    } else {
+                        &mut self.scope_imports
+                    };
+                    if parts.first().is_some_and(|part| part != "static") {
+                        if parts.get(1).is_some_and(|part| part == "=") {
+                            if parts.len() > 2 {
+                                imports
+                                    .aliases
+                                    .insert(parts[0].clone(), parts[2..].join(""));
+                            }
+                        } else {
+                            imports.namespaces.push(parts.join(""));
+                        }
+                    }
                 }
                 "namespace" => {
                     self.bump();
                     namespace = self.parse_qualified_name()?;
+                    self.current_namespace.clone_from(&namespace);
+                    self.scope_imports = EnumImports::default();
                     if self.eat(";") {
                         continue;
                     }
@@ -992,17 +1224,37 @@ impl<'a> Parser<'a> {
                     return Err(self.error("top-level types cannot be private or protected"));
                 }
                 "static" | "sealed" | "abstract" | "partial" | "unsafe" | "readonly" => {
+                    type_modifiers.push(text);
                     self.bump();
                 }
                 "enum" => {
-                    self.parse_enum_declaration()?;
-                    type_access = None;
+                    if !type_modifiers.is_empty() {
+                        return Err(self.error("invalid enum modifier"));
+                    }
+                    let is_flags = match type_attributes.as_str() {
+                        "" => false,
+                        "[System.Flags]"
+                        | "[System.FlagsAttribute]"
+                        | "[System.Flags()]"
+                        | "[System.FlagsAttribute()]" => true,
+                        _ => return Err(self.error("enum attribute is not supported")),
+                    };
+                    type_attributes.clear();
+                    self.parse_enum_declaration(
+                        &namespace,
+                        type_access.take().unwrap_or(false),
+                        is_flags,
+                    )?;
                 }
                 "class" | "struct" | "interface" | "record" => {
+                    type_modifiers.clear();
+                    type_attributes.clear();
                     types.push(self.parse_type(&namespace, type_access.take().unwrap_or(false))?);
                     if self.check("}") && !namespace.is_empty() {
                         self.bump();
                         namespace.clear();
+                        self.current_namespace.clear();
+                        self.scope_imports = EnumImports::default();
                     }
                 }
                 "}" => {
@@ -1011,6 +1263,8 @@ impl<'a> Parser<'a> {
                     }
                     self.bump();
                     namespace.clear();
+                    self.current_namespace.clear();
+                    self.scope_imports = EnumImports::default();
                 }
                 _ => return Err(self.error(format!("unexpected top-level token '{text}'"))),
             }
@@ -1038,36 +1292,372 @@ impl<'a> Parser<'a> {
             "bool" => Ty::Bool,
             "string" | "String" => Ty::String,
             "object" => Ty::Object,
-            other if self.enums.contains_key(other) => Ty::Int,
+            other if self.enum_info(other).is_some() => {
+                let info = self.enum_info(other).expect("enum was just found");
+                Ty::Enum(info.full_name(), info.base)
+            }
             other => Ty::Class(other.to_string()),
         })
     }
 
-    fn parse_enum_declaration(&mut self) -> Result<(), CompileError> {
+    fn enum_info(&self, name: &str) -> Option<&EnumInfo> {
+        find_enum(
+            &self.enums,
+            name,
+            &self.current_namespace,
+            &self.enum_imports(),
+        )
+    }
+
+    fn enum_imports(&self) -> EnumImports {
+        let mut imports = self.root_imports.clone();
+        imports
+            .namespaces
+            .extend(self.scope_imports.namespaces.iter().cloned());
+        imports.aliases.extend(self.scope_imports.aliases.clone());
+        imports
+    }
+
+    fn parse_enum_literal(&mut self, base: EnumBase) -> Result<i128, CompileError> {
+        let negative = self.eat("-");
+        if !negative {
+            self.eat("+");
+        }
+        if self.token().kind != syntax::TokenKind::Number {
+            return Err(self.error("enum initializer must be a supported integral constant"));
+        }
+        let text = self.text().replace('_', "");
+        self.bump();
+        let suffix_start = text.trim_end_matches(['u', 'U', 'l', 'L']).len();
+        let digits = &text[..suffix_start];
+        let suffix = text[suffix_start..].to_ascii_lowercase();
+        if !matches!(suffix.as_str(), "" | "u" | "l" | "ul" | "lu") {
+            return Err(self.error("invalid integral literal suffix"));
+        }
+        let (radix, digits) = if let Some(rest) = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            (16, rest)
+        } else if let Some(rest) = digits
+            .strip_prefix("0b")
+            .or_else(|| digits.strip_prefix("0B"))
+        {
+            (2, rest)
+        } else {
+            (10, digits)
+        };
+        let magnitude = u64::from_str_radix(digits, radix)
+            .map_err(|_| self.error("enum initializer is not a supported integral literal"))?;
+        let mut kind = match suffix.as_str() {
+            "" if magnitude <= i32::MAX as u64 => IntegerLiteralType::I32,
+            "" if magnitude <= u32::MAX as u64 => IntegerLiteralType::U32,
+            "" if magnitude <= i64::MAX as u64 => IntegerLiteralType::I64,
+            "" => IntegerLiteralType::U64,
+            "u" if magnitude <= u32::MAX as u64 => IntegerLiteralType::U32,
+            "u" => IntegerLiteralType::U64,
+            "l" if magnitude <= i64::MAX as u64 => IntegerLiteralType::I64,
+            "l" | "ul" | "lu" => IntegerLiteralType::U64,
+            _ => unreachable!(),
+        };
+        let value = if negative {
+            if magnitude == (1u64 << 31) && suffix.is_empty() {
+                kind = IntegerLiteralType::I32;
+            } else if magnitude == (1u64 << 63) && matches!(suffix.as_str(), "" | "l") {
+                kind = IntegerLiteralType::I64;
+            } else {
+                kind = match kind {
+                    IntegerLiteralType::I32 => IntegerLiteralType::I32,
+                    IntegerLiteralType::U32 | IntegerLiteralType::I64 => IntegerLiteralType::I64,
+                    IntegerLiteralType::U64 => {
+                        return Err(self.error("cannot negate an unsigned long constant"));
+                    }
+                };
+            }
+            -(magnitude as i128)
+        } else {
+            magnitude as i128
+        };
+        let (min, max) = base.bounds();
+        if value < min || value > max {
+            return Err(self.error("enum initializer is outside the underlying type range"));
+        }
+        let implicit = match kind {
+            IntegerLiteralType::I32 => true,
+            IntegerLiteralType::U32 => matches!(base, EnumBase::U4 | EnumBase::I8 | EnumBase::U8),
+            IntegerLiteralType::I64 => base == EnumBase::I8 || (base == EnumBase::U8 && value >= 0),
+            IntegerLiteralType::U64 => base == EnumBase::U8,
+        };
+        if !implicit {
+            return Err(
+                self.error("enum initializer has no implicit conversion to its underlying type")
+            );
+        }
+        Ok(value)
+    }
+
+    fn parse_enum_constant_unary(&mut self) -> Result<EnumConstantExpr, CompileError> {
+        if self.check("-")
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|token| token.kind == syntax::TokenKind::Number)
+        {
+            return Ok(EnumConstantExpr::Int(
+                self.parse_enum_literal(EnumBase::I4)? as i32,
+            ));
+        }
+        if self.eat("-") {
+            return Ok(EnumConstantExpr::Negate(Box::new(
+                self.parse_enum_constant_unary()?,
+            )));
+        }
+        if self.eat("+") {
+            return self.parse_enum_constant_unary();
+        }
+        if self.eat("~") {
+            return Ok(EnumConstantExpr::Complement(Box::new(
+                self.parse_enum_constant_unary()?,
+            )));
+        }
+        if self.eat("(") {
+            let value = self.parse_enum_constant_expression(1)?;
+            self.expect(")")?;
+            return Ok(value);
+        }
+        if self.token().kind == syntax::TokenKind::Number {
+            return Ok(EnumConstantExpr::Int(
+                self.parse_enum_literal(EnumBase::I4)? as i32,
+            ));
+        }
+        if self.token().kind == syntax::TokenKind::Identifier {
+            return Ok(EnumConstantExpr::Name(self.identifier()?));
+        }
+        Err(self.error("unsupported enum constant expression"))
+    }
+
+    fn parse_enum_constant_expression(
+        &mut self,
+        minimum: u8,
+    ) -> Result<EnumConstantExpr, CompileError> {
+        let mut left = self.parse_enum_constant_unary()?;
+        loop {
+            let operator = match self.text() {
+                "|" => Some((EnumConstantOp::Or, 1, 1)),
+                "^" => Some((EnumConstantOp::Xor, 2, 1)),
+                "&" => Some((EnumConstantOp::And, 3, 1)),
+                "<<" => Some((EnumConstantOp::ShiftLeft, 4, 1)),
+                ">" if self.peek(1) == Some(">")
+                    && self.tokens[self.position].end == self.tokens[self.position + 1].start =>
+                {
+                    Some((EnumConstantOp::ShiftRight, 4, 2))
+                }
+                "+" => Some((EnumConstantOp::Add, 5, 1)),
+                "-" => Some((EnumConstantOp::Subtract, 5, 1)),
+                "*" => Some((EnumConstantOp::Multiply, 6, 1)),
+                "/" => Some((EnumConstantOp::Divide, 6, 1)),
+                "%" => Some((EnumConstantOp::Remainder, 6, 1)),
+                _ => None,
+            };
+            let Some((operator, precedence, length)) = operator else {
+                break;
+            };
+            if precedence < minimum {
+                break;
+            }
+            for _ in 0..length {
+                self.bump();
+            }
+            let right = self.parse_enum_constant_expression(precedence + 1)?;
+            left = EnumConstantExpr::Binary(operator, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn evaluate_enum_expression(
+        &self,
+        expression: &EnumConstantExpr,
+        members: &[PendingEnumMember],
+        names: &HashMap<String, usize>,
+        base: EnumBase,
+        values: &mut [Option<i128>],
+        visiting: &mut [bool],
+    ) -> Result<i32, CompileError> {
+        let evaluate =
+            |expression: &EnumConstantExpr, values: &mut [Option<i128>], visiting: &mut [bool]| {
+                self.evaluate_enum_expression(expression, members, names, base, values, visiting)
+            };
+        let value = match expression {
+            EnumConstantExpr::Int(value) => return Ok(*value),
+            EnumConstantExpr::Name(name) => {
+                let index = *names
+                    .get(name)
+                    .ok_or_else(|| self.error(format!("unknown enum member '{name}'")))?;
+                let value =
+                    self.evaluate_enum_member(index, members, names, base, values, visiting)?;
+                return i32::try_from(value).map_err(|_| {
+                    self.error("enum constant expression exceeds supported int range")
+                });
+            }
+            EnumConstantExpr::Negate(inner) => evaluate(inner, values, visiting)?.checked_neg(),
+            EnumConstantExpr::Complement(inner) => Some(!evaluate(inner, values, visiting)?),
+            EnumConstantExpr::Binary(operator, left, right) => {
+                let left = evaluate(left, values, visiting)?;
+                let right = evaluate(right, values, visiting)?;
+                match operator {
+                    EnumConstantOp::Add => left.checked_add(right),
+                    EnumConstantOp::Subtract => left.checked_sub(right),
+                    EnumConstantOp::Multiply => left.checked_mul(right),
+                    EnumConstantOp::Divide => left.checked_div(right),
+                    EnumConstantOp::Remainder => left.checked_rem(right),
+                    EnumConstantOp::And => Some(left & right),
+                    EnumConstantOp::Or => Some(left | right),
+                    EnumConstantOp::Xor => Some(left ^ right),
+                    EnumConstantOp::ShiftLeft => Some(left.wrapping_shl((right as u32) & 31)),
+                    EnumConstantOp::ShiftRight => Some(left >> ((right as u32) & 31)),
+                }
+            }
+        };
+        value.ok_or_else(|| self.error("invalid or overflowing enum constant expression"))
+    }
+
+    fn evaluate_enum_member(
+        &self,
+        index: usize,
+        members: &[PendingEnumMember],
+        names: &HashMap<String, usize>,
+        base: EnumBase,
+        values: &mut [Option<i128>],
+        visiting: &mut [bool],
+    ) -> Result<i128, CompileError> {
+        if let Some(value) = values[index] {
+            return Ok(value);
+        }
+        if visiting[index] {
+            return Err(self.error(format!("circular enum constant '{}'", members[index].name)));
+        }
+        visiting[index] = true;
+        let value = match &members[index].initializer {
+            EnumInitializer::Literal(value) => *value,
+            EnumInitializer::Implicit if index == 0 => 0,
+            EnumInitializer::Implicit => self
+                .evaluate_enum_member(index - 1, members, names, base, values, visiting)?
+                .checked_add(1)
+                .ok_or_else(|| self.error("enum auto-increment overflow"))?,
+            EnumInitializer::Expression(EnumConstantExpr::Name(name)) => {
+                let target = *names
+                    .get(name)
+                    .ok_or_else(|| self.error(format!("unknown enum member '{name}'")))?;
+                self.evaluate_enum_member(target, members, names, base, values, visiting)?
+            }
+            EnumInitializer::Expression(expression) => {
+                if matches!(base, EnumBase::U4 | EnumBase::I8 | EnumBase::U8) {
+                    return Err(self.error(
+                        "enum constant arithmetic for this underlying type is not supported",
+                    ));
+                }
+                self.evaluate_enum_expression(expression, members, names, base, values, visiting)?
+                    as i128
+            }
+        };
+        let (min, max) = base.bounds();
+        if value < min || value > max {
+            return Err(self.error("enum constant is outside the underlying type range"));
+        }
+        visiting[index] = false;
+        values[index] = Some(value);
+        Ok(value)
+    }
+
+    fn parse_enum_declaration(
+        &mut self,
+        namespace: &str,
+        is_public: bool,
+        is_flags: bool,
+    ) -> Result<(), CompileError> {
+        let offset = self.token().start;
         self.bump(); // enum
         let name = self.identifier()?;
-        if self.eat(":") {
-            self.parse_qualified_name()?;
+        let full_name = if namespace.is_empty() {
+            name.clone()
+        } else {
+            format!("{namespace}.{name}")
+        };
+        if let Some(existing) = self.enums.get(&full_name)
+            && (existing.file != self.file || existing.offset != offset)
+        {
+            return Err(self.error(format!("duplicate enum type '{name}'")));
         }
+        let base = if self.eat(":") {
+            let underlying = self.parse_qualified_name()?;
+            EnumBase::parse(&underlying)
+                .ok_or_else(|| self.error(format!("invalid enum underlying type '{underlying}'")))?
+        } else {
+            EnumBase::I4
+        };
         self.expect("{")?;
-        let mut values = HashMap::new();
-        let mut next = 0i32;
+        let mut names = HashMap::new();
+        let mut pending = Vec::new();
         while !self.check("}") && !self.at_end() {
-            let member = self.identifier()?;
-            if self.eat("=")
-                && let Expr::Int(value) = self.parse_expression()?
-            {
-                next = value;
+            let attribute_start = self.position;
+            self.skip_attribute_lists()?;
+            if self.position != attribute_start {
+                return Err(self.error("enum member attributes are not supported"));
             }
-            values.insert(member, next);
-            next += 1;
+            let member = self.identifier()?;
+            if names.insert(member.clone(), pending.len()).is_some() {
+                return Err(self.error(format!("duplicate enum member '{member}'")));
+            }
+            let initializer = if self.eat("=") {
+                let numeric_offset = usize::from(self.check("+") || self.check("-"));
+                if self
+                    .tokens
+                    .get(self.position + numeric_offset)
+                    .is_some_and(|token| token.kind == syntax::TokenKind::Number)
+                    && matches!(self.peek(numeric_offset + 1), Some(",") | Some("}"))
+                {
+                    EnumInitializer::Literal(self.parse_enum_literal(base)?)
+                } else {
+                    EnumInitializer::Expression(self.parse_enum_constant_expression(1)?)
+                }
+            } else {
+                EnumInitializer::Implicit
+            };
+            pending.push(PendingEnumMember {
+                name: member,
+                initializer,
+            });
             if !self.eat(",") {
                 break;
             }
         }
         self.eat(",");
         self.expect("}")?;
-        self.enums.insert(name, values);
+        let mut resolved = vec![None; pending.len()];
+        let mut visiting = vec![false; pending.len()];
+        for index in 0..pending.len() {
+            self.evaluate_enum_member(index, &pending, &names, base, &mut resolved, &mut visiting)?;
+        }
+        let members: Vec<(String, i128)> = pending
+            .into_iter()
+            .zip(resolved)
+            .map(|(member, value)| (member.name, value.expect("enum member was resolved")))
+            .collect();
+        let values = members.iter().cloned().collect();
+        self.enums.insert(
+            full_name,
+            EnumInfo {
+                file: self.file.to_string(),
+                offset,
+                namespace: namespace.to_string(),
+                name,
+                is_public,
+                is_flags,
+                base,
+                members,
+                values,
+            },
+        );
         Ok(())
     }
 
@@ -1127,6 +1717,7 @@ impl<'a> Parser<'a> {
             file: self.file.to_string(),
             offset: class_offset,
             namespace: namespace.to_string(),
+            enum_imports: self.enum_imports(),
             name,
             base,
             interfaces,
@@ -1464,7 +2055,10 @@ impl<'a> Parser<'a> {
             "bool" => Ty::Bool,
             "string" | "String" => Ty::String,
             "object" => Ty::Object,
-            other if self.enums.contains_key(other) => Ty::Int,
+            other if self.enum_info(other).is_some() => {
+                let info = self.enum_info(other).expect("enum was just found");
+                Ty::Enum(info.full_name(), info.base)
+            }
             other => Ty::Class(other.to_string()),
         };
         if self.check("<") {
@@ -2006,7 +2600,7 @@ impl<'a> Parser<'a> {
                     && self.text().replace('_', "") == "2147483648"
                 {
                     self.bump();
-                    return Ok(Expr::Int(i32::MIN));
+                    return Ok(Expr::Int(i32::MIN, true));
                 }
                 Ok(Expr::Negate(Box::new(self.parse_unary()?)))
             }
@@ -2240,6 +2834,10 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Float(value));
                 }
                 let trimmed = cleaned.trim_end_matches(['u', 'U', 'l', 'L']);
+                let suffix = cleaned[trimmed.len()..].to_ascii_lowercase();
+                if !matches!(suffix.as_str(), "" | "u" | "l" | "ul" | "lu") {
+                    return Err(self.error("invalid integer literal suffix"));
+                }
                 let value = if let Some(hex) = trimmed
                     .strip_prefix("0x")
                     .or_else(|| trimmed.strip_prefix("0X"))
@@ -2254,7 +2852,7 @@ impl<'a> Parser<'a> {
                     trimmed.parse::<i32>()
                 }
                 .map_err(|_| self.error(format!("integer literal '{text}' is not supported")))?;
-                Ok(Expr::Int(value))
+                Ok(Expr::Int(value, suffix.is_empty()))
             }
             syntax::TokenKind::String => {
                 let raw = self.text();
@@ -2461,6 +3059,43 @@ fn type_error(
     CompileError::new(&decl.file, source, decl.offset, message)
 }
 
+fn enum_error(
+    decl: &EnumInfo,
+    sources: &[(String, String)],
+    message: impl Into<String>,
+) -> CompileError {
+    let source = sources
+        .iter()
+        .find(|(file, _)| file == &decl.file)
+        .map(|(_, text)| text.as_str())
+        .unwrap_or("");
+    CompileError::new(&decl.file, source, decl.offset, message)
+}
+
+fn program_error(
+    program: &Program,
+    sources: &[(String, String)],
+    message: impl Into<String>,
+) -> CompileError {
+    let message = message.into();
+    if let Some(decl) = program.types.first() {
+        type_error(decl, sources, message)
+    } else if let Some(decl) = program
+        .enums
+        .values()
+        .min_by_key(|entry| (&entry.file, entry.offset))
+    {
+        enum_error(decl, sources, message)
+    } else {
+        CompileError::new(
+            sources.first().map(|(file, _)| file.as_str()).unwrap_or(""),
+            "",
+            0,
+            message,
+        )
+    }
+}
+
 fn is_reference(ty: &Ty) -> bool {
     matches!(
         ty,
@@ -2522,6 +3157,17 @@ fn array_element_opcode(ty: &Ty, store: bool) -> Option<OpCode> {
         (Ty::Float, true) => Some(OpCode::Stelem_R4),
         (Ty::Bool, false) => Some(OpCode::Ldelem_U1),
         (Ty::Bool, true) => Some(OpCode::Stelem_I1),
+        (Ty::Enum(_, EnumBase::I1), false) => Some(OpCode::Ldelem_I1),
+        (Ty::Enum(_, EnumBase::U1), false) => Some(OpCode::Ldelem_U1),
+        (Ty::Enum(_, EnumBase::I1 | EnumBase::U1), true) => Some(OpCode::Stelem_I1),
+        (Ty::Enum(_, EnumBase::I2), false) => Some(OpCode::Ldelem_I2),
+        (Ty::Enum(_, EnumBase::U2), false) => Some(OpCode::Ldelem_U2),
+        (Ty::Enum(_, EnumBase::I2 | EnumBase::U2), true) => Some(OpCode::Stelem_I2),
+        (Ty::Enum(_, EnumBase::I4), false) => Some(OpCode::Ldelem_I4),
+        (Ty::Enum(_, EnumBase::U4), false) => Some(OpCode::Ldelem_U4),
+        (Ty::Enum(_, EnumBase::I4 | EnumBase::U4), true) => Some(OpCode::Stelem_I4),
+        (Ty::Enum(_, EnumBase::I8 | EnumBase::U8), false) => Some(OpCode::Ldelem_I8),
+        (Ty::Enum(_, EnumBase::I8 | EnumBase::U8), true) => Some(OpCode::Stelem_I8),
         (Ty::Object | Ty::String | Ty::Class(_) | Ty::Array(_) | Ty::Generic(_, _), false) => {
             Some(OpCode::Ldelem_Ref)
         }
@@ -2571,6 +3217,12 @@ fn resolve_type(
         Ty::Null => return Err("null has no type of its own".to_string()),
         Ty::Bool => TypeSig::BOOL,
         Ty::String => TypeSig::STRING,
+        Ty::Enum(name, _) => {
+            let entry = types
+                .get(name)
+                .ok_or_else(|| format!("unknown enum type '{name}'"))?;
+            TypeSig::ValueType(TypeDefOrRef::TypeDef(entry.clone()))
+        }
         Ty::Class(name) => match types.get(name) {
             Some(entry) => TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone())),
             None if core_exception_name(name).is_some() && externals.find(name).is_none() => {
@@ -2630,7 +3282,7 @@ fn emit(
     references: &[String],
 ) -> Result<Vec<u8>, CompileError> {
     let externals = Externals::load(references, sources)?;
-    if program.types.is_empty() {
+    if program.types.is_empty() && program.enums.is_empty() {
         return Err(CompileError {
             file: sources
                 .first()
@@ -2645,13 +3297,42 @@ fn emit(
     let mut module = Module::new(assembly_name, ModuleKind::Dll, TargetRuntime::NetCore(10));
     let object = module
         .corlib_type("System.Object")
-        .map_err(|error| type_error(&program.types[0], sources, error.to_string()))?;
+        .map_err(|error| program_error(program, sources, error.to_string()))?;
 
     // Pass 0: declare every type so fields and signatures can reference types
     // that are declared later in the compilation.
     let mut types: HashMap<String, Entry<TypeDef>> = HashMap::new();
+    let mut enums: Vec<&EnumInfo> = program.enums.values().collect();
+    enums
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    for decl in &enums {
+        let base = module
+            .corlib_type("System.Enum")
+            .map_err(|error| enum_error(decl, sources, error.to_string()))?;
+        let flags = (if decl.is_public {
+            TypeAttributes::Public
+        } else {
+            TypeAttributes::NotPublic
+        }) | TypeAttributes::Sealed;
+        let entry = module.add_type(TypeDef::new(flags, &decl.namespace, &decl.name, Some(base)));
+        if decl.is_flags {
+            let constructor = module
+                .corlib_attribute("System.FlagsAttribute")
+                .map_err(|error| enum_error(decl, sources, error.to_string()))?;
+            entry
+                .get_mut()
+                .custom_attributes
+                .push(CustomAttribute::without_arguments(constructor));
+        }
+        types.insert(decl.full_name(), entry);
+    }
     for decl in &program.types {
-        if types.contains_key(&decl.name) {
+        let full_name = if decl.namespace.is_empty() {
+            decl.name.clone()
+        } else {
+            format!("{}.{}", decl.namespace, decl.name)
+        };
+        if types.contains_key(&decl.name) || types.contains_key(&full_name) {
             return Err(type_error(
                 decl,
                 sources,
@@ -2677,6 +3358,39 @@ fn emit(
             },
         ));
         types.insert(decl.name.clone(), entry);
+    }
+    for decl in &enums {
+        let entry = types
+            .get(&decl.full_name())
+            .expect("enum type was declared")
+            .clone();
+        TypeDef::add_field(
+            &entry,
+            Field::new(
+                FieldFlags::Public | FieldFlags::SpecialName | FieldFlags::RTSpecialName,
+                "value__",
+                FieldSig {
+                    ty: TypeSig::Primitive(decl.base.primitive()),
+                },
+            ),
+        );
+        for (name, value) in &decl.members {
+            let mut field = Field::new(
+                FieldFlags::Public
+                    | FieldFlags::Static
+                    | FieldFlags::Literal
+                    | FieldFlags::HasDefault,
+                name,
+                FieldSig {
+                    ty: TypeSig::ValueType(TypeDefOrRef::TypeDef(entry.clone())),
+                },
+            );
+            field.constant = Some(Constant {
+                element_type: decl.base.element_type(),
+                value: (*value as u64).to_le_bytes()[..decl.base.width()].to_vec(),
+            });
+            TypeDef::add_field(&entry, field);
+        }
     }
 
     // A type listed first in the base list may still be an interface
@@ -3076,8 +3790,8 @@ fn emit(
     }
 
     module.write().map_err(|error| {
-        type_error(
-            &program.types[0],
+        program_error(
+            program,
             sources,
             format!("assembly emission failed: {error}"),
         )
@@ -3097,7 +3811,7 @@ enum Job {
 fn emit_body(
     module: &mut Module,
     externals: &Externals,
-    enums: &HashMap<String, HashMap<String, i32>>,
+    enums: &EnumValues,
     base: Option<&String>,
     types: &HashMap<String, Entry<TypeDef>>,
     symbols: &HashMap<String, TypeSymbol>,
@@ -3115,6 +3829,8 @@ fn emit_body(
         types,
         symbols,
         current: decl.name.clone(),
+        namespace: decl.namespace.clone(),
+        enum_imports: &decl.enum_imports,
         is_static: true,
         return_ty: Ty::Void,
         externals,
@@ -3267,6 +3983,8 @@ struct FnEmitter<'a> {
     types: &'a HashMap<String, Entry<TypeDef>>,
     symbols: &'a HashMap<String, TypeSymbol>,
     current: String,
+    namespace: String,
+    enum_imports: &'a EnumImports,
     is_static: bool,
     return_ty: Ty,
     externals: &'a Externals,
@@ -3550,6 +4268,49 @@ impl<'a> FnEmitter<'a> {
         } else {
             self.require_assignable(actual, expected, what)
         }
+    }
+
+    fn constant_int(expression: &Expr) -> Option<i32> {
+        match expression {
+            Expr::Int(value, true) => Some(*value),
+            Expr::Negate(value) => Self::constant_int(value)?.checked_neg(),
+            Expr::Binary(op, left, right) => {
+                let left = Self::constant_int(left)?;
+                let right = Self::constant_int(right)?;
+                match op {
+                    BinaryOp::Add => left.checked_add(right),
+                    BinaryOp::Subtract => left.checked_sub(right),
+                    BinaryOp::Multiply => left.checked_mul(right),
+                    BinaryOp::Divide => left.checked_div(right),
+                    BinaryOp::Remainder => left.checked_rem(right),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn is_enum_zero(expression: &Expr) -> bool {
+        matches!(expression, Expr::Int(0, _)) || Self::constant_int(expression) == Some(0)
+    }
+
+    fn convert_expression(
+        &mut self,
+        actual: &Ty,
+        expected: &Ty,
+        expression: &Expr,
+        what: &str,
+    ) -> Result<(), String> {
+        if *actual == Ty::Int
+            && let Ty::Enum(_, base) = expected
+            && Self::is_enum_zero(expression)
+        {
+            if base.width() == 8 {
+                self.emitter.op(base.conversion());
+            }
+            return Ok(());
+        }
+        self.convert_assignable(actual, expected, what)
     }
 
     fn validate_compound(&self, ty: &Ty, op: &str) -> Result<(), CompileError> {
@@ -4072,8 +4833,13 @@ impl<'a> FnEmitter<'a> {
                 self.locals.insert(name.clone(), (index, ty.clone()));
                 if let Some(value) = init {
                     let actual = self.expr(value)?;
-                    self.convert_assignable(&actual, ty, &format!("initializer of '{name}'"))
-                        .map_err(|message| self.error(message))?;
+                    self.convert_expression(
+                        &actual,
+                        ty,
+                        value,
+                        &format!("initializer of '{name}'"),
+                    )
+                    .map_err(|message| self.error(message))?;
                     self.emitter.stloc(index);
                 }
                 Ok(())
@@ -4192,7 +4958,7 @@ impl<'a> FnEmitter<'a> {
                 Self::require(&index_type, &Ty::Int, "array index")
                     .map_err(|message| self.error(message))?;
                 let value_type = self.expr(value)?;
-                self.convert_assignable(&value_type, &element, "array element")
+                self.convert_expression(&value_type, &element, value, "array element")
                     .map_err(|message| self.error(message))?;
                 let opcode = array_element_opcode(&element, true)
                     .ok_or_else(|| self.error(format!("unsupported array element {element:?}")))?;
@@ -4353,8 +5119,13 @@ impl<'a> FnEmitter<'a> {
                         return Err(self.error(format!("'{type_name}.{name}' is static")));
                     }
                     let actual = self.expr(value)?;
-                    self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
-                        .map_err(|message| self.error(message))?;
+                    self.convert_expression(
+                        &actual,
+                        &field.ty,
+                        value,
+                        &format!("assignment to '{name}'"),
+                    )
+                    .map_err(|message| self.error(message))?;
                     self.emitter.emit(Instruction::new(
                         OpCode::Stfld,
                         Operand::Token(MemberToken::Field(field.entry)),
@@ -4410,8 +5181,13 @@ impl<'a> FnEmitter<'a> {
                 };
                 self.require_method_access(&setter, true, Some(&type_name))?;
                 let actual = self.expr(value)?;
-                self.convert_assignable(&actual, &property_ty, &format!("assignment to '{name}'"))
-                    .map_err(|message| self.error(message))?;
+                self.convert_expression(
+                    &actual,
+                    &property_ty,
+                    value,
+                    &format!("assignment to '{name}'"),
+                )
+                .map_err(|message| self.error(message))?;
                 self.emitter.callvirt(setter);
                 Ok(())
             }
@@ -4430,7 +5206,7 @@ impl<'a> FnEmitter<'a> {
                     Some(expression) => {
                         let actual = self.expr(expression)?;
                         let return_ty = self.return_ty.clone();
-                        self.convert_assignable(&actual, &return_ty, "return")
+                        self.convert_expression(&actual, &return_ty, expression, "return")
                             .map_err(|message| self.error(message))?;
                     }
                     None => {
@@ -4587,7 +5363,7 @@ impl<'a> FnEmitter<'a> {
     fn assign(&mut self, name: &str, value: &Expr) -> Result<(), CompileError> {
         if let Some((index, ty)) = self.locals.get(name).cloned() {
             let actual = self.expr(value)?;
-            self.convert_assignable(&actual, &ty, &format!("assignment to '{name}'"))
+            self.convert_expression(&actual, &ty, value, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.stloc(index);
             return Ok(());
@@ -4599,7 +5375,7 @@ impl<'a> FnEmitter<'a> {
         {
             let ty = self.params[position].1.clone();
             let actual = self.expr(value)?;
-            self.convert_assignable(&actual, &ty, &format!("assignment to '{name}'"))
+            self.convert_expression(&actual, &ty, value, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.starg(self.argument_index(position));
             return Ok(());
@@ -4610,8 +5386,13 @@ impl<'a> FnEmitter<'a> {
         };
         if field.is_static {
             let actual = self.expr(value)?;
-            self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
-                .map_err(|message| self.error(message))?;
+            self.convert_expression(
+                &actual,
+                &field.ty,
+                value,
+                &format!("assignment to '{name}'"),
+            )
+            .map_err(|message| self.error(message))?;
             self.emitter.emit(Instruction::new(
                 OpCode::Stsfld,
                 Operand::Token(MemberToken::Field(field.entry)),
@@ -4625,8 +5406,13 @@ impl<'a> FnEmitter<'a> {
         }
         self.emitter.ldarg(0);
         let actual = self.expr(value)?;
-        self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
-            .map_err(|message| self.error(message))?;
+        self.convert_expression(
+            &actual,
+            &field.ty,
+            value,
+            &format!("assignment to '{name}'"),
+        )
+        .map_err(|message| self.error(message))?;
         self.emitter.emit(Instruction::new(
             OpCode::Stfld,
             Operand::Token(MemberToken::Field(field.entry)),
@@ -4645,7 +5431,7 @@ impl<'a> FnEmitter<'a> {
     fn assign_value(&mut self, name: &str, value: &Expr) -> Result<Ty, CompileError> {
         if let Some((index, ty)) = self.locals.get(name).cloned() {
             let actual = self.expr(value)?;
-            self.convert_assignable(&actual, &ty, &format!("assignment to '{name}'"))
+            self.convert_expression(&actual, &ty, value, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.dup();
             self.emitter.stloc(index);
@@ -4658,7 +5444,7 @@ impl<'a> FnEmitter<'a> {
         {
             let ty = self.params[position].1.clone();
             let actual = self.expr(value)?;
-            self.convert_assignable(&actual, &ty, &format!("assignment to '{name}'"))
+            self.convert_expression(&actual, &ty, value, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.dup();
             self.emitter.starg(self.argument_index(position));
@@ -4669,8 +5455,13 @@ impl<'a> FnEmitter<'a> {
         };
         if field.is_static {
             let actual = self.expr(value)?;
-            self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
-                .map_err(|message| self.error(message))?;
+            self.convert_expression(
+                &actual,
+                &field.ty,
+                value,
+                &format!("assignment to '{name}'"),
+            )
+            .map_err(|message| self.error(message))?;
             self.emitter.dup();
             self.emitter.emit(Instruction::new(
                 OpCode::Stsfld,
@@ -4685,8 +5476,13 @@ impl<'a> FnEmitter<'a> {
         }
         self.emitter.ldarg(0);
         let actual = self.expr(value)?;
-        self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
-            .map_err(|message| self.error(message))?;
+        self.convert_expression(
+            &actual,
+            &field.ty,
+            value,
+            &format!("assignment to '{name}'"),
+        )
+        .map_err(|message| self.error(message))?;
         let signature = resolve_type(&field.ty, self.types, self.externals, &mut *self.module)
             .map_err(|message| self.error(message))?;
         let temporary = self.emitter.declare_local(signature);
@@ -4724,8 +5520,13 @@ impl<'a> FnEmitter<'a> {
             self.emitter.ldarg(0);
         }
         let actual = self.expr(value)?;
-        self.convert_assignable(&actual, &property.ty, &format!("assignment to '{name}'"))
-            .map_err(|message| self.error(message))?;
+        self.convert_expression(
+            &actual,
+            &property.ty,
+            value,
+            &format!("assignment to '{name}'"),
+        )
+        .map_err(|message| self.error(message))?;
         let temporary = if leave_value {
             let signature =
                 resolve_type(&property.ty, self.types, self.externals, &mut *self.module)
@@ -4852,8 +5653,13 @@ impl<'a> FnEmitter<'a> {
             if let Some(args) = args {
                 for (index, argument) in args.iter().enumerate() {
                     let actual = self.expr(argument)?;
-                    self.convert_assignable(&actual, &ctor.params[index], "base argument")
-                        .map_err(|message| self.error(message))?;
+                    self.convert_expression(
+                        &actual,
+                        &ctor.params[index],
+                        argument,
+                        "base argument",
+                    )
+                    .map_err(|message| self.error(message))?;
                 }
             }
             self.emitter.call(ctor.entry);
@@ -4907,7 +5713,7 @@ impl<'a> FnEmitter<'a> {
             if let Some(args) = args {
                 for (index, argument) in args.iter().enumerate() {
                     let actual = self.expr(argument)?;
-                    self.convert_assignable(&actual, &params[index], "base argument")
+                    self.convert_expression(&actual, &params[index], argument, "base argument")
                         .map_err(|message| self.error(message))?;
                 }
             }
@@ -4996,7 +5802,7 @@ impl<'a> FnEmitter<'a> {
 impl<'a> FnEmitter<'a> {
     fn expr(&mut self, expression: &Expr) -> Result<Ty, CompileError> {
         match expression {
-            Expr::Int(value) => {
+            Expr::Int(value, _) => {
                 self.emitter.ldc_i4(*value);
                 Ok(Ty::Int)
             }
@@ -5049,9 +5855,54 @@ impl<'a> FnEmitter<'a> {
                 Ok(result)
             }
             Expr::Cast(target, inner) => {
+                let enum_constant = self.enum_constant_value(inner);
                 let source = self.expr(inner)?;
                 match (&source, target) {
                     _ if &source == target => {}
+                    (Ty::Enum(_, _), Ty::Int) => {
+                        if enum_constant.is_some_and(|value| {
+                            value < i32::MIN as i128 || value > i32::MAX as i128
+                        }) {
+                            return Err(
+                                self.error("constant enum conversion exceeds the target type")
+                            );
+                        }
+                        self.emitter.op(OpCode::Conv_I4);
+                    }
+                    (Ty::Int, Ty::Enum(_, base)) => {
+                        let constant = match inner.as_ref() {
+                            Expr::Int(value, _) => Some(i128::from(*value)),
+                            Expr::Negate(value) => match value.as_ref() {
+                                Expr::Int(value, _) => Some(-i128::from(*value)),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(value) = constant {
+                            let (min, max) = base.bounds();
+                            if value < min || value > max {
+                                return Err(self.error(
+                                    "constant enum conversion exceeds the underlying type",
+                                ));
+                            }
+                        }
+                        self.emitter.op(base.conversion());
+                    }
+                    (Ty::Enum(_, source_base), Ty::Enum(_, target_base)) => {
+                        let (min, max) = target_base.bounds();
+                        if enum_constant.is_some_and(|value| value < min || value > max) {
+                            return Err(
+                                self.error("constant enum conversion exceeds the target type")
+                            );
+                        }
+                        let conversion = if *source_base == EnumBase::U4 && target_base.width() == 8
+                        {
+                            OpCode::Conv_U8
+                        } else {
+                            target_base.conversion()
+                        };
+                        self.emitter.op(conversion);
+                    }
                     (Ty::Int, Ty::Float) => {
                         self.emitter.op(OpCode::Conv_R4);
                     }
@@ -5278,7 +6129,7 @@ impl<'a> FnEmitter<'a> {
                 TypeDefOrRef::TypeRef(entry) => Ok(MemberToken::TypeRef(entry)),
                 _ => Err(self.error("System.Object is not a type reference")),
             },
-            Ty::Class(type_name) => {
+            Ty::Class(type_name) | Ty::Enum(type_name, _) => {
                 let Some(entry) = self.types.get(type_name) else {
                     return Err(self.error(format!("unknown type '{type_name}'")));
                 };
@@ -5320,15 +6171,44 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    fn enum_constant_value(&self, expression: &Expr) -> Option<i128> {
+        let Expr::Member { target, name } = expression else {
+            return None;
+        };
+        let type_name = Self::type_path(target)?;
+        let root = type_name.split('.').next()?;
+        if self.locals.contains_key(root) || self.params.iter().any(|(name, _)| name == root) {
+            return None;
+        }
+        find_enum(self.enums, &type_name, &self.namespace, self.enum_imports)?
+            .values
+            .get(name)
+            .copied()
+    }
+
     fn member_read(&mut self, target: &Expr, name: &str) -> Result<Ty, CompileError> {
-        if let Expr::Name(type_name) = target
-            && let Some(values) = self.enums.get(type_name)
+        if let Some(type_name) = Self::type_path(target)
+            && let Some(info) =
+                find_enum(self.enums, &type_name, &self.namespace, self.enum_imports)
+            && !self
+                .locals
+                .contains_key(type_name.split('.').next().unwrap_or(&type_name))
+            && !self.params.iter().any(|(parameter, _)| {
+                parameter == type_name.split('.').next().unwrap_or(&type_name)
+            })
         {
-            let Some(value) = values.get(name) else {
+            let Some(value) = info.values.get(name) else {
                 return Err(self.error(format!("enum '{type_name}' has no member '{name}'")));
             };
-            self.emitter.ldc_i4(*value);
-            return Ok(Ty::Int);
+            if info.base.width() == 8 {
+                self.emitter.emit(Instruction::new(
+                    OpCode::Ldc_I8,
+                    Operand::Int64(*value as u64 as i64),
+                ));
+            } else {
+                self.emitter.ldc_i4(*value as i32);
+            }
+            return Ok(Ty::Enum(info.full_name(), info.base));
         }
         if let Expr::Name(builtin) = target
             && !self.types.contains_key(builtin)
@@ -5494,7 +6374,7 @@ impl<'a> FnEmitter<'a> {
                 }
                 self.emitter.dup();
                 let actual = self.expr(value)?;
-                self.convert_assignable(&actual, &field.ty, "initializer")
+                self.convert_expression(&actual, &field.ty, value, "initializer")
                     .map_err(|message| self.error(message))?;
                 self.emitter.emit(Instruction::new(
                     OpCode::Stfld,
@@ -5516,7 +6396,7 @@ impl<'a> FnEmitter<'a> {
             self.require_method_access(&setter, true, Some(type_name))?;
             self.emitter.dup();
             let actual = self.expr(value)?;
-            self.convert_assignable(&actual, &property.ty, "initializer")
+            self.convert_expression(&actual, &property.ty, value, "initializer")
                 .map_err(|message| self.error(message))?;
             self.emitter.callvirt(setter);
         }
@@ -5531,7 +6411,7 @@ impl<'a> FnEmitter<'a> {
     ) -> Result<(), CompileError> {
         for (index, argument) in args.iter().enumerate() {
             let actual = self.expr(argument)?;
-            self.convert_assignable(&actual, &params[index], what)
+            self.convert_expression(&actual, &params[index], argument, what)
                 .map_err(|message| self.error(message))?;
         }
         Ok(())
@@ -5564,8 +6444,86 @@ impl<'a> FnEmitter<'a> {
             return Ok(Ty::Bool);
         }
 
-        let left_ty = self.expr(left)?;
-        let right_ty = self.expr(right)?;
+        let mut left_ty = self.expr(left)?;
+        let mut right_ty = self.expr(right)?;
+        if matches!(
+            op,
+            BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::Less
+                | BinaryOp::LessOrEqual
+                | BinaryOp::Greater
+                | BinaryOp::GreaterOrEqual
+        ) {
+            if matches!(left_ty, Ty::Enum(_, _)) && right_ty == Ty::Int && Self::is_enum_zero(right)
+            {
+                self.convert_expression(&right_ty, &left_ty, right, "enum comparison")
+                    .map_err(|message| self.error(message))?;
+                right_ty = left_ty.clone();
+            } else if matches!(right_ty, Ty::Enum(_, _))
+                && left_ty == Ty::Int
+                && Self::is_enum_zero(left)
+            {
+                let signature =
+                    resolve_type(&right_ty, self.types, self.externals, &mut *self.module)
+                        .map_err(|message| self.error(message))?;
+                let temporary = self.emitter.declare_local(signature);
+                self.emitter.stloc(temporary);
+                self.convert_expression(&left_ty, &right_ty, left, "enum comparison")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.ldloc(temporary);
+                left_ty = right_ty.clone();
+            }
+        }
+        if let (Ty::Enum(left_name, base), Ty::Enum(right_name, _)) = (&left_ty, &right_ty)
+            && left_name == right_name
+        {
+            let unsigned = base.is_unsigned();
+            match op {
+                BinaryOp::Equal => {
+                    self.emitter.op(OpCode::Ceq);
+                }
+                BinaryOp::NotEqual => {
+                    self.emitter.op(OpCode::Ceq).ldc_i4(0).op(OpCode::Ceq);
+                }
+                BinaryOp::Less => {
+                    self.emitter.op(if unsigned {
+                        OpCode::Clt_Un
+                    } else {
+                        OpCode::Clt
+                    });
+                }
+                BinaryOp::Greater => {
+                    self.emitter.op(if unsigned {
+                        OpCode::Cgt_Un
+                    } else {
+                        OpCode::Cgt
+                    });
+                }
+                BinaryOp::LessOrEqual => {
+                    self.emitter
+                        .op(if unsigned {
+                            OpCode::Cgt_Un
+                        } else {
+                            OpCode::Cgt
+                        })
+                        .ldc_i4(0)
+                        .op(OpCode::Ceq);
+                }
+                BinaryOp::GreaterOrEqual => {
+                    self.emitter
+                        .op(if unsigned {
+                            OpCode::Clt_Un
+                        } else {
+                            OpCode::Clt
+                        })
+                        .ldc_i4(0)
+                        .op(OpCode::Ceq);
+                }
+                _ => return Err(self.error("this enum operator is not supported yet")),
+            }
+            return Ok(Ty::Bool);
+        }
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && left_ty == Ty::String
             && right_ty == Ty::String
@@ -6246,7 +7204,7 @@ impl<'a> FnEmitter<'a> {
         };
         if symbol.is_static {
             let actual = self.expr(value)?;
-            self.convert_assignable(&actual, &symbol.ty, "field initializer")
+            self.convert_expression(&actual, &symbol.ty, value, "field initializer")
                 .map_err(|message| self.error(message))?;
             self.emitter.emit(Instruction::new(
                 OpCode::Stsfld,
@@ -6255,7 +7213,7 @@ impl<'a> FnEmitter<'a> {
         } else {
             self.emitter.ldarg(0);
             let actual = self.expr(value)?;
-            self.convert_assignable(&actual, &symbol.ty, "field initializer")
+            self.convert_expression(&actual, &symbol.ty, value, "field initializer")
                 .map_err(|message| self.error(message))?;
             self.emitter.emit(Instruction::new(
                 OpCode::Stfld,

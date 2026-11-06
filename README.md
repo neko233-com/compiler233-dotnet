@@ -1,13 +1,13 @@
 # compiler233-dotnet
 
-面向生产环境的 Rust .NET 编译器项目，**以 [Microsoft Roslyn](https://github.com/dotnet/roslyn) 为直接对标对象**。项目目标是在可验证的 C# 语言兼容性、程序集行为和工具链集成基础上，持续优化编译延迟、吞吐量与内存占用；性能比较以相同功能、相同输入和正确输出为前提。
+面向生产环境的 Rust .NET 编译器项目，**以 [Microsoft Roslyn](https://github.com/dotnet/roslyn) 为功能与生态兼容目标**。项目目标是在完整的 C# 语言支持、正确的程序集行为和工具链集成基础上，持续优化编译延迟、吞吐量与内存占用，力争性能领先。
 
-**当前状态：早期开发，尚不适用于生产。** 现有版本仅能编译下文列出的极小 C# 子集，尚未实现 Roslyn 完整语言、程序集或 API 兼容，也没有完整编译性能对标结论。不要将其用于生产构建。
+**当前状态：早期开发，尚不适用于生产。** 现有版本仅能编译下文列出的极小 C# 子集，尚未实现完整语言、程序集或 API 兼容，也未完成生产环境验收。不要将其用于生产构建。
 
 ## 产品目标
 
-- **兼容性**：按明确的 C# / .NET 版本逐步实现语法、绑定、类型检查、诊断、CLR 元数据和 CIL；以 Roslyn 的编译结果和实际运行行为进行差分验证。
-- **性能**：在等价的正确性和功能覆盖下，对标 Roslyn 的冷启动、完整与增量编译、并发吞吐、p50/p95/p99、分配量及峰值内存，目标是在主要工作负载上显著领先。
+- **兼容性**：按明确的 C# / .NET 版本逐步实现语法、绑定、类型检查、诊断、CLR 元数据和 CIL；按语言及运行时契约验证产物与实际运行行为。
+- **性能**：持续优化冷启动、完整与增量编译、并发吞吐及内存占用，目标是在主要工作负载上显著领先；当前优先完成正确性与生产可用性，不要求竞品速度对比。
 - **集成**：逐步覆盖多文件项目、引用解析、CLI/MSBuild、可复现构建及开发工具接口。达到兼容性要求前，不宣称可以替代 `csc`、MSBuild 或 Roslyn API。
 - **替代目标**：包括 csc 命令行契约、C# 和 Visual Basic、分析器与源生成器，以及 `Microsoft.CodeAnalysis` 托管 API 兼容；这些能力目前只有少量 csc/C# 子集实现。HotReload233 的接入点是 csc 进程契约，待相关能力及实际链路验证后再接入。
 - **平台**：当前优先实现并验收 Windows x86-64；macOS **ARM64** 在后续补全，macOS Intel 不在目标范围。现有 Linux 和 macOS CI / 发布配置保留，但不作为当前 Windows 阶段的验收前提。平台 CI 通过只说明当前已实现功能通过该平台的检查。
@@ -61,8 +61,7 @@ cargo test --locked
 ./tests/runtime.ps1
 ./tests/preprocessor.ps1
 ./tests/output-safety.ps1
-./benchmarks/run.ps1 -RustMode Subset -Source benchmarks/corpus/Subset.cs -Iterations 500 -Warmup 50
-./benchmarks/run.ps1 -RustMode Subset -Stage Compile -Source tests/fixtures/Arithmetic.cs -Iterations 100 -Warmup 30
+./tests/enums.ps1
 ./benchmarks/check-subset.ps1
 ```
 
@@ -126,6 +125,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 数值：支持部分 `int` 到 `float` 的隐式转换与混合运算；测试覆盖舍入、求值顺序和 `NaN` 的大小比较。完整数值类型与转换规则仍未实现。
 - 异常处理：支持部分 `try`/`catch`/`finally`、`throw`、重新抛出及 `catch ... when` 筛选器；测试覆盖筛选器在栈展开前执行、筛选器抛异常、变量修改、嵌套异常及跨保护区的返回、`break`、`continue`。完整异常类型解析和语言语义仍未覆盖。
 - 数组：一维数组构造、`a[i]` 读写、`a.Length` 和 `foreach` 遍历；`int`、`float`、`bool`、`string`、`object` 的元素指令与部分边界异常有运行时对照测试。
+- 枚举：支持同程序集中的八种整数底层类型、具名成员、前向引用及部分常量表达式，生成真实 CLR 枚举元数据；支持枚举签名、数组、比较、显式转换和部分零值隐式转换，以及全限定的 `System.Flags` 特性。`uint`/`long`/`ulong` 底层类型的常量算术、引用程序集中的枚举绑定、其他枚举特性及完整运算规则尚未实现。
 - 继承：基类（本地或引用程序集）、`virtual`/`override` 虚调用、`: base(args)` 基类构造、基类方法继承与基类-派生类赋值兼容
 - 接口：`interface` 声明（抽象方法、无方法体）、类实现接口（`InterfaceImpl` + 隐式实现标记为 `virtual final newslot`）、接口类型变量与 `callvirt` 派发
 - 外部基类继承：`class X : System.Exception` 可编译，构造函数 `: base(args)`、继承的字段与属性（`get_X`）沿引用程序集的 `extends` 链解析
@@ -141,11 +141,11 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 尚未支持、会被明确拒绝而不是静默降级：泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、`async` 和 `switch` 模式匹配等扩展形式。
 
-验收方式：`./tests/compile.ps1` 用 Roslyn 编译同一批源码并比较运行结果；`./tests/exceptions.ps1` 专门比较异常与筛选器行为、无效输入和引用程序集下游加载；`./tests/loops.ps1` 和 `./tests/switch.ps1` 对照循环、分支与异常控制流。
+当前针对性测试包括 `./tests/enums.ps1`：检查枚举字段与方法元数据、引用程序集、实际运行结果、下游调用和失败时旧产物保护。仓库保留既有的差分测试及历史数据；这些有限用例不能代表完整功能或生产验收。
 
 ## 发布
 
-发布由 GitHub tag 触发，本地也可直接打包：
+完成 Windows 生产验收后才推送并发布。发布由 GitHub tag 触发，本地也可直接打包：
 
 ```powershell
 ./scripts/package.ps1 -Version 0.1.0
@@ -153,24 +153,9 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 产物为 `compiler233-dotnet-<version>-<平台>.zip`（含可执行文件、README、LICENSE、THIRD_PARTY_NOTICES）与同名 `.sha256`。推送 `v*` tag 时 `.github/workflows/release.yml` 在 win-x64、linux-x64、macos-arm64 三个平台分别构建并上传 Release 资产。macOS Intel 不在支持范围。
 
-## 性能基准
+## 性能与生产验证
 
-```powershell
-./benchmarks/generate-subset.ps1 -Output benchmarks/results/generated.cs -Methods 200
-./benchmarks/run.ps1 -RustMode Subset -Source benchmarks/results/generated.cs -Iterations 300 -Warmup 100
-```
-
-脚本对相同 UTF-8 输入检查 SHA-256，预热后记录所有样本及 p50/p95。两种实现分别在独立进程中运行，使用的 Roslyn 随本机 SDK 版本变化；原始 JSON 需要和输入一起保存。默认只测语法解析；`-Stage Compile` 测量内存中的解析、绑定与 DLL 生成。两种模式均不包含进程启动、文件读取或执行。
-
-原生前端的语法覆盖和语法树内容比 Roslyn 少，因此该微基准**不是功能等价的速度比较**。[本机实验记录](benchmarks/RESULTS.md)仅用于跟踪早期实现。正式性能结论需要固定工具版本、代表性项目、正确性验证、多次独立运行、内存与完整编译测量。
-
-Windows x64 上可运行端到端子集对照：
-
-```powershell
-./benchmarks/equivalent-compile.ps1 -Iterations 100 -Warmup 5 -ExtraMethods 200
-```
-
-脚本为双方使用同一批源码、目标类型和 `System.Runtime` 引用，先用 Roslyn oracle 运行指定入口，再交替启动独立编译进程并记录全部样本与 p50/p95/p99。JSON 报告保存在 `benchmarks/results/equivalent-compile/`，包含工具及输入 SHA-256、命令参数、版本和校验结果。每个样本读取 Windows [进程峰值工作集和提交量](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters)，不包含父进程或子进程。该合成语料不覆盖完整 C#、实际工程、增量编译、分析器或生成器，不能证明完整 Roslyn 替代或总体性能领先。
+性能领先是项目目标。当前以功能正确、真实项目编译、产物可用和生产链路验证为优先，不要求竞品速度对比。[历史实验记录](benchmarks/RESULTS.md)仅覆盖早期子集，不能证明完整编译器的性能或生产可用性。
 
 ## 后续里程碑
 
@@ -179,7 +164,7 @@ Windows x64 上可运行端到端子集对照：
 - **M2（进行中）**：自研词法 + 递归下降解析已落地，覆盖预处理/条件编译、命名空间、类型、成员、语句与表达式；当次语料与条件分支的语法层结果见上文。剩余工作：trivia/span 保真、增量解析，以及更多语料和编译条件下的长尾构造。
 - **M3（进行中）**：部分名字/类型检查与 CIL 发射已打通，由 `tests/compile.ps1` 与 Roslyn 执行结果对照；仍需完整的泛型定义、lambda、异常、async 及其语义验证。
 - **M4**：CIL、元数据、便携 PDB、引用程序集，以及目标框架矩阵（netstandard2.0/2.1、net472、net8/9/10）。
-- **M5**：性能对标（冷启动、全量/增量 p50/p95、峰值内存）与 GitHub tag 发布；当前先验证 win-x64，后续补全 macos-arm64。
+- **M5**：优化性能并完成真实项目与生产链路验收，再进行推送和 GitHub tag 发布；当前先验证 win-x64，后续补全 macos-arm64。
 - **M6**：Visual Basic、分析器与源生成器，以及 `Microsoft.CodeAnalysis` 托管 API 兼容。
 
 MIT License；依赖项遵循各自许可证。
