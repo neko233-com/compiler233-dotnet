@@ -8,6 +8,7 @@ pub mod compile;
 pub mod csc;
 pub mod csharp;
 pub mod frontend;
+pub mod reference;
 pub mod subset;
 pub mod syntax;
 

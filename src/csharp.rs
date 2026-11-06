@@ -2211,6 +2211,19 @@ fn emit(
                 property_symbol.setter = Some(entry.clone());
                 jobs.push((index, entry, Job::Setter(property_index)));
             }
+            ty.get_mut()
+                .properties
+                .push(Entry::new(hao::dotnet::entries::Property {
+                    name: property.name.clone(),
+                    signature: hao::dotnet::signature::PropertySig {
+                        has_this: !property.is_static,
+                        ty: signature.clone(),
+                        params: Vec::new(),
+                    },
+                    getter: property_symbol.getter.clone(),
+                    setter: property_symbol.setter.clone(),
+                    ..Default::default()
+                }));
             symbol
                 .properties
                 .insert(property.name.clone(), property_symbol);
@@ -2942,6 +2955,40 @@ impl<'a> FnEmitter<'a> {
                     .and_then(|symbol| symbol.properties.get(name))
                     .map(|property| (property.ty.clone(), property.setter.clone()));
                 let Some((property_ty, setter)) = setter else {
+                    let owner = self
+                        .external_base_of(&type_name)
+                        .unwrap_or_else(|| type_name.clone());
+                    if let Some((index, entry)) =
+                        self.externals
+                            .method_in_chain(&owner, &format!("set_{name}"), 1)
+                    {
+                        let (flags, signature) = {
+                            let method = entry.get();
+                            (method.flags, method.signature.clone())
+                        };
+                        if flags & MethodFlags::MemberAccessMask != MethodFlags::Public
+                            || flags.contains(MethodFlags::Static)
+                            || !flags.contains(MethodFlags::SpecialName)
+                        {
+                            return Err(self.error(format!(
+                                "property '{type_name}.{name}' has no accessible instance setter"
+                            )));
+                        }
+                        let expected = external_ty(&signature.params[0]);
+                        let actual = self.expr(value)?;
+                        self.require_assignable(
+                            &actual,
+                            &expected,
+                            &format!("assignment to '{name}'"),
+                        )
+                        .map_err(|message| self.error(message))?;
+                        let token = self
+                            .module
+                            .import_foreign_method(&entry, &self.externals.modules[index])
+                            .map_err(|error| self.error(error.to_string()))?;
+                        self.emitter.callvirt(token);
+                        return Ok(());
+                    }
                     return Err(self.error(format!("unknown member '{type_name}.{name}'")));
                 };
                 let Some(setter) = setter else {

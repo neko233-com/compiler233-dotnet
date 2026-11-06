@@ -16,7 +16,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::{csharp, syntax};
+use crate::{csharp, reference, syntax};
 
 const MAX_RESPONSE_DEPTH: usize = 16;
 
@@ -488,6 +488,54 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Stage both artifacts before replacing either. If the second replacement
+/// fails, restore the first artifact or report the rollback failure explicitly.
+fn write_assembly_pair(
+    output: &Path,
+    bytes: &[u8],
+    refout: &Path,
+    reference: &[u8],
+) -> std::io::Result<()> {
+    fn stage(path: &Path, data: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
+        if path.exists() && !path.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("'{}' is not a regular file", path.display()),
+            ));
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(data)?;
+        Ok(temporary)
+    }
+    let output_stage = stage(output, bytes)?;
+    let reference_stage = stage(refout, reference)?;
+    let previous = match fs::read(output) {
+        Ok(data) => Some(data),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    output_stage.persist(output).map_err(|error| error.error)?;
+    if let Err(error) = reference_stage.persist(refout) {
+        let rollback = match previous {
+            Some(data) => write_atomic(output, &data),
+            None => fs::remove_file(output),
+        };
+        if let Err(rollback_error) = rollback {
+            return Err(std::io::Error::other(format!(
+                "reference output failed: {}; output rollback failed: {rollback_error}",
+                error.error
+            )));
+        }
+        return Err(error.error);
+    }
+    Ok(())
+}
+
 fn target_identity(path: &Path) -> std::io::Result<PathBuf> {
     if let Ok(existing) = path.canonicalize() {
         return Ok(existing);
@@ -632,14 +680,6 @@ fn compile_assembly(
         ));
         return None;
     }
-    if options.refout.is_some() {
-        diagnostics.push(Diagnostic::error(
-            "<command line>",
-            "CD2330002",
-            "-refout is not implemented; no assembly was produced",
-        ));
-        return None;
-    }
     for source in &options.sources {
         if source == "-" {
             diagnostics.push(Diagnostic::error(
@@ -723,7 +763,19 @@ fn compile_assembly(
             return None;
         }
     };
-    if let Err(error) = write_atomic(&output, &bytes) {
+    let write_result = if let Some(refout) = &options.refout {
+        let reference = match reference::emit(&bytes) {
+            Ok(reference) => reference,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(refout, "CD2330023", error));
+                return None;
+            }
+        };
+        write_assembly_pair(&output, &bytes, Path::new(refout), &reference)
+    } else {
+        write_atomic(&output, &bytes)
+    };
+    if let Err(error) = write_result {
         diagnostics.push(Diagnostic::error(
             output.display().to_string(),
             "CS2012",

@@ -57,13 +57,10 @@ Assert-True ($report.define -contains 'HOTRELOAD233_PATCH') 'report did not reco
 Assert-True ($report.ignored_options -contains 'nologo') 'report did not record ignored options'
 Assert-True ($report.ignored_options -contains 'optimize') 'report did not record the optimize modifier'
 
-# A reference assembly is not the implementation assembly: reject the option
-# until a correct reference assembly can be emitted, preserving existing output.
-$beforeRefout = (Get-FileHash -Algorithm SHA256 $output).Hash
+# A reference output is a separate metadata-only assembly.
 $result = Invoke-Csc @($fixture, "-out:$output", "-refout:$refout")
-Assert-True ($result.ExitCode -eq 1 -and $result.Output -match 'CD2330002') 'unimplemented refout was not rejected'
-Assert-True ((Get-FileHash -Algorithm SHA256 $output).Hash -eq $beforeRefout) 'failed refout compilation modified the implementation assembly'
-Assert-True (-not (Test-Path $refout)) 'failed refout compilation created an artifact'
+Assert-True ($result.ExitCode -eq 0) "reference output failed: $($result.Output)"
+Assert-True (Test-Path $refout) 'reference output was not created'
 
 # A failed compilation must keep the previously produced assembly.
 $before = (Get-FileHash -Algorithm SHA256 $output).Hash
