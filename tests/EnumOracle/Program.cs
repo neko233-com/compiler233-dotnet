@@ -181,7 +181,7 @@ if (api.GetField("ZeroField")!.FieldType.FullName != "EnumFixture.UnsignedLong" 
     Convert.ToUInt64(api.GetField("ZeroField")!.GetValue(null)) != 0) throw new Exception("Invalid zero field");
 foreach (var test in new[] {
     ("EnumFixture.Api", "Run", 2), ("EnumFixture.Api", "RoundTrip", -2),
-    ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143),
+    ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143), ("EnumFixture.Api", "FlagOperations", 42), ("EnumFixture.Api", "FlagSwitch", 19),
     ("EnumFixture.Api", "SwitchEnums", 43), ("EnumFixture.Api", "SwitchAll", 36), ("EnumFixture.Api", "SwitchUnsignedDense", 15), ("EnumFixture.Api", "SwitchNoDefault", 13),
     ("EnumOne.Holder", "Run", 1), ("EnumTwo.OtherHolder", "Run", 2),
     ("EnumImported.ImportedHolder", "Run", 1), ("EnumAliased.AliasHolder", "Run", 2)

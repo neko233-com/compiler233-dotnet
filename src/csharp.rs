@@ -170,6 +170,19 @@ impl EnumBase {
     fn is_unsigned(self) -> bool {
         matches!(self, Self::U1 | Self::U2 | Self::U4 | Self::U8)
     }
+
+    fn from_bits(self, value: u64) -> i128 {
+        match self {
+            Self::I1 => value as u8 as i8 as i128,
+            Self::U1 => value as u8 as i128,
+            Self::I2 => value as u16 as i16 as i128,
+            Self::U2 => value as u16 as i128,
+            Self::I4 => value as u32 as i32 as i128,
+            Self::U4 => value as u32 as i128,
+            Self::I8 => value as i64 as i128,
+            Self::U8 => value as i128,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -745,6 +758,9 @@ enum BinaryOp {
     LessOrEqual,
     Greater,
     GreaterOrEqual,
+    BitAnd,
+    BitOr,
+    BitXor,
     And,
     Or,
 }
@@ -760,6 +776,7 @@ enum Expr {
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
     Negate(Box<Expr>),
     Not(Box<Expr>),
+    Complement(Box<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
     Conditional {
         condition: Box<Expr>,
@@ -2664,11 +2681,47 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_logical_and(&mut self) -> Result<Expr, CompileError> {
-        let mut left = self.parse_equality()?;
+        let mut left = self.parse_bitwise_or()?;
         while self.check("&&") {
             self.bump();
-            let right = self.parse_equality()?;
+            let right = self.parse_bitwise_or()?;
             left = Expr::Binary(BinaryOp::And, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_or(&mut self) -> Result<Expr, CompileError> {
+        let mut left = self.parse_bitwise_xor()?;
+        while self.eat("|") {
+            left = Expr::Binary(
+                BinaryOp::BitOr,
+                Box::new(left),
+                Box::new(self.parse_bitwise_xor()?),
+            );
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_xor(&mut self) -> Result<Expr, CompileError> {
+        let mut left = self.parse_bitwise_and()?;
+        while self.eat("^") {
+            left = Expr::Binary(
+                BinaryOp::BitXor,
+                Box::new(left),
+                Box::new(self.parse_bitwise_and()?),
+            );
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_and(&mut self) -> Result<Expr, CompileError> {
+        let mut left = self.parse_equality()?;
+        while self.eat("&") {
+            left = Expr::Binary(
+                BinaryOp::BitAnd,
+                Box::new(left),
+                Box::new(self.parse_equality()?),
+            );
         }
         Ok(left)
     }
@@ -2770,6 +2823,10 @@ impl<'a> Parser<'a> {
             "!" => {
                 self.bump();
                 Ok(Expr::Not(Box::new(self.parse_unary()?)))
+            }
+            "~" => {
+                self.bump();
+                Ok(Expr::Complement(Box::new(self.parse_unary()?)))
             }
             "(" => {
                 if self.looks_like_cast() {
@@ -4538,6 +4595,7 @@ impl<'a> FnEmitter<'a> {
         match expression {
             Expr::Int(value, true) => Some(*value),
             Expr::Negate(value) => Self::constant_int(value)?.checked_neg(),
+            Expr::Complement(value) => Some(!Self::constant_int(value)?),
             Expr::Binary(op, left, right) => {
                 let left = Self::constant_int(left)?;
                 let right = Self::constant_int(right)?;
@@ -4547,6 +4605,9 @@ impl<'a> FnEmitter<'a> {
                     BinaryOp::Multiply => left.checked_mul(right),
                     BinaryOp::Divide => left.checked_div(right),
                     BinaryOp::Remainder => left.checked_rem(right),
+                    BinaryOp::BitAnd => Some(left & right),
+                    BinaryOp::BitOr => Some(left | right),
+                    BinaryOp::BitXor => Some(left ^ right),
                     _ => None,
                 }
             }
@@ -4556,6 +4617,17 @@ impl<'a> FnEmitter<'a> {
 
     fn is_enum_zero(expression: &Expr) -> bool {
         matches!(expression, Expr::Int(0, _)) || Self::constant_int(expression) == Some(0)
+    }
+
+    fn has_non_int_literal(expression: &Expr) -> bool {
+        match expression {
+            Expr::Int(_, false) => true,
+            Expr::Negate(inner) | Expr::Complement(inner) => Self::has_non_int_literal(inner),
+            Expr::Binary(_, left, right) => {
+                Self::has_non_int_literal(left) || Self::has_non_int_literal(right)
+            }
+            _ => false,
+        }
     }
 
     fn convert_expression(
@@ -4580,7 +4652,7 @@ impl<'a> FnEmitter<'a> {
     fn validate_compound(&self, ty: &Ty, op: &str) -> Result<(), CompileError> {
         let valid = match op {
             "+=" | "-=" | "*=" | "/=" | "%=" => matches!(ty, Ty::Int | Ty::Float),
-            "&=" | "|=" | "^=" => matches!(ty, Ty::Int | Ty::Bool),
+            "&=" | "|=" | "^=" => matches!(ty, Ty::Int | Ty::Bool | Ty::Enum(_, _)),
             _ => false,
         };
         if valid {
@@ -5174,7 +5246,7 @@ impl<'a> FnEmitter<'a> {
                         Operand::Token(MemberToken::Field(field.entry.clone())),
                     ));
                     let rhs = self.expr(value)?;
-                    self.convert_assignable(&rhs, &field.ty, "compound assignment")
+                    self.convert_expression(&rhs, &field.ty, value, "compound assignment")
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
                     self.emitter.emit(Instruction::new(
@@ -5215,7 +5287,7 @@ impl<'a> FnEmitter<'a> {
                         self.emitter.ldarg(0).callvirt(getter);
                     }
                     let rhs = self.expr(value)?;
-                    self.convert_assignable(&rhs, &ty, "compound assignment")
+                    self.convert_expression(&rhs, &ty, value, "compound assignment")
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
                     if is_static {
@@ -5235,7 +5307,7 @@ impl<'a> FnEmitter<'a> {
                 let ty = self.load(name)?;
                 self.validate_compound(&ty, op)?;
                 let rhs = self.expr(value)?;
-                self.convert_assignable(&rhs, &ty, "compound assignment")
+                self.convert_expression(&rhs, &ty, value, "compound assignment")
                     .map_err(|message| self.error(message))?;
                 self.emitter.op(opcode);
                 self.store_top(name)?;
@@ -5366,7 +5438,7 @@ impl<'a> FnEmitter<'a> {
                         Operand::Token(MemberToken::Field(field.entry.clone())),
                     ));
                     let rhs = self.expr(value)?;
-                    self.convert_assignable(&rhs, &field.ty, "compound assignment")
+                    self.convert_expression(&rhs, &field.ty, value, "compound assignment")
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
                     self.emitter.emit(Instruction::new(
@@ -5394,7 +5466,7 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.dup();
                 self.emitter.callvirt(getter);
                 let rhs = self.expr(value)?;
-                self.convert_assignable(&rhs, &property.ty, "compound assignment")
+                self.convert_expression(&rhs, &property.ty, value, "compound assignment")
                     .map_err(|message| self.error(message))?;
                 self.emitter.op(opcode);
                 self.emitter.callvirt(setter);
@@ -6134,6 +6206,30 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.op(OpCode::Neg);
                 Ok(ty)
             }
+            Expr::Complement(inner) => {
+                let ty = self.expr(inner)?;
+                match &ty {
+                    Ty::Int if Self::has_non_int_literal(inner) => {
+                        return Err(self.error(
+                            "bitwise complement of unsigned or long literals is not supported",
+                        ));
+                    }
+                    Ty::Int => {
+                        self.emitter.op(OpCode::Not);
+                    }
+                    Ty::Enum(_, base) => {
+                        self.emitter.op(OpCode::Not);
+                        if base.width() < 4 {
+                            self.emitter.op(base.conversion());
+                        }
+                    }
+                    _ => {
+                        return Err(self
+                            .error(format!("unary '~' requires an integer or enum, got {ty:?}")));
+                    }
+                }
+                Ok(ty)
+            }
             Expr::Conditional {
                 condition,
                 when_true,
@@ -6493,16 +6589,61 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn enum_constant(&self, expression: &Expr) -> Option<(&EnumInfo, i128)> {
-        let Expr::Member { target, name } = expression else {
-            return None;
-        };
-        let type_name = Self::type_path(target)?;
-        let root = type_name.split('.').next()?;
-        if self.locals.contains_key(root) || self.params.iter().any(|(name, _)| name == root) {
-            return None;
+        match expression {
+            Expr::Member { target, name } => {
+                let type_name = Self::type_path(target)?;
+                let root = type_name.split('.').next()?;
+                if self.locals.contains_key(root)
+                    || self.params.iter().any(|(name, _)| name == root)
+                {
+                    return None;
+                }
+                let info = find_enum(self.enums, &type_name, &self.namespace, self.enum_imports)?;
+                Some((info, *info.values.get(name)?))
+            }
+            Expr::Cast(Ty::Enum(name, base), inner) => {
+                let info = self.enums.get(name)?.as_ref();
+                let value = match inner.as_ref() {
+                    Expr::Int(value, _) => i128::from(*value),
+                    other => self
+                        .enum_constant(other)
+                        .map(|(_, value)| value)
+                        .or_else(|| Self::constant_int(other).map(i128::from))?,
+                };
+                let (min, max) = base.bounds();
+                (min..=max).contains(&value).then_some((info, value))
+            }
+            Expr::Complement(inner) => {
+                let (info, value) = self.enum_constant(inner)?;
+                Some((info, info.base.from_bits(!(value as u64))))
+            }
+            Expr::Binary(
+                op @ (BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor),
+                left,
+                right,
+            ) => {
+                let left_constant = self.enum_constant(left);
+                let right_constant = self.enum_constant(right);
+                let (info, left_value, right_value) = match (left_constant, right_constant) {
+                    (Some((info, left)), Some((other, right)))
+                        if info.full_name() == other.full_name() =>
+                    {
+                        (info, left, right)
+                    }
+                    (Some((info, left)), None) if Self::is_enum_zero(right) => (info, left, 0),
+                    (None, Some((info, right))) if Self::is_enum_zero(left) => (info, 0, right),
+                    _ => return None,
+                };
+                let value = match op {
+                    BinaryOp::BitAnd => (left_value as u64) & (right_value as u64),
+                    BinaryOp::BitOr => (left_value as u64) | (right_value as u64),
+                    BinaryOp::BitXor => (left_value as u64) ^ (right_value as u64),
+                    _ => unreachable!(),
+                };
+                Some((info, info.base.from_bits(value)))
+            }
+            _ => None,
         }
-        let info = find_enum(self.enums, &type_name, &self.namespace, self.enum_imports)?;
-        Some((info, *info.values.get(name)?))
     }
 
     fn enum_switch_constant(&self, expression: &Expr, expected: &Ty) -> Option<i128> {
@@ -6795,6 +6936,9 @@ impl<'a> FnEmitter<'a> {
                 | BinaryOp::LessOrEqual
                 | BinaryOp::Greater
                 | BinaryOp::GreaterOrEqual
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
         ) {
             if matches!(left_ty, Ty::Enum(_, _)) && right_ty == Ty::Int && Self::is_enum_zero(right)
             {
@@ -6819,6 +6963,15 @@ impl<'a> FnEmitter<'a> {
         if let (Ty::Enum(left_name, base), Ty::Enum(right_name, _)) = (&left_ty, &right_ty)
             && left_name == right_name
         {
+            if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor) {
+                self.emitter.op(match op {
+                    BinaryOp::BitAnd => OpCode::And,
+                    BinaryOp::BitOr => OpCode::Or,
+                    BinaryOp::BitXor => OpCode::Xor,
+                    _ => unreachable!(),
+                });
+                return Ok(left_ty);
+            }
             let unsigned = base.is_unsigned();
             match op {
                 BinaryOp::Equal => {
@@ -6864,6 +7017,30 @@ impl<'a> FnEmitter<'a> {
                 _ => return Err(self.error("this enum operator is not supported yet")),
             }
             return Ok(Ty::Bool);
+        }
+        if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor)
+            && left_ty == right_ty
+            && matches!(left_ty, Ty::Int | Ty::Bool)
+        {
+            if left_ty == Ty::Int
+                && (Self::has_non_int_literal(left) || Self::has_non_int_literal(right))
+            {
+                return Err(
+                    self.error("bitwise operations on unsigned or long literals are not supported")
+                );
+            }
+            self.emitter.op(match op {
+                BinaryOp::BitAnd => OpCode::And,
+                BinaryOp::BitOr => OpCode::Or,
+                BinaryOp::BitXor => OpCode::Xor,
+                _ => unreachable!(),
+            });
+            return Ok(left_ty);
+        }
+        if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor) {
+            return Err(self.error(format!(
+                "bitwise operands are incompatible: {left_ty:?} and {right_ty:?}"
+            )));
         }
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && left_ty == Ty::String
@@ -6994,7 +7171,11 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.ldc_i4(0);
                 self.emitter.op(OpCode::Ceq);
             }
-            BinaryOp::And | BinaryOp::Or => unreachable!(),
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::And
+            | BinaryOp::Or => unreachable!(),
         }
         if matches!(
             op,

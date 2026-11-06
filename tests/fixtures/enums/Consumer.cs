@@ -34,6 +34,7 @@ public static class ExternalConsumer {
         if (g[0] != EchoSignedLong(SignedLong.Minimum)) return -9;
         if (h[0] != EchoUnsignedLong(UnsignedLong.Maximum)) return -10;
         if (EchoAlias(Picked.Positive) != Direction.Positive) return -11;
+        if ((UnsignedLong.Maximum ^ UnsignedLong.Maximum) != UnsignedLong.Zero) return -13;
         switch (h[0]) { case UnsignedLong.Maximum: break; default: return -12; }
         if (Api.Echo(values[0]) != Direction.Positive) return -2;
         return (int)Echo(EchoArray(values)[0]) + (int)UnsignedByte.Maximum;

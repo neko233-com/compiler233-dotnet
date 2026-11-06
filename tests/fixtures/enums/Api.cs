@@ -27,15 +27,23 @@ namespace EnumFixture {
         High = 1 << 7, Low = 1, Both = High | Low, Invert = (~0) & 255,
         Arithmetic = 256 - 1
     }
+    public class FlagBox {
+        public Bits Field = Bits.Both;
+        public Bits Property { get; set; }
+    }
 
     public static class Api {
         public static Direction Current = Direction.Positive;
         public static UnsignedLong ZeroField = 0;
+        public static Bits FlagField = Bits.Read;
+        public static int Calls = 0;
         public static Direction Echo(Direction value) { return value; }
         public static Direction[] EchoArray(Direction[] value) { return value; }
         public static Direction Cast(int value) { return (Direction)value; }
         public static UnsignedLong EchoWide(UnsignedLong value) { return value; }
         public static UnsignedLong ZeroMethod() { return 1 - 1; }
+        public static bool TrueTick() { Calls = Calls + 1; return true; }
+        public static bool FalseTick() { Calls = Calls + 10; return false; }
         public static int Run() {
             Direction value = Direction.Positive;
             if (value == Direction.Positive) return (int)Echo(value);
@@ -45,10 +53,55 @@ namespace EnumFixture {
         public static int FlagConstants() {
             return (int)Bits.AfterFuture + (int)ByteFlags.Both + (int)Bits.Precedence + (int)Bits.Shift;
         }
+        public static int FlagOperations() {
+            Bits value = Bits.Read | Bits.Write;
+            if (value != Bits.Both) return -1;
+            value &= Bits.Read;
+            value |= Bits.Write;
+            value ^= Bits.Read;
+            value |= 0;
+            if (value != Bits.Write || (0 | value) != Bits.Write) return -2;
+            if ((~Bits.Read & Bits.Both) != Bits.Write) return -3;
+            if ((Bits.Read | Bits.Write & Bits.Read) != Bits.Read) return -4;
+            if (~SignedByte.Minimum != SignedByte.Maximum) return -5;
+            if (~UnsignedByte.Maximum != UnsignedByte.Zero) return -6;
+            if (~SignedShort.Minimum != SignedShort.Maximum) return -7;
+            if (~UnsignedShort.Maximum != UnsignedShort.Zero) return -8;
+            if (~SignedInt.Minimum != SignedInt.Maximum) return -9;
+            if (~UnsignedInt.Maximum != UnsignedInt.Zero) return -10;
+            if (~SignedLong.Minimum != SignedLong.Maximum) return -11;
+            if (~UnsignedLong.Maximum != UnsignedLong.Zero) return -12;
+            if ((UnsignedLong.Maximum | 0) != UnsignedLong.Maximum || (0 | UnsignedLong.Maximum) != UnsignedLong.Maximum) return -15;
+            UnsignedLong wide = UnsignedLong.Maximum;
+            wide &= 0;
+            wide |= UnsignedLong.Maximum;
+            if (wide != UnsignedLong.Maximum) return -17;
+            FlagBox box = new FlagBox();
+            box.Property = Bits.Both;
+            box.Field &= Bits.Read;
+            box.Property ^= Bits.Read;
+            FlagField |= Bits.Write;
+            if (box.Field != Bits.Read || box.Property != Bits.Write || FlagField != Bits.Both) return -13;
+            int integer = 1 | 2 & 4 ^ 8;
+            bool boolean = true | false & false;
+            if (integer != 9 || !boolean) return -14;
+            Calls = 0;
+            bool bothCalled = TrueTick() | FalseTick();
+            if (!bothCalled || Calls != 11) return -16;
+            return 42;
+        }
+        public static int FlagCase(Bits value) {
+            switch (value) {
+                case Bits.Read | Bits.Write: return 9;
+                case ~Bits.Read: return 10;
+                default: return 0;
+            }
+        }
+        public static int FlagSwitch() { return FlagCase(Bits.Both) + FlagCase(~Bits.Read); }
         public static int Classify(Direction value) {
             switch (value) {
                 case Direction.Negative: return 3;
-                case 0: return 4;
+                case (1 & 0): return 4;
                 case Direction.Positive: return 5;
                 case (Direction)3: return 7;
                 default: return 6;
@@ -105,6 +158,7 @@ namespace EnumFixture {
             value = 0U;
             value = 0L;
             value = 0UL;
+            value = ~(-1);
             UnsignedLong[] values = new UnsignedLong[1];
             values[0] = 0;
             if (value != 0) return -1;
