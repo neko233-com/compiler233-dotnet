@@ -63,6 +63,8 @@ foreach ($invalid in @(
     'enum E { A = 1, B = 2 } class C { int M(E value) { switch(value) { case E.A + 1: return 1; case E.B: return 2; default: return 3; } } }',
     'enum E { A } class C { E M() { return E.A++; } }',
     'class C { string M(string value) { return value++; } }',
+    'enum E { A } class C { string M() { return E.A.ToString(null); } }',
+    'enum E { A } class C { E M(string value) { return (E)value; } }',
     'class C { public int P { get; } int M() { return this.P++; } }',
     'class C { int M() { string[] values = new string[1]; values[0]++; return 0; } }',
     'enum E { A } enum E { B }',

@@ -50,6 +50,11 @@ namespace EnumFixture {
         public static UnsignedByte StaticProperty { get; set; }
         public static CounterBox SharedCounter = new CounterBox();
         public static Direction Echo(Direction value) { return value; }
+        public static object Box(Direction value) { return value; }
+        public static object BoxExplicit(Direction value) { return (object)value; }
+        public static Direction Unbox(object value) { return (Direction)value; }
+        public static object EchoObject(object value) { return value; }
+        public static string FormatDirection(string format) { return Direction.Positive.ToString(format); }
         public static Direction[] EchoArray(Direction[] value) { return value; }
         public static Direction Cast(int value) { return (Direction)value; }
         public static UnsignedLong EchoWide(UnsignedLong value) { return value; }
@@ -217,6 +222,27 @@ namespace EnumFixture {
             GetCounter().Value += 1;
             if (SharedCounter.Value != UnsignedByte.Zero || Calls != 1) return -17;
             return 45;
+        }
+        public static int EnumBoxing() {
+            object boxed = Direction.Positive;
+            if ((Direction)boxed != Direction.Positive) return -1;
+            if (Unbox(Box(Direction.Positive)) != Direction.Positive) return -2;
+            if (Unbox(BoxExplicit(Direction.Positive)) != Direction.Positive) return -3;
+            if ((Direction)EchoObject(Direction.Positive) != Direction.Positive) return -4;
+            object[] values = new object[1];
+            values[0] = UnsignedLong.Maximum;
+            if ((UnsignedLong)values[0] != UnsignedLong.Maximum) return -5;
+            Direction unnamed = (Direction)8;
+            if (Direction.Positive.ToString() != "Positive" || unnamed.ToString() != "8") return -6;
+            if (Direction.Positive.GetHashCode() != 2) return -7;
+            if (UnsignedLong.Maximum.ToString() != "Maximum") return -8;
+            UnsignedLong unnamedWide = UnsignedLong.Maximum;
+            unnamedWide -= 1;
+            if (unnamedWide.ToString() != "18446744073709551614") return -9;
+            if (Direction.Positive.ToString("X") != "00000002" || UnsignedByte.Maximum.ToString("X") != "FF") return -10;
+            Calls = 0;
+            if (NextValue().ToString() != "Zero" || Calls != 2) return -11;
+            return 46;
         }
         public static int Classify(Direction value) {
             switch (value) {

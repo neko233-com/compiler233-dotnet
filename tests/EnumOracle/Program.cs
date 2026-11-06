@@ -179,9 +179,30 @@ var api = actual.GetType("EnumFixture.Api", true)!;
 if (api.GetField("Current")!.FieldType.FullName != "EnumFixture.Direction") throw new Exception("Invalid Current field type");
 if (api.GetField("ZeroField")!.FieldType.FullName != "EnumFixture.UnsignedLong" ||
     Convert.ToUInt64(api.GetField("ZeroField")!.GetValue(null)) != 0) throw new Exception("Invalid zero field");
+var directionType = actual.GetType("EnumFixture.Direction", true)!;
+var directionValue = Enum.ToObject(directionType, 2);
+foreach (string methodName in new[] { "Box", "BoxExplicit" })
+{
+    object? boxed = api.GetMethod(methodName)!.Invoke(null, [directionValue]);
+    if (boxed?.GetType() != directionType || Convert.ToInt32(boxed) != 2)
+        throw new Exception($"{methodName} did not preserve the enum type and value");
+}
+var unbox = api.GetMethod("Unbox")!;
+foreach (var (value, exceptionType) in new[] {
+    ((object?)null, typeof(NullReferenceException)),
+    (Enum.ToObject(actual.GetType("EnumFixture.UnsignedByte", true)!, 2), typeof(InvalidCastException))
+})
+{
+    try { unbox.Invoke(null, [value]); throw new Exception("Invalid unbox unexpectedly succeeded"); }
+    catch (TargetInvocationException exception) when (exception.InnerException?.GetType() == exceptionType) { }
+}
+var formatDirection = api.GetMethod("FormatDirection")!;
+if (!Equals(formatDirection.Invoke(null, [null]), "Positive")) throw new Exception("Null format was not treated as general format");
+try { formatDirection.Invoke(null, ["invalid"]); throw new Exception("Invalid enum format unexpectedly succeeded"); }
+catch (TargetInvocationException exception) when (exception.InnerException is FormatException) { }
 foreach (var test in new[] {
     ("EnumFixture.Api", "Run", 2), ("EnumFixture.Api", "RoundTrip", -2),
-    ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143), ("EnumFixture.Api", "FlagOperations", 42), ("EnumFixture.Api", "FlagSwitch", 19), ("EnumFixture.Api", "IncrementEnums", 44), ("EnumFixture.Api", "IncrementExceptions", 2), ("EnumFixture.Api", "EnumArithmetic", 45),
+    ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143), ("EnumFixture.Api", "FlagOperations", 42), ("EnumFixture.Api", "FlagSwitch", 19), ("EnumFixture.Api", "IncrementEnums", 44), ("EnumFixture.Api", "IncrementExceptions", 2), ("EnumFixture.Api", "EnumArithmetic", 45), ("EnumFixture.Api", "EnumBoxing", 46),
     ("EnumFixture.Api", "SwitchEnums", 43), ("EnumFixture.Api", "SwitchAll", 36), ("EnumFixture.Api", "SwitchUnsignedDense", 15), ("EnumFixture.Api", "SwitchNoDefault", 13),
     ("EnumOne.Holder", "Run", 1), ("EnumTwo.OtherHolder", "Run", 2),
     ("EnumImported.ImportedHolder", "Run", 1), ("EnumAliased.AliasHolder", "Run", 2)

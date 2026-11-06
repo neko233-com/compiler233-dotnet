@@ -4624,11 +4624,25 @@ impl<'a> FnEmitter<'a> {
 
     /// Convert the value on top of the evaluation stack when C# requires it.
     fn convert_assignable(&mut self, actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
-        if *actual == Ty::Int && *expected == Ty::Float {
+        if matches!(actual, Ty::Enum(_, _)) && *expected == Ty::Object {
+            let token = self.enum_type_token(actual)?;
+            self.emitter
+                .emit(Instruction::new(OpCode::Box, Operand::Token(token)));
+            Ok(())
+        } else if *actual == Ty::Int && *expected == Ty::Float {
             self.emitter.op(OpCode::Conv_R4);
             Ok(())
         } else {
             self.require_assignable(actual, expected, what)
+        }
+    }
+
+    fn enum_type_token(&mut self, ty: &Ty) -> Result<MemberToken, String> {
+        match resolve_type(ty, self.types, self.externals, &mut *self.module)? {
+            TypeSig::ValueType(TypeDefOrRef::TypeDef(entry)) => Ok(MemberToken::TypeDef(entry)),
+            TypeSig::ValueType(TypeDefOrRef::TypeRef(entry)) => Ok(MemberToken::TypeRef(entry)),
+            TypeSig::ValueType(TypeDefOrRef::TypeSpec(entry)) => Ok(MemberToken::TypeSpec(entry)),
+            _ => Err("enum is not a value type".to_string()),
         }
     }
 
@@ -6638,6 +6652,20 @@ impl<'a> FnEmitter<'a> {
                         }
                         self.emitter.op(OpCode::Conv_I4);
                     }
+                    (Ty::Enum(_, _), Ty::Object) => {
+                        let token = self
+                            .enum_type_token(&source)
+                            .map_err(|message| self.error(message))?;
+                        self.emitter
+                            .emit(Instruction::new(OpCode::Box, Operand::Token(token)));
+                    }
+                    (Ty::Object, Ty::Enum(_, _)) => {
+                        let token = self
+                            .enum_type_token(target)
+                            .map_err(|message| self.error(message))?;
+                        self.emitter
+                            .emit(Instruction::new(OpCode::Unbox_Any, Operand::Token(token)));
+                    }
                     (Ty::Int, Ty::Enum(_, base)) => {
                         let constant = match inner.as_ref() {
                             Expr::Int(value, _) => Some(i128::from(*value)),
@@ -6909,23 +6937,9 @@ impl<'a> FnEmitter<'a> {
                 };
                 Ok(MemberToken::TypeDef(entry.clone()))
             }
-            Ty::Enum(_, _) => {
-                let signature =
-                    resolve_type(element, self.types, self.externals, &mut *self.module)
-                        .map_err(|message| self.error(message))?;
-                match signature {
-                    TypeSig::ValueType(TypeDefOrRef::TypeDef(entry)) => {
-                        Ok(MemberToken::TypeDef(entry))
-                    }
-                    TypeSig::ValueType(TypeDefOrRef::TypeRef(entry)) => {
-                        Ok(MemberToken::TypeRef(entry))
-                    }
-                    TypeSig::ValueType(TypeDefOrRef::TypeSpec(entry)) => {
-                        Ok(MemberToken::TypeSpec(entry))
-                    }
-                    _ => Err(self.error("enum array element is not a value type")),
-                }
-            }
+            Ty::Enum(_, _) => self
+                .enum_type_token(element)
+                .map_err(|message| self.error(message)),
             Ty::Int => match self
                 .module
                 .corlib_type("System.Int32")
@@ -7805,6 +7819,9 @@ impl<'a> FnEmitter<'a> {
                 }
             }
             let receiver_type = self.expr(receiver)?;
+            if matches!(receiver_type, Ty::Enum(_, _)) {
+                return self.enum_call(&receiver_type, name, generic_args, args);
+            }
             if matches!(
                 receiver_type,
                 Ty::Int | Ty::Float | Ty::Bool | Ty::String | Ty::Object
@@ -7875,6 +7892,66 @@ impl<'a> FnEmitter<'a> {
 
     /// The receiver is already on the evaluation stack and is evaluated once.
     /// Value types are stored in a temporary and passed by address, avoiding boxing.
+    fn enum_call(
+        &mut self,
+        receiver: &Ty,
+        name: &str,
+        generic_args: &[Ty],
+        args: &[Expr],
+    ) -> Result<Ty, CompileError> {
+        if !generic_args.is_empty() {
+            return Err(self.error(format!("unsupported enum method '{name}'")));
+        }
+        if name == "ToString" && args.len() == 1 {
+            let token = self
+                .enum_type_token(receiver)
+                .map_err(|message| self.error(message))?;
+            self.emitter
+                .emit(Instruction::new(OpCode::Box, Operand::Token(token)));
+            let format = self.expr(&args[0])?;
+            if format == Ty::Null {
+                return Err(self.error("ToString(null) is ambiguous between format and provider"));
+            }
+            self.convert_assignable(&format, &Ty::String, "argument")
+                .map_err(|message| self.error(message))?;
+            let method = self.import_bcl_method(
+                "System.Runtime",
+                "System.Enum",
+                name,
+                MethodSig::new_instance(TypeSig::STRING, vec![TypeSig::STRING]),
+            )?;
+            self.emitter.callvirt(method);
+            return Ok(Ty::String);
+        }
+        if !args.is_empty() {
+            return Err(self.error(format!("unsupported enum method '{name}'")));
+        }
+        let (ty, signature) = match name {
+            "ToString" => (Ty::String, TypeSig::STRING),
+            "GetHashCode" => (Ty::Int, TypeSig::INT32),
+            _ => return Err(self.error(format!("unsupported enum method '{name}'"))),
+        };
+        let local = resolve_type(receiver, self.types, self.externals, &mut *self.module)
+            .map_err(|message| self.error(message))?;
+        let temporary = self.emitter.declare_local(local);
+        self.emitter.stloc(temporary).ldloca(temporary);
+        let enum_token = self
+            .enum_type_token(receiver)
+            .map_err(|message| self.error(message))?;
+        self.emitter.emit(Instruction::new(
+            OpCode::Constrained,
+            Operand::Token(enum_token),
+        ));
+        let method = self.import_bcl_method(
+            "System.Runtime",
+            "System.Object",
+            name,
+            MethodSig::new_instance(signature, vec![]),
+        )?;
+        self.emitter.callvirt(method);
+        Ok(ty)
+    }
+
     fn primitive_call(
         &mut self,
         receiver: &Ty,
