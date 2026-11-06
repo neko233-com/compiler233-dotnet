@@ -2808,8 +2808,11 @@ impl<'a> FnEmitter<'a> {
                     "^=" => OpCode::Xor,
                     other => return Err(self.error(format!("unsupported operator '{other}'"))),
                 };
+                let shadowed = self.locals.contains_key(name)
+                    || self.params.iter().any(|(parameter, _)| parameter == name);
                 let current = self.current.clone();
-                if let Some(field) = self.field_symbol(&current, name)
+                if !shadowed
+                    && let Some(field) = self.field_symbol(&current, name)
                     && !field.is_static
                 {
                     self.validate_compound(&field.ty, op)?;
@@ -2845,13 +2848,14 @@ impl<'a> FnEmitter<'a> {
                             property.ty.clone(),
                             property.getter.clone(),
                             property.setter.clone(),
+                            property.is_static,
                         )
                     });
-                if let Some((ty, getter, setter)) = property {
+                if !shadowed && let Some((ty, getter, setter, is_static)) = property {
                     self.validate_compound(&ty, op)?;
-                    if self.is_static {
+                    if self.is_static && !is_static {
                         return Err(self.error(format!(
-                            "compound assignment to static property '{name}' is not supported yet"
+                            "instance property '{name}' cannot be used from a static method"
                         )));
                     }
                     let Some(getter) = getter else {
@@ -2860,12 +2864,19 @@ impl<'a> FnEmitter<'a> {
                     let Some(setter) = setter else {
                         return Err(self.error(format!("property '{name}' has no setter")));
                     };
-                    self.emitter.ldarg(0);
-                    self.emitter.callvirt(getter);
+                    if is_static {
+                        self.emitter.call(getter);
+                    } else {
+                        self.emitter.ldarg(0).callvirt(getter);
+                    }
                     let rhs = self.expr(value)?;
                     self.convert_assignable(&rhs, &ty, "compound assignment")
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
+                    if is_static {
+                        self.emitter.call(setter);
+                        return Ok(());
+                    }
                     let signature =
                         resolve_type(&ty, self.types, self.externals, &mut *self.module)
                             .map_err(|message| self.error(message))?;
@@ -3225,7 +3236,8 @@ impl<'a> FnEmitter<'a> {
             return Ok(());
         }
         let Some(field) = self.field_symbol(&self.current.clone(), name) else {
-            return Err(self.error(format!("undefined identifier '{name}'")));
+            self.assign_property(name, value, false)?;
+            return Ok(());
         };
         if field.is_static {
             let actual = self.expr(value)?;
@@ -3284,7 +3296,7 @@ impl<'a> FnEmitter<'a> {
             return Ok(ty);
         }
         let Some(field) = self.field_symbol(&self.current.clone(), name) else {
-            return Err(self.error(format!("undefined identifier '{name}'")));
+            return self.assign_property(name, value, true);
         };
         if field.is_static {
             let actual = self.expr(value)?;
@@ -3306,12 +3318,64 @@ impl<'a> FnEmitter<'a> {
         let actual = self.expr(value)?;
         self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
             .map_err(|message| self.error(message))?;
+        let signature = resolve_type(&field.ty, self.types, self.externals, &mut *self.module)
+            .map_err(|message| self.error(message))?;
+        let temporary = self.emitter.declare_local(signature);
         self.emitter.dup();
+        self.emitter.stloc(temporary);
         self.emitter.emit(Instruction::new(
             OpCode::Stfld,
             Operand::Token(MemberToken::Field(field.entry)),
         ));
+        self.emitter.ldloc(temporary);
         Ok(field.ty)
+    }
+
+    fn assign_property(
+        &mut self,
+        name: &str,
+        value: &Expr,
+        leave_value: bool,
+    ) -> Result<Ty, CompileError> {
+        let property = self
+            .symbols
+            .get(&self.current)
+            .and_then(|symbol| symbol.properties.get(name))
+            .cloned()
+            .ok_or_else(|| self.error(format!("undefined identifier '{name}'")))?;
+        let setter = property
+            .setter
+            .ok_or_else(|| self.error(format!("property '{name}' has no setter")))?;
+        if !property.is_static {
+            if self.is_static {
+                return Err(self.error(format!(
+                    "instance property '{name}' cannot be used from a static method"
+                )));
+            }
+            self.emitter.ldarg(0);
+        }
+        let actual = self.expr(value)?;
+        self.convert_assignable(&actual, &property.ty, &format!("assignment to '{name}'"))
+            .map_err(|message| self.error(message))?;
+        let temporary = if leave_value {
+            let signature =
+                resolve_type(&property.ty, self.types, self.externals, &mut *self.module)
+                    .map_err(|message| self.error(message))?;
+            let temporary = self.emitter.declare_local(signature);
+            self.emitter.dup().stloc(temporary);
+            Some(temporary)
+        } else {
+            None
+        };
+        if property.is_static {
+            self.emitter.call(setter);
+        } else {
+            self.emitter.callvirt(setter);
+        }
+        if let Some(temporary) = temporary {
+            self.emitter.ldloc(temporary);
+        }
+        Ok(property.ty)
     }
 
     fn load(&mut self, name: &str) -> Result<Ty, CompileError> {
@@ -3479,7 +3543,34 @@ impl<'a> FnEmitter<'a> {
             return Ok(());
         }
         let Some(field) = self.field_symbol(&self.current.clone(), name) else {
-            return Err(self.error(format!("undefined identifier '{name}'")));
+            let property = self
+                .symbols
+                .get(&self.current)
+                .and_then(|symbol| symbol.properties.get(name))
+                .cloned()
+                .ok_or_else(|| self.error(format!("undefined identifier '{name}'")))?;
+            let setter = property
+                .setter
+                .ok_or_else(|| self.error(format!("property '{name}' has no setter")))?;
+            if property.is_static {
+                self.emitter.call(setter);
+            } else {
+                if self.is_static {
+                    return Err(self.error(format!(
+                        "instance property '{name}' cannot be used from a static method"
+                    )));
+                }
+                let signature =
+                    resolve_type(&property.ty, self.types, self.externals, &mut *self.module)
+                        .map_err(|message| self.error(message))?;
+                let temporary = self.emitter.declare_local(signature);
+                self.emitter
+                    .stloc(temporary)
+                    .ldarg(0)
+                    .ldloc(temporary)
+                    .callvirt(setter);
+            }
+            return Ok(());
         };
         if !field.is_static {
             if self.is_static {
@@ -3487,8 +3578,10 @@ impl<'a> FnEmitter<'a> {
                     "instance field '{name}' cannot be used from a static method"
                 )));
             }
-            // `load` already pushed the receiver, so the value on top is stored
-            // against it: [this, value] -> stfld.
+            let signature = resolve_type(&field.ty, self.types, self.externals, &mut *self.module)
+                .map_err(|message| self.error(message))?;
+            let temporary = self.emitter.declare_local(signature);
+            self.emitter.stloc(temporary).ldarg(0).ldloc(temporary);
             self.emitter.emit(Instruction::new(
                 OpCode::Stfld,
                 Operand::Token(MemberToken::Field(field.entry)),
