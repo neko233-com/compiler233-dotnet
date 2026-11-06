@@ -2724,6 +2724,29 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    /// Convert the value on top of the evaluation stack when C# requires it.
+    fn convert_assignable(&mut self, actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
+        if *actual == Ty::Int && *expected == Ty::Float {
+            self.emitter.op(OpCode::Conv_R4);
+            Ok(())
+        } else {
+            self.require_assignable(actual, expected, what)
+        }
+    }
+
+    fn validate_compound(&self, ty: &Ty, op: &str) -> Result<(), CompileError> {
+        let valid = match op {
+            "+=" | "-=" | "*=" | "/=" | "%=" => matches!(ty, Ty::Int | Ty::Float),
+            "&=" | "|=" | "^=" => matches!(ty, Ty::Int | Ty::Bool),
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(self.error(format!("operator '{op}' is not supported for {ty:?}")))
+        }
+    }
+
     fn require(actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
         if actual == expected {
             Ok(())
@@ -2766,7 +2789,7 @@ impl<'a> FnEmitter<'a> {
                 self.locals.insert(name.clone(), (index, ty.clone()));
                 if let Some(value) = init {
                     let actual = self.expr(value)?;
-                    self.require_assignable(&actual, ty, &format!("initializer of '{name}'"))
+                    self.convert_assignable(&actual, ty, &format!("initializer of '{name}'"))
                         .map_err(|message| self.error(message))?;
                     self.emitter.stloc(index);
                 }
@@ -2789,6 +2812,7 @@ impl<'a> FnEmitter<'a> {
                 if let Some(field) = self.field_symbol(&current, name)
                     && !field.is_static
                 {
+                    self.validate_compound(&field.ty, op)?;
                     if self.is_static {
                         return Err(self.error(format!(
                             "instance field '{name}' cannot be used from a static method"
@@ -2802,7 +2826,7 @@ impl<'a> FnEmitter<'a> {
                         Operand::Token(MemberToken::Field(field.entry.clone())),
                     ));
                     let rhs = self.expr(value)?;
-                    self.require_assignable(&rhs, &field.ty, "compound assignment")
+                    self.convert_assignable(&rhs, &field.ty, "compound assignment")
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
                     self.emitter.emit(Instruction::new(
@@ -2824,6 +2848,7 @@ impl<'a> FnEmitter<'a> {
                         )
                     });
                 if let Some((ty, getter, setter)) = property {
+                    self.validate_compound(&ty, op)?;
                     if self.is_static {
                         return Err(self.error(format!(
                             "compound assignment to static property '{name}' is not supported yet"
@@ -2838,7 +2863,7 @@ impl<'a> FnEmitter<'a> {
                     self.emitter.ldarg(0);
                     self.emitter.callvirt(getter);
                     let rhs = self.expr(value)?;
-                    self.require_assignable(&rhs, &ty, "compound assignment")
+                    self.convert_assignable(&rhs, &ty, "compound assignment")
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
                     let signature =
@@ -2852,8 +2877,9 @@ impl<'a> FnEmitter<'a> {
                     return Ok(());
                 }
                 let ty = self.load(name)?;
+                self.validate_compound(&ty, op)?;
                 let rhs = self.expr(value)?;
-                self.require_assignable(&rhs, &ty, "compound assignment")
+                self.convert_assignable(&rhs, &ty, "compound assignment")
                     .map_err(|message| self.error(message))?;
                 self.emitter.op(opcode);
                 self.store_top(name)?;
@@ -2872,7 +2898,7 @@ impl<'a> FnEmitter<'a> {
                 Self::require(&index_type, &Ty::Int, "array index")
                     .map_err(|message| self.error(message))?;
                 let value_type = self.expr(value)?;
-                self.require_assignable(&value_type, &element, "array element")
+                self.convert_assignable(&value_type, &element, "array element")
                     .map_err(|message| self.error(message))?;
                 let opcode = array_element_opcode(&element, true)
                     .ok_or_else(|| self.error(format!("unsupported array element {element:?}")))?;
@@ -2971,13 +2997,14 @@ impl<'a> FnEmitter<'a> {
                     return Err(self.error("compound assignment requires a class instance"));
                 };
                 if let Some(field) = self.field_symbol(&type_name, name) {
+                    self.validate_compound(&field.ty, op)?;
                     self.emitter.dup();
                     self.emitter.emit(Instruction::new(
                         OpCode::Ldfld,
                         Operand::Token(MemberToken::Field(field.entry.clone())),
                     ));
                     let rhs = self.expr(value)?;
-                    self.require_assignable(&rhs, &field.ty, "compound assignment")
+                    self.convert_assignable(&rhs, &field.ty, "compound assignment")
                         .map_err(|message| self.error(message))?;
                     self.emitter.op(opcode);
                     self.emitter.emit(Instruction::new(
@@ -2994,6 +3021,7 @@ impl<'a> FnEmitter<'a> {
                 let Some(property) = property else {
                     return Err(self.error(format!("unknown member '{type_name}.{name}'")));
                 };
+                self.validate_compound(&property.ty, op)?;
                 let (Some(getter), Some(setter)) =
                     (property.getter.clone(), property.setter.clone())
                 else {
@@ -3002,7 +3030,7 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.dup();
                 self.emitter.callvirt(getter);
                 let rhs = self.expr(value)?;
-                self.require_assignable(&rhs, &property.ty, "compound assignment")
+                self.convert_assignable(&rhs, &property.ty, "compound assignment")
                     .map_err(|message| self.error(message))?;
                 self.emitter.op(opcode);
                 self.emitter.callvirt(setter);
@@ -3022,7 +3050,7 @@ impl<'a> FnEmitter<'a> {
                         return Err(self.error(format!("'{type_name}.{name}' is static")));
                     }
                     let actual = self.expr(value)?;
-                    self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
+                    self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
                         .map_err(|message| self.error(message))?;
                     self.emitter.emit(Instruction::new(
                         OpCode::Stfld,
@@ -3057,7 +3085,7 @@ impl<'a> FnEmitter<'a> {
                         }
                         let expected = external_ty(&signature.params[0]);
                         let actual = self.expr(value)?;
-                        self.require_assignable(
+                        self.convert_assignable(
                             &actual,
                             &expected,
                             &format!("assignment to '{name}'"),
@@ -3076,7 +3104,7 @@ impl<'a> FnEmitter<'a> {
                     return Err(self.error(format!("property '{type_name}.{name}' has no setter")));
                 };
                 let actual = self.expr(value)?;
-                self.require_assignable(&actual, &property_ty, &format!("assignment to '{name}'"))
+                self.convert_assignable(&actual, &property_ty, &format!("assignment to '{name}'"))
                     .map_err(|message| self.error(message))?;
                 self.emitter.callvirt(setter);
                 Ok(())
@@ -3092,7 +3120,8 @@ impl<'a> FnEmitter<'a> {
                 match value {
                     Some(expression) => {
                         let actual = self.expr(expression)?;
-                        self.require_assignable(&actual, &self.return_ty, "return")
+                        let return_ty = self.return_ty.clone();
+                        self.convert_assignable(&actual, &return_ty, "return")
                             .map_err(|message| self.error(message))?;
                     }
                     None => {
@@ -3110,7 +3139,7 @@ impl<'a> FnEmitter<'a> {
                 else_branch,
             } => {
                 let actual = self.expr(condition)?;
-                self.require_assignable(&actual, &Ty::Bool, "if condition")
+                self.convert_assignable(&actual, &Ty::Bool, "if condition")
                     .map_err(|message| self.error(message))?;
                 let alternative = self.emitter.label();
                 let end = self.emitter.label();
@@ -3129,7 +3158,7 @@ impl<'a> FnEmitter<'a> {
                 let end = self.emitter.label();
                 self.emitter.mark(top);
                 let actual = self.expr(condition)?;
-                self.require_assignable(&actual, &Ty::Bool, "while condition")
+                self.convert_assignable(&actual, &Ty::Bool, "while condition")
                     .map_err(|message| self.error(message))?;
                 self.emitter.branch(OpCode::Brfalse, end);
                 self.loops.push((end, top));
@@ -3154,7 +3183,7 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.mark(top);
                 if let Some(condition) = condition {
                     let actual = self.expr(condition)?;
-                    self.require_assignable(&actual, &Ty::Bool, "for condition")
+                    self.convert_assignable(&actual, &Ty::Bool, "for condition")
                         .map_err(|message| self.error(message))?;
                     self.emitter.branch(OpCode::Brfalse, end);
                 }
@@ -3178,7 +3207,7 @@ impl<'a> FnEmitter<'a> {
     fn assign(&mut self, name: &str, value: &Expr) -> Result<(), CompileError> {
         if let Some((index, ty)) = self.locals.get(name).cloned() {
             let actual = self.expr(value)?;
-            self.require_assignable(&actual, &ty, &format!("assignment to '{name}'"))
+            self.convert_assignable(&actual, &ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.stloc(index);
             return Ok(());
@@ -3190,7 +3219,7 @@ impl<'a> FnEmitter<'a> {
         {
             let ty = self.params[position].1.clone();
             let actual = self.expr(value)?;
-            self.require_assignable(&actual, &ty, &format!("assignment to '{name}'"))
+            self.convert_assignable(&actual, &ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.starg(self.argument_index(position));
             return Ok(());
@@ -3200,7 +3229,7 @@ impl<'a> FnEmitter<'a> {
         };
         if field.is_static {
             let actual = self.expr(value)?;
-            self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
+            self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.emit(Instruction::new(
                 OpCode::Stsfld,
@@ -3215,7 +3244,7 @@ impl<'a> FnEmitter<'a> {
         }
         self.emitter.ldarg(0);
         let actual = self.expr(value)?;
-        self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
+        self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
             .map_err(|message| self.error(message))?;
         self.emitter.emit(Instruction::new(
             OpCode::Stfld,
@@ -3235,7 +3264,7 @@ impl<'a> FnEmitter<'a> {
     fn assign_value(&mut self, name: &str, value: &Expr) -> Result<Ty, CompileError> {
         if let Some((index, ty)) = self.locals.get(name).cloned() {
             let actual = self.expr(value)?;
-            self.require_assignable(&actual, &ty, &format!("assignment to '{name}'"))
+            self.convert_assignable(&actual, &ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.dup();
             self.emitter.stloc(index);
@@ -3248,7 +3277,7 @@ impl<'a> FnEmitter<'a> {
         {
             let ty = self.params[position].1.clone();
             let actual = self.expr(value)?;
-            self.require_assignable(&actual, &ty, &format!("assignment to '{name}'"))
+            self.convert_assignable(&actual, &ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.dup();
             self.emitter.starg(self.argument_index(position));
@@ -3259,7 +3288,7 @@ impl<'a> FnEmitter<'a> {
         };
         if field.is_static {
             let actual = self.expr(value)?;
-            self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
+            self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
                 .map_err(|message| self.error(message))?;
             self.emitter.dup();
             self.emitter.emit(Instruction::new(
@@ -3275,7 +3304,7 @@ impl<'a> FnEmitter<'a> {
         }
         self.emitter.ldarg(0);
         let actual = self.expr(value)?;
-        self.require_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
+        self.convert_assignable(&actual, &field.ty, &format!("assignment to '{name}'"))
             .map_err(|message| self.error(message))?;
         self.emitter.dup();
         self.emitter.emit(Instruction::new(
@@ -3389,7 +3418,7 @@ impl<'a> FnEmitter<'a> {
             if let Some(args) = args {
                 for (index, argument) in args.iter().enumerate() {
                     let actual = self.expr(argument)?;
-                    self.require_assignable(&actual, &ctor.params[index], "base argument")
+                    self.convert_assignable(&actual, &ctor.params[index], "base argument")
                         .map_err(|message| self.error(message))?;
                 }
             }
@@ -3417,7 +3446,7 @@ impl<'a> FnEmitter<'a> {
             if let Some(args) = args {
                 for (index, argument) in args.iter().enumerate() {
                     let actual = self.expr(argument)?;
-                    self.require_assignable(&actual, &params[index], "base argument")
+                    self.convert_assignable(&actual, &params[index], "base argument")
                         .map_err(|message| self.error(message))?;
                 }
             }
@@ -3501,10 +3530,13 @@ impl<'a> FnEmitter<'a> {
             Expr::Name(name) => self.load(name),
             Expr::Negate(inner) => {
                 let ty = self.expr(inner)?;
-                self.require_assignable(&ty, &Ty::Int, "unary '-'")
-                    .map_err(|message| self.error(message))?;
+                if !matches!(ty, Ty::Int | Ty::Float) {
+                    return Err(
+                        self.error(format!("unary '-' requires a numeric operand, got {ty:?}"))
+                    );
+                }
                 self.emitter.op(OpCode::Neg);
-                Ok(Ty::Int)
+                Ok(ty)
             }
             Expr::Conditional {
                 condition,
@@ -3512,7 +3544,7 @@ impl<'a> FnEmitter<'a> {
                 when_false,
             } => {
                 let condition_ty = self.expr(condition)?;
-                self.require_assignable(&condition_ty, &Ty::Bool, "?: condition")
+                self.convert_assignable(&condition_ty, &Ty::Bool, "?: condition")
                     .map_err(|message| self.error(message))?;
                 let otherwise = self.emitter.label();
                 let end = self.emitter.label();
@@ -3521,7 +3553,7 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.branch(OpCode::Br, end);
                 self.emitter.mark(otherwise);
                 let alternative = self.expr(when_false)?;
-                self.require_assignable(&alternative, &result, "?: branches")
+                self.convert_assignable(&alternative, &result, "?: branches")
                     .map_err(|message| self.error(message))?;
                 self.emitter.mark(end);
                 Ok(result)
@@ -3609,19 +3641,24 @@ impl<'a> FnEmitter<'a> {
             }
             Expr::Coalesce(left, right) => {
                 let ty = self.expr(left)?;
+                if !is_reference(&ty) && ty != Ty::Object {
+                    return Err(
+                        self.error("left operand of '??' must be a supported reference type")
+                    );
+                }
                 let end = self.emitter.label();
                 self.emitter.dup();
                 self.emitter.branch(OpCode::Brtrue, end);
                 self.emitter.pop();
                 let right_ty = self.expr(right)?;
-                self.require_assignable(&right_ty, &ty, "??")
+                self.convert_assignable(&right_ty, &ty, "??")
                     .map_err(|message| self.error(message))?;
                 self.emitter.mark(end);
                 Ok(ty)
             }
             Expr::Not(inner) => {
                 let ty = self.expr(inner)?;
-                self.require_assignable(&ty, &Ty::Bool, "unary '!'")
+                self.convert_assignable(&ty, &Ty::Bool, "unary '!'")
                     .map_err(|message| self.error(message))?;
                 self.emitter.ldc_i4(0);
                 self.emitter.op(OpCode::Ceq);
@@ -3635,7 +3672,7 @@ impl<'a> FnEmitter<'a> {
                 prefix,
             } => {
                 let ty = self.load(name)?;
-                self.require_assignable(&ty, &Ty::Int, "increment")
+                self.convert_assignable(&ty, &Ty::Int, "increment")
                     .map_err(|message| self.error(message))?;
                 if *prefix {
                     self.emitter.ldc_i4(delta.abs());
@@ -3920,7 +3957,7 @@ impl<'a> FnEmitter<'a> {
                 }
                 self.emitter.dup();
                 let actual = self.expr(value)?;
-                self.require_assignable(&actual, &field.ty, "initializer")
+                self.convert_assignable(&actual, &field.ty, "initializer")
                     .map_err(|message| self.error(message))?;
                 self.emitter.emit(Instruction::new(
                     OpCode::Stfld,
@@ -3941,7 +3978,7 @@ impl<'a> FnEmitter<'a> {
             };
             self.emitter.dup();
             let actual = self.expr(value)?;
-            self.require_assignable(&actual, &property.ty, "initializer")
+            self.convert_assignable(&actual, &property.ty, "initializer")
                 .map_err(|message| self.error(message))?;
             self.emitter.callvirt(setter);
         }
@@ -3956,7 +3993,7 @@ impl<'a> FnEmitter<'a> {
     ) -> Result<(), CompileError> {
         for (index, argument) in args.iter().enumerate() {
             let actual = self.expr(argument)?;
-            self.require_assignable(&actual, &params[index], what)
+            self.convert_assignable(&actual, &params[index], what)
                 .map_err(|message| self.error(message))?;
         }
         Ok(())
@@ -3967,7 +4004,7 @@ impl<'a> FnEmitter<'a> {
             let end = self.emitter.label();
             let done = self.emitter.label();
             let ty = self.expr(left)?;
-            self.require_assignable(&ty, &Ty::Bool, "logical operand")
+            self.convert_assignable(&ty, &Ty::Bool, "logical operand")
                 .map_err(|message| self.error(message))?;
             let short_circuit = if matches!(op, BinaryOp::And) {
                 OpCode::Brfalse
@@ -3976,7 +4013,7 @@ impl<'a> FnEmitter<'a> {
             };
             self.emitter.branch(short_circuit, end);
             let ty = self.expr(right)?;
-            self.require_assignable(&ty, &Ty::Bool, "logical operand")
+            self.convert_assignable(&ty, &Ty::Bool, "logical operand")
                 .map_err(|message| self.error(message))?;
             self.emitter.branch(short_circuit, end);
             self.emitter.ldc_i4(1);
@@ -4013,6 +4050,14 @@ impl<'a> FnEmitter<'a> {
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && (left_ty == Ty::Null || right_ty == Ty::Null)
         {
+            let other = if left_ty == Ty::Null {
+                &right_ty
+            } else {
+                &left_ty
+            };
+            if *other != Ty::Null && *other != Ty::Object && !is_reference(other) {
+                return Err(self.error("null cannot be compared with a non-nullable value"));
+            }
             // Reference comparison against null: `node == null`.
             self.emitter.op(OpCode::Ceq);
             if matches!(op, BinaryOp::NotEqual) {
@@ -4044,14 +4089,25 @@ impl<'a> FnEmitter<'a> {
             self.emitter.call(entry);
             return Ok(Ty::String);
         }
-        if !matches!(
-            (&left_ty, &right_ty),
-            (Ty::Float, Ty::Float) | (Ty::Int, Ty::Int)
-        ) {
-            return Err(self.error(format!(
-                "operands are {left_ty:?} and {right_ty:?}; mixed or non-numeric arithmetic is not supported yet"
-            )));
+        match (&left_ty, &right_ty) {
+            (Ty::Float, Ty::Float) | (Ty::Int, Ty::Int) => {}
+            (Ty::Float, Ty::Int) => {
+                self.emitter.op(OpCode::Conv_R4);
+            }
+            (Ty::Int, Ty::Float) => {
+                let temporary = self
+                    .emitter
+                    .declare_local(TypeSig::Primitive(PrimitiveType::R4));
+                self.emitter
+                    .stloc(temporary)
+                    .op(OpCode::Conv_R4)
+                    .ldloc(temporary);
+            }
+            _ => return Err(self.error(format!(
+                "operands are {left_ty:?} and {right_ty:?}; non-numeric arithmetic is not supported"
+            ))),
         }
+        let floating = left_ty == Ty::Float || right_ty == Ty::Float;
         match op {
             BinaryOp::Add => {
                 self.emitter.op(OpCode::Add);
@@ -4083,12 +4139,20 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.op(OpCode::Cgt);
             }
             BinaryOp::LessOrEqual => {
-                self.emitter.op(OpCode::Cgt);
+                self.emitter.op(if floating {
+                    OpCode::Cgt_Un
+                } else {
+                    OpCode::Cgt
+                });
                 self.emitter.ldc_i4(0);
                 self.emitter.op(OpCode::Ceq);
             }
             BinaryOp::GreaterOrEqual => {
-                self.emitter.op(OpCode::Clt);
+                self.emitter.op(if floating {
+                    OpCode::Clt_Un
+                } else {
+                    OpCode::Clt
+                });
                 self.emitter.ldc_i4(0);
                 self.emitter.op(OpCode::Ceq);
             }
@@ -4105,11 +4169,7 @@ impl<'a> FnEmitter<'a> {
         ) {
             return Ok(Ty::Bool);
         }
-        Ok(if left_ty == Ty::Float {
-            Ty::Float
-        } else {
-            Ty::Int
-        })
+        Ok(if floating { Ty::Float } else { Ty::Int })
     }
 
     /// Reconstructs `A.B.C` from a member chain so qualified type names resolve.
@@ -4309,7 +4369,7 @@ impl<'a> FnEmitter<'a> {
             if actual == Ty::Null {
                 return Err(self.error("ToString(null) is ambiguous between format and provider"));
             }
-            self.require_assignable(&actual, &Ty::String, "argument")
+            self.convert_assignable(&actual, &Ty::String, "argument")
                 .map_err(|message| self.error(message))?;
         }
         let token = self.import_bcl_method(
@@ -4631,7 +4691,7 @@ impl<'a> FnEmitter<'a> {
         };
         if symbol.is_static {
             let actual = self.expr(value)?;
-            self.require_assignable(&actual, &symbol.ty, "field initializer")
+            self.convert_assignable(&actual, &symbol.ty, "field initializer")
                 .map_err(|message| self.error(message))?;
             self.emitter.emit(Instruction::new(
                 OpCode::Stsfld,
@@ -4640,7 +4700,7 @@ impl<'a> FnEmitter<'a> {
         } else {
             self.emitter.ldarg(0);
             let actual = self.expr(value)?;
-            self.require_assignable(&actual, &symbol.ty, "field initializer")
+            self.convert_assignable(&actual, &symbol.ty, "field initializer")
                 .map_err(|message| self.error(message))?;
             self.emitter.emit(Instruction::new(
                 OpCode::Stfld,

@@ -122,6 +122,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 属性：`get`/`set` 访问器（自动属性生成后备字段）、`obj.Prop` 读取与 `obj.Prop = v` 赋值、静态属性
 - 表达式体：在现有表达式和语句子集内支持方法、构造函数、只读属性及 `get`/`set` 访问器的 `=>` 写法；接口成员的表达式体和更广的表达式仍未覆盖。
 - 基础类型实例调用：支持 `int`、`float`、`bool`、`string` 和 `object` 的无参 `ToString` / `GetHashCode`，以及 `int`、`float` 的 `ToString(string)`；其他重载尚未覆盖。
+- 数值：支持部分 `int` 到 `float` 的隐式转换与混合运算；测试覆盖舍入、求值顺序和 `NaN` 的大小比较。完整数值类型与转换规则仍未实现。
 - 数组：一维数组构造、`a[i]` 读写、`a.Length` 和 `foreach` 遍历；`int`、`float`、`bool`、`string`、`object` 的元素指令与部分边界异常有运行时对照测试。
 - 继承：基类（本地或引用程序集）、`virtual`/`override` 虚调用、`: base(args)` 基类构造、基类方法继承与基类-派生类赋值兼容
 - 接口：`interface` 声明（抽象方法、无方法体）、类实现接口（`InterfaceImpl` + 隐式实现标记为 `virtual final newslot`）、接口类型变量与 `callvirt` 派发
