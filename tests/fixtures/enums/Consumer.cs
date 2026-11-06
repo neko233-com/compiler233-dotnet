@@ -15,6 +15,8 @@ public static class ExternalConsumer {
     public static UnsignedLong EchoUnsignedLong(UnsignedLong value) { return value; }
 
     public static int Run() {
+        if (default(Direction) != Direction.Zero || default(UnsignedLong) != UnsignedLong.Zero) return -19;
+        switch (default(UnsignedLong)) { case default(UnsignedLong): break; default: return -20; }
         Direction[] values = new Direction[1];
         values[0] = Direction.Positive;
         SignedByte[] a = new SignedByte[1]; a[0] = SignedByte.Minimum;

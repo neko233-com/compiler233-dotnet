@@ -534,6 +534,9 @@ fn switch_constant(value: &Expr) -> Option<SwitchConstant> {
         Expr::Bool(value) => Some(SwitchConstant::Bool(*value)),
         Expr::Str(value) => Some(SwitchConstant::String(value.clone())),
         Expr::Null => Some(SwitchConstant::Null),
+        Expr::Default(Ty::Int) => Some(SwitchConstant::Int(0)),
+        Expr::Default(Ty::Bool) => Some(SwitchConstant::Bool(false)),
+        Expr::Default(Ty::String) => Some(SwitchConstant::Null),
         _ => None,
     }
 }
@@ -779,6 +782,7 @@ enum Expr {
     Null,
     Bool(bool),
     Str(String),
+    Default(Ty),
     Name(String),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
     Negate(Box<Expr>),
@@ -2351,9 +2355,7 @@ impl<'a> Parser<'a> {
                 let ty = self.parse_type_reference()?;
                 let name = self.identifier()?;
                 if self.eat("=") {
-                    // Default values are accepted for signature compatibility and
-                    // ignored: callers must pass every argument explicitly.
-                    self.parse_expression()?;
+                    return Err(self.error("optional parameter defaults are not supported yet"));
                 }
                 params.push((ty, name));
                 if !self.eat(",") {
@@ -2695,6 +2697,17 @@ impl<'a> Parser<'a> {
             return Err(self.error("only member access can be assigned here"));
         }
         self.expect(";")?;
+        if !matches!(
+            expression,
+            Expr::Call { .. }
+                | Expr::New { .. }
+                | Expr::Increment { .. }
+                | Expr::IncrementMember { .. }
+                | Expr::IncrementIndex { .. }
+                | Expr::Assign { .. }
+        ) {
+            return Err(self.error("expression is not a valid statement"));
+        }
         Ok(Stmt::Expression(expression))
     }
 
@@ -3081,6 +3094,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, CompileError> {
+        if self.eat("default") {
+            self.expect("(")?;
+            let ty = self.parse_type_reference()?;
+            self.expect(")")?;
+            return Ok(Expr::Default(ty));
+        }
         if self.check("new") {
             self.bump();
             let element = self.parse_new_type()?;
@@ -4821,6 +4840,7 @@ impl<'a> FnEmitter<'a> {
     fn constant_int(expression: &Expr) -> Option<i32> {
         match expression {
             Expr::Int(value, true) => Some(*value),
+            Expr::Default(Ty::Int) => Some(0),
             Expr::Member { target, name } if matches!(target.as_ref(), Expr::Name(type_name) if type_name == "int") => {
                 match name.as_str() {
                     "MaxValue" => Some(i32::MAX),
@@ -4867,6 +4887,7 @@ impl<'a> FnEmitter<'a> {
     fn int_constant_syntax(expression: &Expr) -> bool {
         match expression {
             Expr::Int(_, true) => true,
+            Expr::Default(Ty::Int) => true,
             Expr::Member { target, name } => {
                 matches!(target.as_ref(), Expr::Name(type_name) if type_name == "int")
                     && matches!(name.as_str(), "MinValue" | "MaxValue")
@@ -6754,6 +6775,32 @@ impl<'a> FnEmitter<'a> {
                 self.emitter.ldstr(value.clone());
                 Ok(Ty::String)
             }
+            Expr::Default(ty) => {
+                match ty {
+                    Ty::Int | Ty::Bool => {
+                        self.emitter.ldc_i4(0);
+                    }
+                    Ty::Float => {
+                        self.emitter
+                            .emit(Instruction::new(OpCode::Ldc_R4, Operand::Float32(0.0)));
+                    }
+                    Ty::Object | Ty::String => {
+                        self.emitter.ldnull();
+                    }
+                    Ty::Enum(_, base) => {
+                        resolve_type(ty, self.types, self.externals, &mut *self.module)
+                            .map_err(|message| self.error(message))?;
+                        if base.width() == 8 {
+                            self.emitter
+                                .emit(Instruction::new(OpCode::Ldc_I8, Operand::Int64(0)));
+                        } else {
+                            self.emitter.ldc_i4(0);
+                        }
+                    }
+                    _ => return Err(self.error("default(T) is not supported for this type")),
+                }
+                Ok(ty.clone())
+            }
             Expr::Name(name) => self.load(name),
             Expr::Negate(inner) => {
                 let ty = self.expr(inner)?;
@@ -7168,6 +7215,7 @@ impl<'a> FnEmitter<'a> {
 
     fn enum_constant(&self, expression: &Expr) -> Option<(&EnumInfo, i128)> {
         match expression {
+            Expr::Default(Ty::Enum(name, _)) => Some((self.enums.get(name)?.as_ref(), 0)),
             Expr::Member { target, name } => {
                 let type_name = Self::type_path(target)?;
                 let root = type_name.split('.').next()?;

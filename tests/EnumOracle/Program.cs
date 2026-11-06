@@ -244,7 +244,7 @@ catch (TargetInvocationException exception) when (exception.InnerException is Ar
 try { api.GetMethod("CompareOther")!.Invoke(null, [bitsValue, directionValue]); throw new Exception("CompareTo with another enum type unexpectedly succeeded"); }
 catch (TargetInvocationException exception) when (exception.InnerException is ArgumentException) { }
 foreach (var test in new[] {
-    ("EnumFixture.Api", "Run", 2), ("EnumFixture.Api", "RoundTrip", -2),
+    ("EnumFixture.Api", "Run", 2), ("EnumFixture.Api", "RoundTrip", -2), ("EnumFixture.Api", "Defaults", 48),
     ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143), ("EnumFixture.Api", "FlagOperations", 42), ("EnumFixture.Api", "FlagSwitch", 19), ("EnumFixture.Api", "IncrementEnums", 44), ("EnumFixture.Api", "IncrementExceptions", 2), ("EnumFixture.Api", "EnumArithmetic", 45), ("EnumFixture.Api", "EnumBoxing", 46), ("EnumFixture.Api", "EnumMethods", 47),
     ("EnumFixture.Api", "SwitchEnums", 43), ("EnumFixture.Api", "SwitchAll", 36), ("EnumFixture.Api", "SwitchUnsignedDense", 15), ("EnumFixture.Api", "SwitchNoDefault", 13),
     ("EnumOne.Holder", "Run", 1), ("EnumTwo.OtherHolder", "Run", 2),

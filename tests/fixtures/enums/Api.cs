@@ -46,6 +46,8 @@ namespace EnumFixture {
 
     public static class Api {
         public static Direction Current = Direction.Positive;
+        public static Direction InitialDefault = default(Direction);
+        public static UnsignedLong WideDefault = default(UnsignedLong);
         public static UnsignedLong ZeroField = 0;
         public static Bits FlagField = Bits.Read;
         public static int Calls = 0;
@@ -53,6 +55,31 @@ namespace EnumFixture {
         public static UnsignedByte StaticProperty { get; set; }
         public static CounterBox SharedCounter = new CounterBox();
         public static Direction Echo(Direction value) { return value; }
+        public static int DefaultIntCase(int value) { switch (value) { case default(int): return 1; default: return 0; } }
+        public static int DefaultBoolCase(bool value) { switch (value) { case default(bool): return 1; default: return 0; } }
+        public static int DefaultStringCase(string value) { switch (value) { case default(string): return 1; default: return 0; } }
+        public static int DefaultEnumCase(UnsignedLong value) { switch (value) { case default(UnsignedLong): return 1; default: return 0; } }
+        public static int Defaults() {
+            if (default(int) != 0 || default(bool) || default(float) != 0f) return -1;
+            if (default(string) != null || default(object) != null) return -2;
+            if ((default(string) ?? "fallback") != "fallback") return -3;
+            if (default(SignedByte) != 0 || default(UnsignedByte) != 0) return -4;
+            if (default(SignedShort) != 0 || default(UnsignedShort) != 0) return -5;
+            if (default(SignedInt) != 0 || default(UnsignedInt) != 0) return -6;
+            if (default(SignedLong) != 0 || default(UnsignedLong) != 0) return -7;
+            if (InitialDefault != Direction.Zero || WideDefault != UnsignedLong.Zero) return -8;
+            Direction fromInt = default(int);
+            if (Echo(fromInt) != default(Direction)) return -9;
+            if (DefaultIntCase(default(int)) + DefaultBoolCase(default(bool)) + DefaultStringCase(default(string)) + DefaultEnumCase(default(UnsignedLong)) != 4) return -10;
+            CounterBox box = new CounterBox();
+            box.Property++;
+            UnsignedByte[] items = new UnsignedByte[1];
+            items[0]++;
+            Echo(Direction.Zero);
+            new CounterBox();
+            if ((int)box.Property != 1 || (int)items[0] != 1) return -11;
+            return 48;
+        }
         public static object Box(Direction value) { return value; }
         public static object BoxExplicit(Direction value) { return (object)value; }
         public static Direction Unbox(object value) { return (Direction)value; }
