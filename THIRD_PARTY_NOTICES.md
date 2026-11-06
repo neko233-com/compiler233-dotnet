@@ -8,6 +8,7 @@ licenses apply to those components.
 | --- | --- | --- | --- |
 | hao | 0.0.9 | MIT | https://github.com/pigeonhands/hao |
 | serde_json | 1.0.154 | MIT OR Apache-2.0 | https://github.com/serde-rs/json |
+| sha1 | 0.10.7 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 | https://github.com/Stebalien/tempfile |
 | tree-sitter | 0.25.10 | MIT | https://github.com/tree-sitter/tree-sitter |

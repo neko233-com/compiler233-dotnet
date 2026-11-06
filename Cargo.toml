@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 hao = "0.0.9"
 serde_json = "1"
+sha1 = "0.10"
 sha2 = "0.10"
 tempfile = "3"
 tree-sitter = "0.25"

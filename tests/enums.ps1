@@ -75,14 +75,88 @@ foreach ($unsupported in @(
     }
 }
 Write-Output 'Unsupported enum attributes rejected; previous outputs preserved.'
-[IO.File]::WriteAllText($bad, 'public class Consumer { public static EnumFixture.Direction Echo(EnumFixture.Direction value) { return value; } }')
-$null = & $binary csc $bad "-reference:$reference" "-out:$output" 2>&1
-if ($LASTEXITCODE -ne 1) { throw 'Unsupported external enum was accepted as a reference type.' }
-if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before -or
-    (Get-FileHash -Algorithm SHA256 $reference).Hash -ne $referenceBefore) {
-    throw 'Unsupported external enum changed a previous output'
+$consumerSource = Join-Path $root 'tests/fixtures/enums/Consumer.cs'
+$consumerOutput = Join-Path $work 'ExternalConsumer.dll'
+$consumerReference = Join-Path (Join-Path $work 'consumer-ref') 'ExternalConsumer.dll'
+& $binary csc $consumerSource "-reference:$reference" "-out:$consumerOutput" "-refout:$consumerReference"
+if ($LASTEXITCODE -ne 0) { throw 'External enum consumer failed to compile.' }
+& dotnet $enumOracle --external $consumerOutput $consumerReference $reference
+if ($LASTEXITCODE -ne 0) { throw 'External enum consumer failed to execute.' }
+foreach ($inaccessible in @(
+    'class C { EnumFixture.InternalCode Field; }',
+    'class C { int M() { return (int)EnumFixture.InternalCode.One; } }'
+)) {
+    [IO.File]::WriteAllText($bad, $inaccessible)
+    $null = & $binary csc $bad "-reference:$reference" "-out:$output" 2>&1
+    if ($LASTEXITCODE -ne 1) { throw "Inaccessible external enum was accepted: $inaccessible" }
+    if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Inaccessible enum changed a previous output.' }
 }
-Write-Output 'Unsupported external enum rejected; previous outputs preserved.'
+$otherSource = Join-Path $work 'OtherEnum.cs'
+$otherOutput = Join-Path $work 'OtherEnum.dll'
+[IO.File]::WriteAllText($otherSource, 'namespace EnumFixture { public enum Direction { Value = 7 } }')
+& $binary csc $otherSource "-out:$otherOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Second enum assembly failed to compile.' }
+[IO.File]::WriteAllText($bad, 'class C { EnumFixture.Direction M(EnumFixture.Direction value) { return value; } }')
+$null = & $binary csc $bad "-reference:$reference" "-reference:$otherOutput" "-out:$output" 2>&1
+if ($LASTEXITCODE -ne 1) { throw 'Ambiguous referenced enum was accepted.' }
+if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Ambiguous enum changed a previous output.' }
+$localSource = Join-Path $work 'LocalEnum.cs'
+$localOutput = Join-Path $work 'LocalEnum.dll'
+[IO.File]::WriteAllText($localSource, 'namespace EnumFixture { public enum Direction { Value = 7 } public class Local { public static int Run() { return (int)Direction.Value; } } }')
+& $binary csc $localSource "-reference:$reference" "-out:$localOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Locally declared enum did not take precedence.' }
+& dotnet $enumOracle --invoke $localOutput 'EnumFixture.Local' 'Run' '7'
+if ($LASTEXITCODE -ne 0) { throw 'Locally declared enum failed at runtime.' }
+[IO.File]::WriteAllText($bad, 'namespace EnumFixture { public enum Direction { Value = 7 } public static class Local { public static int Run() { return (int)Api.Echo(Direction.Value); } } }')
+$null = & $binary csc $bad "-reference:$reference" "-out:$output" 2>&1
+if ($LASTEXITCODE -ne 1) { throw 'Distinct local and external enum types were treated as identical.' }
+if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Enum identity error changed a previous output.' }
+$firstSource = Join-Path $work 'FirstIdentity.cs'
+$firstOutput = Join-Path $work 'FirstIdentity.dll'
+$secondSource = Join-Path $work 'SecondIdentity.cs'
+$secondOutput = Join-Path $work 'SecondIdentity.dll'
+[IO.File]::WriteAllText($firstSource, 'namespace Shared { public enum E { One = 1 } }')
+[IO.File]::WriteAllText($secondSource, 'namespace Shared { public enum E { One = 7 } }')
+& $binary csc $firstSource "-out:$firstOutput"
+if ($LASTEXITCODE -ne 0) { throw 'First identity assembly failed.' }
+& $binary csc $secondSource "-out:$secondOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Second identity assembly failed.' }
+$bridgeSource = Join-Path $work 'IdentityBridge.cs'
+$bridgeOutput = Join-Path $work 'IdentityBridge.dll'
+[IO.File]::WriteAllText($bridgeSource, 'public static class IdentityBridge { public static Shared.E Echo(Shared.E value) { return value; } }')
+& $binary csc $bridgeSource "-reference:$firstOutput" "-out:$bridgeOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Identity bridge failed to compile.' }
+$identitySource = Join-Path $work 'IdentityConsumer.cs'
+$identityOutput = Join-Path $work 'IdentityConsumer.dll'
+[IO.File]::WriteAllText($identitySource, 'public static class IdentityConsumer { public static int Run() { return (int)IdentityBridge.Echo(Shared.E.One); } }')
+& $binary csc $identitySource "-reference:$bridgeOutput" "-reference:$firstOutput" "-out:$identityOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Matching enum assembly identity was rejected.' }
+& dotnet $enumOracle --invoke $identityOutput 'IdentityConsumer' 'Run' '1'
+if ($LASTEXITCODE -ne 0) { throw 'Matching enum assembly identity failed at runtime.' }
+$null = & $binary csc $identitySource "-reference:$bridgeOutput" "-reference:$secondOutput" "-out:$output" 2>&1
+if ($LASTEXITCODE -ne 1) { throw 'Distinct external enum assembly identities were treated as identical.' }
+if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'External enum identity error changed a previous output.' }
+Write-Output 'External enum accessibility, ambiguity and local declaration checks passed.'
+$runtime = & dotnet --list-runtimes | Where-Object { $_ -match '^Microsoft\.NETCore\.App ' } | Select-Object -Last 1
+if ($runtime -notmatch '^Microsoft\.NETCore\.App (\S+) \[(.+)\]$') { throw 'Could not locate the .NET runtime.' }
+$core = Join-Path (Join-Path $Matches[2] $Matches[1]) 'System.Private.CoreLib.dll'
+$systemSource = Join-Path $work 'SystemEnumConsumer.cs'
+$systemOutput = Join-Path $work 'SystemEnumConsumer.dll'
+[IO.File]::WriteAllText($systemSource, 'public static class SystemEnumConsumer { public static System.DayOfWeek Echo(System.DayOfWeek value) { return value; } public static int Run() { System.DayOfWeek[] values = new System.DayOfWeek[1]; values[0] = System.DayOfWeek.Friday; return (int)Echo(values[0]); } }')
+& $binary csc $systemSource "-reference:$core" "-out:$systemOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Framework enum consumer failed to compile.' }
+& dotnet $enumOracle --invoke $systemOutput 'SystemEnumConsumer' 'Run' '5'
+if ($LASTEXITCODE -ne 0) { throw 'Framework enum consumer failed at runtime.' }
+$frameworkBridge = Join-Path $work 'FrameworkBridge.dll'
+& dotnet $enumOracle --make-framework-bridge $frameworkBridge
+if ($LASTEXITCODE -ne 0) { throw 'Framework bridge could not be built.' }
+$bridgeConsumerSource = Join-Path $work 'FrameworkBridgeConsumer.cs'
+$bridgeConsumerOutput = Join-Path $work 'FrameworkBridgeConsumer.dll'
+[IO.File]::WriteAllText($bridgeConsumerSource, 'public static class FrameworkBridgeConsumer { public static int Run() { return (int)FrameworkBridge.Echo(System.DayOfWeek.Friday); } }')
+& $binary csc $bridgeConsumerSource "-reference:$frameworkBridge" "-reference:$core" "-out:$bridgeConsumerOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Framework enum method signature failed to compile.' }
+& dotnet $enumOracle --invoke $bridgeConsumerOutput 'FrameworkBridgeConsumer' 'Run' '5'
+if ($LASTEXITCODE -ne 0) { throw 'Framework enum method signature failed at runtime.' }
 $valid = Join-Path $work 'InternalVisibility.cs'
 $validOutput = Join-Path $work 'InternalVisibility.dll'
 [IO.File]::WriteAllText($valid, 'enum Hidden { A = 4 } internal class InternalClass { public static Hidden Value() { return Hidden.A; } } public class PublicClass { internal Hidden Field; private protected Hidden Access() { return Hidden.A; } public static int Run() { return (int)InternalClass.Value(); } }')

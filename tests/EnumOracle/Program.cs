@@ -1,14 +1,88 @@
 using System.Reflection;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Runtime.Loader;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 
+static Assembly LoadAssembly(string path)
+{
+    string assemblyPath = Path.GetFullPath(path);
+    var loader = new AssemblyLoadContext("runtime-probe", true);
+    loader.Resolving += (context, name) => {
+        string dependency = Path.Combine(Path.GetDirectoryName(assemblyPath)!, name.Name + ".dll");
+        return File.Exists(dependency) ? context.LoadFromAssemblyPath(dependency) : null;
+    };
+    return loader.LoadFromAssemblyPath(assemblyPath);
+}
+if (args.Length == 2 && args[0] == "--make-framework-bridge")
+{
+    var bridgeReferences = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
+        .Select(path => MetadataReference.CreateFromFile(path));
+    const string source = "public static class FrameworkBridge { public static System.DayOfWeek Echo(System.DayOfWeek value) => value; }";
+    var compilation = CSharpCompilation.Create("FrameworkBridge", [CSharpSyntaxTree.ParseText(source)], bridgeReferences,
+        new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+    using var stream = File.Create(args[1]);
+    var result = compilation.Emit(stream);
+    if (!result.Success) throw new Exception("Framework bridge build failed: " + string.Join("\n", result.Diagnostics));
+    stream.Position = 0;
+    using var image = new PEReader(stream, PEStreamOptions.LeaveOpen);
+    var metadata = image.GetMetadataReader();
+    bool strongReference = metadata.AssemblyReferences
+        .Select(metadata.GetAssemblyReference)
+        .Any(reference => metadata.GetString(reference.Name) == "System.Private.CoreLib" &&
+            metadata.GetBlobBytes(reference.PublicKeyOrToken).Length == 8);
+    if (!strongReference) throw new Exception("Framework bridge did not emit the expected strong-name token reference");
+    return;
+}
 if (args.Length == 5 && args[0] == "--invoke")
 {
-    var assembly = new AssemblyLoadContext("invoke", true).LoadFromAssemblyPath(Path.GetFullPath(args[1]));
+    var assembly = LoadAssembly(args[1]);
     object? result = assembly.GetType(args[2], true)!.GetMethod(args[3])!.Invoke(null, null);
     if (!Equals(result, int.Parse(args[4]))) throw new Exception($"Unexpected runtime result: {result}");
     Console.WriteLine($"{args[2]}.{args[3]} returned {result}.");
+    return;
+}
+if (args.Length == 4 && args[0] == "--external")
+{
+    var externalConsumerType = LoadAssembly(args[1]).GetType("ExternalConsumer", true)!;
+    var signatures = new[] {
+        ("Echo", "EnumFixture.Direction"), ("EchoAlias", "EnumFixture.Direction"), ("EchoSignedByte", "EnumFixture.SignedByte"),
+        ("EchoUnsignedByte", "EnumFixture.UnsignedByte"), ("EchoSignedShort", "EnumFixture.SignedShort"),
+        ("EchoUnsignedShort", "EnumFixture.UnsignedShort"), ("EchoSignedInt", "EnumFixture.SignedInt"),
+        ("EchoUnsignedInt", "EnumFixture.UnsignedInt"), ("EchoSignedLong", "EnumFixture.SignedLong"),
+        ("EchoUnsignedLong", "EnumFixture.UnsignedLong")
+    };
+    foreach (var (methodName, enumName) in signatures)
+    {
+        var method = externalConsumerType.GetMethod(methodName)!;
+        if (!method.ReturnType.IsEnum || method.ReturnType.FullName != enumName ||
+            method.GetParameters().Single().ParameterType != method.ReturnType ||
+            method.ReturnType.Assembly.GetName().Name != "EnumApi")
+            throw new Exception($"Invalid external enum signature: {methodName}");
+    }
+    var array = externalConsumerType.GetMethod("EchoArray")!;
+    if (!array.ReturnType.IsArray || array.ReturnType.GetElementType()?.FullName != "EnumFixture.Direction" ||
+        array.GetParameters().Single().ParameterType != array.ReturnType)
+        throw new Exception("Invalid external enum array signature");
+    var framework = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
+        .Select(path => MetadataReference.CreateFromFile(path));
+    var references = framework.Concat([MetadataReference.CreateFromFile(args[2]), MetadataReference.CreateFromFile(args[3])]);
+    var externalReferenceCompilation = CSharpCompilation.Create("ExternalReferenceProbe", references: references,
+        options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+    var referenceConsumer = externalReferenceCompilation.GetTypeByMetadataName("ExternalConsumer")
+        ?? throw new Exception("External consumer reference type missing");
+    foreach (var (methodName, enumName) in signatures)
+    {
+        var method = referenceConsumer.GetMembers(methodName).OfType<IMethodSymbol>().Single();
+        if (method.ReturnType.TypeKind != TypeKind.Enum || method.ReturnType.ToDisplayString() != enumName ||
+            method.ReturnType.ContainingAssembly.Name != "EnumApi" ||
+            !SymbolEqualityComparer.Default.Equals(method.ReturnType, method.Parameters.Single().Type))
+            throw new Exception($"Invalid external enum reference signature: {methodName}");
+    }
+    object? result = externalConsumerType.GetMethod("Run")!.Invoke(null, null);
+    if (!Equals(result, 257)) throw new Exception($"External consumer returned {result}, expected 257");
+    Console.WriteLine("External enum signatures, reference metadata, array operations and cross-assembly execution passed (257).");
     return;
 }
 if (args.Length != 2) throw new ArgumentException("usage: EnumOracle <implementation.dll> <reference.dll> | --invoke <assembly.dll> <type> <method> <expected-int>");

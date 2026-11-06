@@ -4,7 +4,7 @@
 //! abstract syntax tree, resolves names against a two-pass symbol table and
 //! emits executable IL. Anything outside the supported core is rejected with a
 //! located diagnostic instead of being approximated.
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use hao::{
     Module,
@@ -12,7 +12,7 @@ use hao::{
     dotnet::{
         entries::{
             Constant, CustomAttribute, Entry, Field, InterfaceImpl, Method, MethodDefOrRef,
-            MethodSpec, Param, TypeDef, TypeDefOrRef, TypeSpec,
+            MethodSpec, Param, ResolutionScope, TypeDef, TypeDefOrRef, TypeSpec,
         },
         il::{EmitLabel, Emitter, Instruction, MemberToken, MethodBody, OpCode, Operand},
         md::streams::tables_stream::{FieldFlags, MethodFlags, TypeAttributes},
@@ -180,9 +180,20 @@ struct EnumInfo {
     name: String,
     is_public: bool,
     is_flags: bool,
+    is_external: bool,
+    external_identity: Option<ExternalEnumIdentity>,
     base: EnumBase,
     members: Vec<(String, i128)>,
     values: HashMap<String, i128>,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalEnumIdentity {
+    definition: Entry<TypeDef>,
+    assembly: String,
+    version: Version,
+    culture: String,
+    public_key: Vec<u8>,
 }
 
 impl EnumInfo {
@@ -191,6 +202,39 @@ impl EnumInfo {
             self.name.clone()
         } else {
             format!("{}.{}", self.namespace, self.name)
+        }
+    }
+
+    fn matches_type_reference(&self, reference: &TypeDefOrRef, allow_local: bool) -> bool {
+        let Some(identity) = &self.external_identity else {
+            return allow_local && matches!(reference, TypeDefOrRef::TypeDef(_));
+        };
+        match reference {
+            TypeDefOrRef::TypeDef(entry) => identity.definition.ptr_eq(entry),
+            TypeDefOrRef::TypeRef(entry) => {
+                let reference = entry.get();
+                let Some(ResolutionScope::AssemblyRef(assembly)) = &reference.scope else {
+                    return false;
+                };
+                let assembly = assembly.get();
+                let key_matches =
+                    if assembly.public_key_or_token.len() == 8 && !identity.public_key.is_empty() {
+                        use sha1::Digest;
+                        let digest = sha1::Sha1::digest(&identity.public_key);
+                        assembly
+                            .public_key_or_token
+                            .iter()
+                            .copied()
+                            .eq(digest[12..].iter().rev().copied())
+                    } else {
+                        assembly.public_key_or_token == identity.public_key
+                    };
+                assembly.name.eq_ignore_ascii_case(&identity.assembly)
+                    && assembly.version == identity.version
+                    && assembly.culture.eq_ignore_ascii_case(&identity.culture)
+                    && key_matches
+            }
+            TypeDefOrRef::TypeSpec(_) => false,
         }
     }
 }
@@ -762,9 +806,10 @@ pub fn compile(
     assembly_name: &str,
     references: &[String],
 ) -> Result<Vec<u8>, CompileError> {
+    let externals = Externals::load(references, sources)?;
     let mut program = Program {
         types: Vec::new(),
-        enums: HashMap::new(),
+        enums: externals.enum_values(),
     };
     // Enums are compile-time constants, so their names must be known before any
     // file is parsed regardless of declaration order.
@@ -776,7 +821,7 @@ pub fn compile(
         let (types, _) = parse_file(file, text, &program.enums)?;
         program.types.extend(types);
     }
-    emit(&program, assembly_name, sources, references)
+    emit(&program, assembly_name, sources, &externals)
 }
 
 /// External assemblies referenced with `-reference:`, indexed by type name.
@@ -848,6 +893,120 @@ impl Externals {
             methods,
             fields,
         })
+    }
+
+    fn enum_values(&self) -> EnumValues {
+        let mut result = HashMap::new();
+        for (full_name, (module_index, entry)) in &self.types {
+            let definition = entry.get();
+            if !definition.is_visible()
+                || definition.declaring_type.upgrade().is_some()
+                || !definition
+                    .extends
+                    .as_ref()
+                    .is_some_and(|base| base.full_name() == "System.Enum")
+                || self
+                    .by_short_name
+                    .get(&definition.name)
+                    .is_some_and(|candidates| {
+                        candidates
+                            .iter()
+                            .filter(|candidate| *candidate == full_name)
+                            .count()
+                            != 1
+                    })
+            {
+                continue;
+            }
+            let Some(assembly) = &self.modules[*module_index].assembly else {
+                continue;
+            };
+            let assembly = assembly.get();
+            let identity = ExternalEnumIdentity {
+                definition: entry.clone(),
+                assembly: assembly.name.clone(),
+                version: assembly.version,
+                culture: assembly.culture.clone(),
+                public_key: assembly.public_key.clone(),
+            };
+            let Some(fields) = self.fields.get(full_name) else {
+                continue;
+            };
+            let base = fields.iter().find_map(|(_, field)| {
+                let field = field.get();
+                if field.name != "value__" {
+                    return None;
+                }
+                match &field.signature.ty {
+                    TypeSig::Primitive(PrimitiveType::I1) => Some(EnumBase::I1),
+                    TypeSig::Primitive(PrimitiveType::U1) => Some(EnumBase::U1),
+                    TypeSig::Primitive(PrimitiveType::I2) => Some(EnumBase::I2),
+                    TypeSig::Primitive(PrimitiveType::U2) => Some(EnumBase::U2),
+                    TypeSig::Primitive(PrimitiveType::I4) => Some(EnumBase::I4),
+                    TypeSig::Primitive(PrimitiveType::U4) => Some(EnumBase::U4),
+                    TypeSig::Primitive(PrimitiveType::I8) => Some(EnumBase::I8),
+                    TypeSig::Primitive(PrimitiveType::U8) => Some(EnumBase::U8),
+                    _ => None,
+                }
+            });
+            let Some(base) = base else { continue };
+            let mut values = HashMap::new();
+            let mut members = Vec::new();
+            let mut valid = true;
+            for (_, field) in fields {
+                let field = field.get();
+                if !field
+                    .flags
+                    .contains(FieldFlags::Static | FieldFlags::Literal)
+                    || field.flags & FieldFlags::FieldAccessMask != FieldFlags::Public
+                {
+                    continue;
+                }
+                let Some(constant) = &field.constant else {
+                    valid = false;
+                    break;
+                };
+                if constant.element_type != base.element_type()
+                    || constant.value.len() != base.width()
+                {
+                    valid = false;
+                    break;
+                }
+                let Some(raw) = constant.as_i64() else {
+                    valid = false;
+                    break;
+                };
+                let value = if base == EnumBase::U8 {
+                    raw as u64 as i128
+                } else {
+                    raw as i128
+                };
+                if values.insert(field.name.clone(), value).is_some() {
+                    valid = false;
+                    break;
+                }
+                members.push((field.name.clone(), value));
+            }
+            if valid {
+                result.insert(
+                    full_name.clone(),
+                    Arc::new(EnumInfo {
+                        file: String::new(),
+                        offset: 0,
+                        namespace: definition.namespace.clone(),
+                        name: definition.name.clone(),
+                        is_public: true,
+                        is_flags: false,
+                        is_external: true,
+                        external_identity: Some(identity),
+                        base,
+                        members,
+                        values,
+                    }),
+                );
+            }
+        }
+        result
     }
 
     /// Finds the open generic definition `Name\`arity` in the reference set.
@@ -963,7 +1122,7 @@ struct Parser<'a> {
     position: usize,
 }
 
-type EnumValues = HashMap<String, EnumInfo>;
+type EnumValues = HashMap<String, Arc<EnumInfo>>;
 
 #[derive(Debug, Clone, Default)]
 struct EnumImports {
@@ -984,22 +1143,22 @@ fn find_enum<'a>(
             Some(rest) => format!("{alias}.{rest}"),
             None => alias.clone(),
         };
-        return enums.get(&expanded);
+        return enums.get(&expanded).map(Arc::as_ref);
     }
     let mut scope = namespace;
     while !scope.is_empty() {
         if let Some(found) = enums.get(&format!("{scope}.{name}")) {
-            return Some(found);
+            return Some(found.as_ref());
         }
         scope = scope.rsplit_once('.').map_or("", |(parent, _)| parent);
     }
     if let Some(found) = enums.get(name) {
-        return Some(found);
+        return Some(found.as_ref());
     }
     let mut matches = imports
         .namespaces
         .iter()
-        .filter_map(|import| enums.get(&format!("{import}.{name}")));
+        .filter_map(|import| enums.get(&format!("{import}.{name}")).map(Arc::as_ref));
     let first = matches.next()?;
     if matches.any(|other| other.full_name() != first.full_name()) {
         None
@@ -1584,6 +1743,7 @@ impl<'a> Parser<'a> {
             format!("{namespace}.{name}")
         };
         if let Some(existing) = self.enums.get(&full_name)
+            && !existing.is_external
             && (existing.file != self.file || existing.offset != offset)
         {
             return Err(self.error(format!("duplicate enum type '{name}'")));
@@ -1646,17 +1806,19 @@ impl<'a> Parser<'a> {
         let values = members.iter().cloned().collect();
         self.enums.insert(
             full_name,
-            EnumInfo {
+            Arc::new(EnumInfo {
                 file: self.file.to_string(),
                 offset,
                 namespace: namespace.to_string(),
                 name,
                 is_public,
                 is_flags,
+                is_external: false,
+                external_identity: None,
                 base,
                 members,
                 values,
-            },
+            }),
         );
         Ok(())
     }
@@ -3083,6 +3245,7 @@ fn program_error(
     } else if let Some(decl) = program
         .enums
         .values()
+        .filter(|entry| !entry.is_external)
         .min_by_key(|entry| (&entry.file, entry.offset))
     {
         enum_error(decl, sources, message)
@@ -3178,7 +3341,7 @@ fn array_element_opcode(ty: &Ty, store: bool) -> Option<OpCode> {
     }
 }
 
-fn external_ty(sig: &TypeSig) -> Ty {
+fn external_ty(sig: &TypeSig, enums: &EnumValues, allow_local: bool) -> Ty {
     match sig {
         TypeSig::Primitive(PrimitiveType::I4) => Ty::Int,
         TypeSig::Primitive(PrimitiveType::Boolean) => Ty::Bool,
@@ -3186,20 +3349,25 @@ fn external_ty(sig: &TypeSig) -> Ty {
         TypeSig::Primitive(PrimitiveType::Void) => Ty::Void,
         TypeSig::Class(TypeDefOrRef::TypeDef(entry)) => Ty::Class(entry.get().full_name()),
         TypeSig::Class(TypeDefOrRef::TypeRef(entry)) => Ty::Class(entry.get().full_name()),
-        TypeSig::SzArray(inner) => Ty::Array(Box::new(external_ty(inner))),
+        TypeSig::ValueType(reference) => enums
+            .get(&reference.full_name())
+            .filter(|info| info.matches_type_reference(reference, allow_local))
+            .map(|info| Ty::Enum(info.full_name(), info.base))
+            .unwrap_or_else(|| Ty::Named(format!("{sig:?}"))),
+        TypeSig::SzArray(inner) => Ty::Array(Box::new(external_ty(inner, enums, allow_local))),
         other => Ty::Named(format!("{other:?}")),
     }
 }
 
 /// Replaces `MVar` placeholders with the supplied instantiation.
-fn substitute(sig: &TypeSig, instantiation: &[TypeSig]) -> Ty {
+fn substitute(sig: &TypeSig, instantiation: &[TypeSig], enums: &EnumValues) -> Ty {
     match sig {
         TypeSig::Var(index) | TypeSig::MVar(index) => instantiation
             .get(*index as usize)
-            .map(external_ty)
+            .map(|sig| external_ty(sig, enums, true))
             .unwrap_or(Ty::Named("generic argument".to_string())),
-        TypeSig::SzArray(inner) => Ty::Array(Box::new(substitute(inner, instantiation))),
-        other => external_ty(other),
+        TypeSig::SzArray(inner) => Ty::Array(Box::new(substitute(inner, instantiation, enums))),
+        other => external_ty(other, enums, false),
     }
 }
 
@@ -3218,10 +3386,25 @@ fn resolve_type(
         Ty::Bool => TypeSig::BOOL,
         Ty::String => TypeSig::STRING,
         Ty::Enum(name, _) => {
-            let entry = types
-                .get(name)
-                .ok_or_else(|| format!("unknown enum type '{name}'"))?;
-            TypeSig::ValueType(TypeDefOrRef::TypeDef(entry.clone()))
+            if let Some(entry) = types.get(name) {
+                TypeSig::ValueType(TypeDefOrRef::TypeDef(entry.clone()))
+            } else {
+                let (index, entry) = externals
+                    .types
+                    .get(name)
+                    .ok_or_else(|| format!("unknown enum type '{name}'"))?;
+                if !entry.get().is_visible() {
+                    return Err(format!("referenced enum type '{name}' is inaccessible"));
+                }
+                TypeSig::ValueType(
+                    module
+                        .import_foreign_type(
+                            &TypeDefOrRef::TypeDef(entry.clone()),
+                            &externals.modules[*index],
+                        )
+                        .map_err(|error| error.to_string())?,
+                )
+            }
         }
         Ty::Class(name) => match types.get(name) {
             Some(entry) => TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone())),
@@ -3354,11 +3537,10 @@ fn emit(
     program: &Program,
     assembly_name: &str,
     sources: &[(String, String)],
-    references: &[String],
+    externals: &Externals,
 ) -> Result<Vec<u8>, CompileError> {
     validate_enum_api_accessibility(program, sources)?;
-    let externals = Externals::load(references, sources)?;
-    if program.types.is_empty() && program.enums.is_empty() {
+    if program.types.is_empty() && program.enums.values().all(|entry| entry.is_external) {
         return Err(CompileError {
             file: sources
                 .first()
@@ -3378,7 +3560,12 @@ fn emit(
     // Pass 0: declare every type so fields and signatures can reference types
     // that are declared later in the compilation.
     let mut types: HashMap<String, Entry<TypeDef>> = HashMap::new();
-    let mut enums: Vec<&EnumInfo> = program.enums.values().collect();
+    let mut enums: Vec<&EnumInfo> = program
+        .enums
+        .values()
+        .filter(|entry| !entry.is_external)
+        .map(Arc::as_ref)
+        .collect();
     enums
         .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
     for decl in &enums {
@@ -5235,7 +5422,7 @@ impl<'a> FnEmitter<'a> {
                                 "property '{type_name}.{name}' has no accessible instance setter"
                             )));
                         }
-                        let expected = external_ty(&signature.params[0]);
+                        let expected = external_ty(&signature.params[0], self.enums, false);
                         let actual = self.expr(value)?;
                         self.convert_assignable(
                             &actual,
@@ -5785,7 +5972,11 @@ impl<'a> FnEmitter<'a> {
                 let guard = entry.get();
                 guard.signature.clone()
             };
-            let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
+            let params: Vec<Ty> = signature
+                .params
+                .iter()
+                .map(|sig| external_ty(sig, self.enums, false))
+                .collect();
             if let Some(args) = args {
                 for (index, argument) in args.iter().enumerate() {
                     let actual = self.expr(argument)?;
@@ -6205,11 +6396,28 @@ impl<'a> FnEmitter<'a> {
                 TypeDefOrRef::TypeRef(entry) => Ok(MemberToken::TypeRef(entry)),
                 _ => Err(self.error("System.Object is not a type reference")),
             },
-            Ty::Class(type_name) | Ty::Enum(type_name, _) => {
+            Ty::Class(type_name) => {
                 let Some(entry) = self.types.get(type_name) else {
                     return Err(self.error(format!("unknown type '{type_name}'")));
                 };
                 Ok(MemberToken::TypeDef(entry.clone()))
+            }
+            Ty::Enum(_, _) => {
+                let signature =
+                    resolve_type(element, self.types, self.externals, &mut *self.module)
+                        .map_err(|message| self.error(message))?;
+                match signature {
+                    TypeSig::ValueType(TypeDefOrRef::TypeDef(entry)) => {
+                        Ok(MemberToken::TypeDef(entry))
+                    }
+                    TypeSig::ValueType(TypeDefOrRef::TypeRef(entry)) => {
+                        Ok(MemberToken::TypeRef(entry))
+                    }
+                    TypeSig::ValueType(TypeDefOrRef::TypeSpec(entry)) => {
+                        Ok(MemberToken::TypeSpec(entry))
+                    }
+                    _ => Err(self.error("enum array element is not a value type")),
+                }
             }
             Ty::Int => match self
                 .module
@@ -6387,7 +6595,7 @@ impl<'a> FnEmitter<'a> {
                 OpCode::Ldfld,
                 Operand::Token(token.clone()),
             ));
-            return Ok(external_ty(&signature.ty));
+            return Ok(external_ty(&signature.ty, self.enums, false));
         }
         let property = self
             .symbols
@@ -6423,7 +6631,7 @@ impl<'a> FnEmitter<'a> {
                         .map_err(|error| self.error(error.to_string()))?
                 };
                 self.emitter.callvirt(token);
-                return Ok(external_ty(&signature.ret));
+                return Ok(external_ty(&signature.ret, self.enums, false));
             }
             return Err(self.error(format!("unknown member '{type_name}.{name}'")));
         };
@@ -6791,7 +6999,11 @@ impl<'a> FnEmitter<'a> {
                         let guard = entry.get();
                         guard.signature.clone()
                     };
-                    let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
+                    let params: Vec<Ty> = signature
+                        .params
+                        .iter()
+                        .map(|sig| external_ty(sig, self.enums, false))
+                        .collect();
                     self.emitter.ldarg(0);
                     self.push_arguments(args, &params, "argument")?;
                     let token = {
@@ -6802,7 +7014,7 @@ impl<'a> FnEmitter<'a> {
                             .map_err(|error| self.error(error.to_string()))?
                     };
                     self.emitter.call(token);
-                    return Ok(external_ty(&signature.ret));
+                    return Ok(external_ty(&signature.ret, self.enums, false));
                 }
                 return Err(self.error(format!(
                     "base type '{base}' has no method '{name}' with {} parameter(s)",
@@ -6885,7 +7097,11 @@ impl<'a> FnEmitter<'a> {
                 if !generic_args.is_empty() {
                     return self.generic_call(index, &entry, &signature, generic_args, args);
                 }
-                let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
+                let params: Vec<Ty> = signature
+                    .params
+                    .iter()
+                    .map(|sig| external_ty(sig, self.enums, false))
+                    .collect();
                 self.push_arguments(args, &params, "argument")?;
                 let token = {
                     let module = &mut *self.module;
@@ -6895,7 +7111,7 @@ impl<'a> FnEmitter<'a> {
                         .map_err(|error| self.error(error.to_string()))?
                 };
                 self.emitter.callvirt(token);
-                return Ok(external_ty(&signature.ret));
+                return Ok(external_ty(&signature.ret, self.enums, false));
             }
             return Err(self.error(format!(
                 "no instance method '{name}' with {} parameter(s) on '{type_name}'",
@@ -6999,7 +7215,11 @@ impl<'a> FnEmitter<'a> {
             if !generic_args.is_empty() {
                 return self.generic_call(index, &entry, &signature, generic_args, args);
             }
-            let params: Vec<Ty> = signature.params.iter().map(external_ty).collect();
+            let params: Vec<Ty> = signature
+                .params
+                .iter()
+                .map(|sig| external_ty(sig, self.enums, false))
+                .collect();
             self.push_arguments(args, &params, "argument")?;
             let token = {
                 let module = &mut *self.module;
@@ -7009,7 +7229,7 @@ impl<'a> FnEmitter<'a> {
                     .map_err(|error| self.error(error.to_string()))?
             };
             self.emitter.call(token);
-            return Ok(external_ty(&signature.ret));
+            return Ok(external_ty(&signature.ret, self.enums, false));
         }
         Err(self.error(format!(
             "no static method '{name}' with {} parameter(s) on '{type_name}'",
@@ -7082,9 +7302,9 @@ impl<'a> FnEmitter<'a> {
         let params: Vec<Ty> = imported
             .params
             .iter()
-            .map(|param| substitute(param, &instantiation))
+            .map(|param| substitute(param, &instantiation, self.enums))
             .collect();
-        let ret = substitute(&imported.ret, &instantiation);
+        let ret = substitute(&imported.ret, &instantiation, self.enums);
         Ok((token, params, ret))
     }
 
@@ -7130,11 +7350,11 @@ impl<'a> FnEmitter<'a> {
         let params: Vec<Ty> = signature
             .params
             .iter()
-            .map(|param| substitute(param, &instantiation))
+            .map(|param| substitute(param, &instantiation, self.enums))
             .collect();
         self.push_arguments(args, &params, "argument")?;
         self.emitter.call(MemberToken::MethodSpec(spec));
-        Ok(substitute(&signature.ret, &instantiation))
+        Ok(substitute(&signature.ret, &instantiation, self.enums))
     }
 
     fn bcl_call(
