@@ -98,6 +98,7 @@ struct TypeDecl {
     base: Option<String>,
     interfaces: Vec<String>,
     is_interface: bool,
+    is_public: bool,
     fields: Vec<FieldDecl>,
     methods: Vec<MethodDecl>,
     properties: Vec<PropertyDecl>,
@@ -108,6 +109,7 @@ struct FieldDecl {
     name: String,
     ty: Ty,
     is_static: bool,
+    visibility: Visibility,
     init: Option<Expr>,
 }
 
@@ -116,6 +118,9 @@ struct PropertyDecl {
     name: String,
     ty: Ty,
     is_static: bool,
+    visibility: Visibility,
+    getter_visibility: Option<Visibility>,
+    setter_visibility: Option<Visibility>,
     has_getter: bool,
     has_setter: bool,
     getter: Option<Block>,
@@ -126,12 +131,75 @@ struct PropertyDecl {
 struct MethodDecl {
     name: String,
     is_static: bool,
+    visibility: Visibility,
     ret: Ty,
     params: Vec<(Ty, String)>,
     body: Option<Block>,
     is_ctor: bool,
     virtual_kind: VirtualKind,
     base_args: Option<Vec<Expr>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Visibility {
+    Public,
+    Private,
+    Internal,
+    Protected,
+    ProtectedInternal,
+    PrivateProtected,
+}
+
+impl Visibility {
+    fn from_bits(bits: u8, default: Self) -> Option<Self> {
+        match bits {
+            0 => Some(default),
+            1 => Some(Self::Public),
+            2 => Some(Self::Private),
+            4 => Some(Self::Internal),
+            8 => Some(Self::Protected),
+            12 => Some(Self::ProtectedInternal),
+            10 => Some(Self::PrivateProtected),
+            _ => None,
+        }
+    }
+
+    fn more_restrictive_than(self, parent: Self) -> bool {
+        match parent {
+            Self::Public => self != Self::Public,
+            Self::ProtectedInternal => matches!(
+                self,
+                Self::Protected | Self::Internal | Self::PrivateProtected | Self::Private
+            ),
+            Self::Protected | Self::Internal => {
+                matches!(self, Self::PrivateProtected | Self::Private)
+            }
+            Self::PrivateProtected => self == Self::Private,
+            Self::Private => false,
+        }
+    }
+
+    fn method_flags(self) -> MethodFlags {
+        match self {
+            Self::Public => MethodFlags::Public,
+            Self::Private => MethodFlags::Private,
+            Self::Internal => MethodFlags::Assem,
+            Self::Protected => MethodFlags::Family,
+            Self::ProtectedInternal => MethodFlags::FamORAssem,
+            Self::PrivateProtected => MethodFlags::FamANDAssem,
+        }
+    }
+
+    fn field_flags(self) -> FieldFlags {
+        match self {
+            Self::Public => FieldFlags::Public,
+            Self::Private => FieldFlags::Private,
+            Self::Internal => FieldFlags::Assembly,
+            Self::Protected => FieldFlags::Family,
+            Self::ProtectedInternal => FieldFlags::FamORAssem,
+            Self::PrivateProtected => FieldFlags::FamANDAssem,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,6 +660,7 @@ impl<'a> Parser<'a> {
     fn parse_unit(&mut self) -> Result<Vec<TypeDecl>, CompileError> {
         let mut types = Vec::new();
         let mut namespace = String::new();
+        let mut type_access = None;
         while !self.at_end() {
             self.skip_attribute_lists()?;
             if self.eat(";") {
@@ -613,15 +682,24 @@ impl<'a> Parser<'a> {
                     }
                     self.expect("{")?;
                 }
-                "public" | "internal" | "private" | "protected" | "static" | "sealed"
-                | "abstract" | "partial" | "unsafe" | "readonly" => {
+                "public" | "internal" => {
+                    if type_access.replace(text == "public").is_some() {
+                        return Err(self.error("duplicate type accessibility"));
+                    }
+                    self.bump();
+                }
+                "private" | "protected" => {
+                    return Err(self.error("top-level types cannot be private or protected"));
+                }
+                "static" | "sealed" | "abstract" | "partial" | "unsafe" | "readonly" => {
                     self.bump();
                 }
                 "enum" => {
                     self.parse_enum_declaration()?;
+                    type_access = None;
                 }
                 "class" | "struct" | "interface" | "record" => {
-                    types.push(self.parse_type(&namespace)?);
+                    types.push(self.parse_type(&namespace, type_access.take().unwrap_or(false))?);
                     if self.check("}") && !namespace.is_empty() {
                         self.bump();
                         namespace.clear();
@@ -714,7 +792,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_type(&mut self, namespace: &str) -> Result<TypeDecl, CompileError> {
+    fn parse_type(&mut self, namespace: &str, is_public: bool) -> Result<TypeDecl, CompileError> {
         let class_offset = self.token().start;
         let is_interface = self.check("interface");
         self.bump(); // class / struct / interface / record
@@ -753,6 +831,7 @@ impl<'a> Parser<'a> {
             base,
             interfaces,
             is_interface,
+            is_public,
             fields: Vec::new(),
             methods: Vec::new(),
             properties: Vec::new(),
@@ -786,15 +865,21 @@ impl<'a> Parser<'a> {
     fn parse_member(&mut self, decl: &mut TypeDecl) -> Result<(), CompileError> {
         self.skip_attribute_lists()?;
         let mut is_static = false;
-        let mut is_public = false;
+        let mut access_bits = 0;
         let mut virtual_kind = VirtualKind::None;
         loop {
             match self.text() {
-                "public" => {
-                    is_public = true;
-                    self.bump();
-                }
-                "private" | "internal" | "protected" => {
+                "public" | "private" | "internal" | "protected" => {
+                    let bit = match self.text() {
+                        "public" => 1,
+                        "private" => 2,
+                        "internal" => 4,
+                        _ => 8,
+                    };
+                    if access_bits & bit != 0 {
+                        return Err(self.error("duplicate member accessibility"));
+                    }
+                    access_bits |= bit;
                     self.bump();
                 }
                 "static" => {
@@ -815,7 +900,18 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
-        let _ = is_public;
+        let visibility = Visibility::from_bits(
+            access_bits,
+            if decl.is_interface {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            },
+        )
+        .ok_or_else(|| self.error("invalid member accessibility"))?;
+        if decl.is_interface && visibility != Visibility::Public {
+            return Err(self.error("non-public interface members are not supported"));
+        }
         if self.check("}") || self.at_end() {
             return Ok(());
         }
@@ -852,6 +948,7 @@ impl<'a> Parser<'a> {
             decl.methods.push(MethodDecl {
                 name,
                 is_static: false,
+                visibility,
                 ret: Ty::Void,
                 params,
                 body: Some(body),
@@ -873,6 +970,9 @@ impl<'a> Parser<'a> {
                 name,
                 ty,
                 is_static,
+                visibility,
+                getter_visibility: None,
+                setter_visibility: None,
                 has_getter: true,
                 has_setter: false,
                 getter: Some(getter),
@@ -887,14 +987,36 @@ impl<'a> Parser<'a> {
             let mut setter = None;
             let mut has_getter = false;
             let mut has_setter = false;
+            let mut getter_visibility = None;
+            let mut setter_visibility = None;
             while !self.check("}") && !self.at_end() {
                 self.skip_attribute_lists()?;
-                while matches!(
-                    self.text(),
-                    "public" | "private" | "internal" | "protected" | "static" | "readonly"
-                ) {
+                let mut accessor_bits = 0;
+                while matches!(self.text(), "public" | "private" | "internal" | "protected") {
+                    let bit = match self.text() {
+                        "public" => 1,
+                        "private" => 2,
+                        "internal" => 4,
+                        _ => 8,
+                    };
+                    if accessor_bits & bit != 0 {
+                        return Err(self.error("duplicate accessor accessibility"));
+                    }
+                    accessor_bits |= bit;
                     self.bump();
                 }
+                let accessor_visibility = if accessor_bits == 0 {
+                    None
+                } else {
+                    let access = Visibility::from_bits(accessor_bits, visibility)
+                        .ok_or_else(|| self.error("invalid accessor accessibility"))?;
+                    if !access.more_restrictive_than(visibility) {
+                        return Err(
+                            self.error("accessor must be more restrictive than its property")
+                        );
+                    }
+                    Some(access)
+                };
                 let accessor = self.identifier_like()?;
                 let body = if self.eat(";") {
                     None
@@ -908,11 +1030,19 @@ impl<'a> Parser<'a> {
                 };
                 match accessor.as_str() {
                     "get" => {
+                        if has_getter {
+                            return Err(self.error("duplicate get accessor"));
+                        }
                         has_getter = true;
+                        getter_visibility = accessor_visibility;
                         getter = body;
                     }
                     "set" => {
+                        if has_setter {
+                            return Err(self.error("duplicate set accessor"));
+                        }
                         has_setter = true;
+                        setter_visibility = accessor_visibility;
                         setter = body;
                     }
                     other => {
@@ -921,10 +1051,22 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect("}")?;
+            if (getter_visibility.is_some() || setter_visibility.is_some())
+                && (!has_getter
+                    || !has_setter
+                    || (getter_visibility.is_some() && setter_visibility.is_some()))
+            {
+                return Err(self.error(
+                    "accessor accessibility requires both accessors and may occur only once",
+                ));
+            }
             decl.properties.push(PropertyDecl {
                 name,
                 ty,
                 is_static,
+                visibility,
+                getter_visibility,
+                setter_visibility,
                 has_getter,
                 has_setter,
                 getter,
@@ -948,6 +1090,7 @@ impl<'a> Parser<'a> {
             decl.methods.push(MethodDecl {
                 name,
                 is_static,
+                visibility,
                 ret: ty,
                 params,
                 body,
@@ -970,6 +1113,7 @@ impl<'a> Parser<'a> {
                 name: current_name.clone(),
                 ty: ty.clone(),
                 is_static,
+                visibility,
                 init,
             });
             if !self.eat(",") {
@@ -1916,6 +2060,9 @@ fn resolve_type(
             Some(entry) => TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone())),
             None => match externals.find(name) {
                 Some((index, entry)) => {
+                    if !entry.get().is_visible() {
+                        return Err(format!("referenced type '{name}' is inaccessible"));
+                    }
                     let imported = module
                         .import_foreign_type(
                             &TypeDefOrRef::TypeDef(entry.clone()),
@@ -1932,6 +2079,9 @@ fn resolve_type(
             let Some((index, entry)) = externals.find_generic(name, args.len()) else {
                 return Err(format!("unknown generic type '{name}'"));
             };
+            if !entry.get().is_visible() {
+                return Err(format!("referenced type '{name}' is inaccessible"));
+            }
             let open = module
                 .import_foreign_type(
                     &TypeDefOrRef::TypeDef(entry.clone()),
@@ -1987,10 +2137,14 @@ fn emit(
             ));
         }
         let entry = module.add_type(TypeDef::new(
-            if decl.is_interface {
-                TypeAttributes::Public | TypeAttributes::Interface | TypeAttributes::Abstract
+            (if decl.is_public {
+                TypeAttributes::Public
             } else {
-                TypeAttributes::Public | TypeAttributes::BeforeFieldInit
+                TypeAttributes::NotPublic
+            }) | if decl.is_interface {
+                TypeAttributes::Interface | TypeAttributes::Abstract
+            } else {
+                TypeAttributes::BeforeFieldInit
             },
             &decl.namespace,
             &decl.name,
@@ -2109,11 +2263,12 @@ fn emit(
         for field in &decl.fields {
             let signature = resolve_type(&field.ty, &types, &externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
-            let flags = if field.is_static {
-                FieldFlags::Public | FieldFlags::Static
-            } else {
-                FieldFlags::Public
-            };
+            let flags = field.visibility.field_flags()
+                | if field.is_static {
+                    FieldFlags::Static
+                } else {
+                    FieldFlags::empty()
+                };
             let entry = TypeDef::add_field(
                 &ty,
                 Field::new(flags, &field.name, FieldSig { ty: signature }),
@@ -2151,6 +2306,7 @@ fn emit(
                 if !effective[index].1.is_empty()
                     && !method.is_static
                     && !method.is_ctor
+                    && method.visibility == Visibility::Public
                     && method.virtual_kind == VirtualKind::None
                 {
                     // Implicit interface implementations must be virtual and final.
@@ -2161,7 +2317,7 @@ fn emit(
             };
             let (flags, name, signature) = if method.is_ctor {
                 (
-                    MethodFlags::Public
+                    method.visibility.method_flags()
                         | MethodFlags::HideBySig
                         | MethodFlags::SpecialName
                         | MethodFlags::RTSpecialName,
@@ -2170,13 +2326,13 @@ fn emit(
                 )
             } else if method.is_static {
                 (
-                    MethodFlags::Public | MethodFlags::Static | MethodFlags::HideBySig,
+                    method.visibility.method_flags() | MethodFlags::Static | MethodFlags::HideBySig,
                     method.name.clone(),
                     MethodSig::new_static(return_signature, params),
                 )
             } else {
                 (
-                    MethodFlags::Public | MethodFlags::HideBySig | virtual_flags,
+                    method.visibility.method_flags() | MethodFlags::HideBySig | virtual_flags,
                     method.name.clone(),
                     MethodSig::new_instance(return_signature, params),
                 )
@@ -2254,14 +2410,13 @@ fn emit(
                 getter: None,
                 setter: None,
             };
-            let extra = if property.is_static {
-                MethodFlags::Public
-                    | MethodFlags::Static
-                    | MethodFlags::HideBySig
-                    | MethodFlags::SpecialName
-            } else {
-                MethodFlags::Public | MethodFlags::HideBySig | MethodFlags::SpecialName
-            };
+            let extra = MethodFlags::HideBySig
+                | MethodFlags::SpecialName
+                | if property.is_static {
+                    MethodFlags::Static
+                } else {
+                    MethodFlags::empty()
+                };
             if property.has_getter {
                 let signature = if property.is_static {
                     MethodSig::new_static(signature.clone(), vec![])
@@ -2270,8 +2425,16 @@ fn emit(
                 };
                 let entry = TypeDef::add_method(
                     &ty,
-                    Method::new(extra, format!("get_{}", property.name), signature)
-                        .with_body(Emitter::new().finish()),
+                    Method::new(
+                        extra
+                            | property
+                                .getter_visibility
+                                .unwrap_or(property.visibility)
+                                .method_flags(),
+                        format!("get_{}", property.name),
+                        signature,
+                    )
+                    .with_body(Emitter::new().finish()),
                 );
                 property_symbol.getter = Some(entry.clone());
                 jobs.push((index, entry, Job::Getter(property_index)));
@@ -2284,8 +2447,16 @@ fn emit(
                 };
                 let entry = TypeDef::add_method(
                     &ty,
-                    Method::new(extra, format!("set_{}", property.name), signature)
-                        .with_body(Emitter::new().finish()),
+                    Method::new(
+                        extra
+                            | property
+                                .setter_visibility
+                                .unwrap_or(property.visibility)
+                                .method_flags(),
+                        format!("set_{}", property.name),
+                        signature,
+                    )
+                    .with_body(Emitter::new().finish()),
                 );
                 entry.get_mut().params = vec![Entry::new(Param::new(1, "value"))];
                 property_symbol.setter = Some(entry.clone());
@@ -2567,6 +2738,103 @@ struct FnEmitter<'a> {
 impl<'a> FnEmitter<'a> {
     fn error(&self, message: impl Into<String>) -> CompileError {
         CompileError::new(&self.file, &self.source, self.offset, message)
+    }
+
+    fn require_member_access(
+        &self,
+        access: u16,
+        owner: &str,
+        local: bool,
+        receiver: Option<&str>,
+        is_static: bool,
+        name: &str,
+    ) -> Result<(), CompileError> {
+        let owner_short = owner.rsplit('.').next().unwrap_or(owner);
+        let same_type = local && owner_short == self.current;
+        if access == 6
+            || (local && matches!(access, 3 | 5))
+            || (same_type && (1..=6).contains(&access))
+        {
+            return Ok(());
+        }
+        let derived = same_type
+            || self.assignable(
+                &Ty::Class(self.current.clone()),
+                &Ty::Class(owner.to_string()),
+            );
+        let receiver_allowed = is_static
+            || receiver.is_none_or(|ty| {
+                self.assignable(&Ty::Class(ty.to_string()), &Ty::Class(self.current.clone()))
+            });
+        let family = derived && receiver_allowed;
+        let allowed = match access {
+            6 => true,
+            1 => same_type,
+            3 => local,
+            4 => family,
+            5 => local || family,
+            2 => local && family,
+            _ => false,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(self.error(format!("member '{owner}.{name}' is inaccessible")))
+        }
+    }
+
+    fn require_method_access(
+        &self,
+        method: &Entry<Method>,
+        local: bool,
+        receiver: Option<&str>,
+    ) -> Result<(), CompileError> {
+        let method = method.get();
+        let owner = method
+            .declaring_type
+            .upgrade()
+            .ok_or_else(|| self.error(format!("method '{}' has no declaring type", method.name)))?;
+        if !local && !owner.get().is_visible() {
+            return Err(self.error(format!(
+                "referenced type '{}' is inaccessible",
+                owner.get().full_name()
+            )));
+        }
+        self.require_member_access(
+            (method.flags & MethodFlags::MemberAccessMask).bits(),
+            &owner.get().full_name(),
+            local,
+            receiver,
+            method.flags.contains(MethodFlags::Static),
+            &method.name,
+        )
+    }
+
+    fn require_field_access(
+        &self,
+        field: &Entry<Field>,
+        local: bool,
+        receiver: Option<&str>,
+    ) -> Result<(), CompileError> {
+        let field = field.get();
+        let owner = field
+            .declaring_type
+            .upgrade()
+            .ok_or_else(|| self.error(format!("field '{}' has no declaring type", field.name)))?;
+        if !local && !owner.get().is_visible() {
+            return Err(self.error(format!(
+                "referenced type '{}' is inaccessible",
+                owner.get().full_name()
+            )));
+        }
+        self.require_member_access(
+            (field.flags & FieldFlags::FieldAccessMask).bits(),
+            &owner.get().full_name(),
+            local,
+            receiver,
+            field.flags.contains(FieldFlags::Static),
+            &field.name,
+        )
     }
 
     fn argument_index(&self, position: usize) -> u16 {
@@ -3008,6 +3276,7 @@ impl<'a> FnEmitter<'a> {
                     return Err(self.error("compound assignment requires a class instance"));
                 };
                 if let Some(field) = self.field_symbol(&type_name, name) {
+                    self.require_field_access(&field.entry, true, Some(&type_name))?;
                     self.validate_compound(&field.ty, op)?;
                     self.emitter.dup();
                     self.emitter.emit(Instruction::new(
@@ -3038,6 +3307,8 @@ impl<'a> FnEmitter<'a> {
                 else {
                     return Err(self.error(format!("property '{name}' needs a getter and setter")));
                 };
+                self.require_method_access(&getter, true, Some(&type_name))?;
+                self.require_method_access(&setter, true, Some(&type_name))?;
                 self.emitter.dup();
                 self.emitter.callvirt(getter);
                 let rhs = self.expr(value)?;
@@ -3057,6 +3328,7 @@ impl<'a> FnEmitter<'a> {
                     return Err(self.error(format!("type {target_type:?} has no fields")));
                 };
                 if let Some(field) = self.field_symbol(&type_name, name) {
+                    self.require_field_access(&field.entry, true, Some(&type_name))?;
                     if field.is_static {
                         return Err(self.error(format!("'{type_name}.{name}' is static")));
                     }
@@ -3086,7 +3358,9 @@ impl<'a> FnEmitter<'a> {
                             let method = entry.get();
                             (method.flags, method.signature.clone())
                         };
-                        if flags & MethodFlags::MemberAccessMask != MethodFlags::Public
+                        if self
+                            .require_method_access(&entry, false, Some(&type_name))
+                            .is_err()
                             || flags.contains(MethodFlags::Static)
                             || !flags.contains(MethodFlags::SpecialName)
                         {
@@ -3114,6 +3388,7 @@ impl<'a> FnEmitter<'a> {
                 let Some(setter) = setter else {
                     return Err(self.error(format!("property '{type_name}.{name}' has no setter")));
                 };
+                self.require_method_access(&setter, true, Some(&type_name))?;
                 let actual = self.expr(value)?;
                 self.convert_assignable(&actual, &property_ty, &format!("assignment to '{name}'"))
                     .map_err(|message| self.error(message))?;
@@ -3479,6 +3754,7 @@ impl<'a> FnEmitter<'a> {
                     "base '{base_name}' has no constructor with {arity} argument(s)"
                 )));
             };
+            self.require_method_access(&ctor.entry, true, None)?;
             if let Some(args) = args {
                 for (index, argument) in args.iter().enumerate() {
                     let actual = self.expr(argument)?;
@@ -3502,6 +3778,7 @@ impl<'a> FnEmitter<'a> {
             return Ok(());
         }
         if let Some((index, entry)) = self.externals.method(&base_name, ".ctor", arity) {
+            self.require_method_access(&entry, false, None)?;
             let signature = {
                 let guard = entry.get();
                 guard.signature.clone()
@@ -3790,6 +4067,7 @@ impl<'a> FnEmitter<'a> {
                             args.len()
                         )));
                     };
+                    self.require_method_access(&constructor.entry, true, Some(type_name))?;
                     self.push_arguments(args, &constructor.params, "argument")?;
                     self.emitter.newobj(constructor.entry);
                     self.apply_initializer(type_name, fields)?;
@@ -3941,6 +4219,7 @@ impl<'a> FnEmitter<'a> {
                 let Some(getter) = property.getter.clone() else {
                     return Err(self.error(format!("property '{type_name}.{name}' has no getter")));
                 };
+                self.require_method_access(&getter, true, None)?;
                 let ty = property.ty.clone();
                 self.emitter.call(getter);
                 return Ok(ty);
@@ -3967,6 +4246,7 @@ impl<'a> FnEmitter<'a> {
             return Err(self.error(format!("type {target_type:?} has no members")));
         };
         if let Some(field) = self.field_symbol(&type_name, name) {
+            self.require_field_access(&field.entry, true, Some(&type_name))?;
             if field.is_static {
                 return Err(self.error(format!("'{type_name}.{name}' is static")));
             }
@@ -3982,6 +4262,10 @@ impl<'a> FnEmitter<'a> {
             .as_deref()
             .and_then(|base| self.externals.field_in_chain(base, name));
         if let Some((index, entry)) = external_field {
+            self.require_field_access(&entry, false, Some(&type_name))?;
+            if entry.get().flags.contains(FieldFlags::Static) {
+                return Err(self.error(format!("'{type_name}.{name}' is static")));
+            }
             let signature = {
                 let guard = entry.get();
                 guard.signature.clone()
@@ -4013,6 +4297,14 @@ impl<'a> FnEmitter<'a> {
                 self.externals
                     .method_in_chain(&getter_owner, &getter_name, 0)
             {
+                self.require_method_access(&entry, false, Some(&type_name))?;
+                let flags = entry.get().flags;
+                if flags.contains(MethodFlags::Static) || !flags.contains(MethodFlags::SpecialName)
+                {
+                    return Err(self.error(format!(
+                        "property '{type_name}.{name}' has no accessible instance getter"
+                    )));
+                }
                 let signature = {
                     let guard = entry.get();
                     guard.signature.clone()
@@ -4032,6 +4324,7 @@ impl<'a> FnEmitter<'a> {
         let Some(getter) = getter else {
             return Err(self.error(format!("property '{type_name}.{name}' has no getter")));
         };
+        self.require_method_access(&getter, true, Some(&type_name))?;
         self.emitter.callvirt(getter);
         Ok(ty)
     }
@@ -4045,6 +4338,7 @@ impl<'a> FnEmitter<'a> {
     ) -> Result<(), CompileError> {
         for (name, value) in fields {
             if let Some(field) = self.field_symbol(type_name, name) {
+                self.require_field_access(&field.entry, true, Some(type_name))?;
                 if field.is_static {
                     return Err(self.error(format!("'{name}' is static")));
                 }
@@ -4069,6 +4363,7 @@ impl<'a> FnEmitter<'a> {
             let Some(setter) = property.setter else {
                 return Err(self.error(format!("property '{name}' has no setter")));
             };
+            self.require_method_access(&setter, true, Some(type_name))?;
             self.emitter.dup();
             let actual = self.expr(value)?;
             self.convert_assignable(&actual, &property.ty, "initializer")
@@ -4293,6 +4588,7 @@ impl<'a> FnEmitter<'a> {
                 };
                 let short = base.rsplit('.').next().unwrap_or(&base).to_string();
                 if let Some(method) = self.inherited_method(&short, name, args.len()) {
+                    self.require_method_access(&method.entry, true, None)?;
                     self.emitter.ldarg(0);
                     self.push_arguments(args, &method.params, "argument")?;
                     // `base.M()` binds the base implementation, so this is a
@@ -4303,6 +4599,10 @@ impl<'a> FnEmitter<'a> {
                 if let Some((index, entry)) =
                     self.externals.method_in_chain(&base, name, args.len())
                 {
+                    self.require_method_access(&entry, false, None)?;
+                    if entry.get().flags.contains(MethodFlags::Static) {
+                        return Err(self.error(format!("'{base}.{name}' is static")));
+                    }
                     let signature = {
                         let guard = entry.get();
                         guard.signature.clone()
@@ -4384,11 +4684,16 @@ impl<'a> FnEmitter<'a> {
                 return Err(self.error(format!("type {receiver_type:?} has no methods")));
             };
             if let Some(method) = self.inherited_method(&type_name, name, args.len()) {
+                self.require_method_access(&method.entry, true, Some(&type_name))?;
                 self.push_arguments(args, &method.params, "argument")?;
                 self.emitter.callvirt(method.entry);
                 return Ok(method.ret);
             }
             if let Some((index, entry)) = self.externals.method(&type_name, name, args.len()) {
+                self.require_method_access(&entry, false, Some(&type_name))?;
+                if entry.get().flags.contains(MethodFlags::Static) {
+                    return Err(self.error(format!("'{type_name}.{name}' is static")));
+                }
                 let signature = {
                     let guard = entry.get();
                     guard.signature.clone()
@@ -4493,11 +4798,16 @@ impl<'a> FnEmitter<'a> {
             .unwrap_or(type_name)
             .to_string();
         if let Some(method) = self.method_symbol(&short, name, args.len(), true) {
+            self.require_method_access(&method.entry, true, None)?;
             self.push_arguments(args, &method.params, "argument")?;
             self.emitter.call(method.entry);
             return Ok(method.ret);
         }
         if let Some((index, entry)) = self.externals.method(type_name, name, args.len()) {
+            self.require_method_access(&entry, false, None)?;
+            if !entry.get().flags.contains(MethodFlags::Static) {
+                return Err(self.error(format!("'{type_name}.{name}' is an instance method")));
+            }
             let signature = {
                 let guard = entry.get();
                 guard.signature.clone()
@@ -4545,6 +4855,7 @@ impl<'a> FnEmitter<'a> {
                 "no member '{member}' with {arity} parameter(s) on '{full_name}'"
             )));
         };
+        self.require_method_access(&method_entry, false, Some(type_name))?;
         let signature = {
             let guard = method_entry.get();
             guard.signature.clone()
