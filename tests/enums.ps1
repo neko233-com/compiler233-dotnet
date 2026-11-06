@@ -43,6 +43,11 @@ foreach ($invalid in @(
     'enum E { A } enum E { B }',
     'enum E { A } class C { int F(E value) { return value; } }',
     'enum E { A } enum F { A } class C { E M() { return F.A; } }',
+    'enum Hidden { A } public class C { public Hidden M() { return Hidden.A; } }',
+    'enum Hidden { A } public class C { protected Hidden M() { return Hidden.A; } }',
+    'enum Hidden { A } public class C { public Hidden[] Field; }',
+    'enum Hidden { A } public class C { public void M(Hidden value) { } }',
+    'enum Hidden { A } public class C { public Hidden Property { get; set; } }',
     'enum E { A } class C { E M(int value) { return value; } }',
     'enum E { A } class C { E M() { return 1; } }',
     'enum E : uint { Max = 4294967295U } class C { int M() { return (int)E.Max; } }',
@@ -70,4 +75,19 @@ foreach ($unsupported in @(
     }
 }
 Write-Output 'Unsupported enum attributes rejected; previous outputs preserved.'
+[IO.File]::WriteAllText($bad, 'public class Consumer { public static EnumFixture.Direction Echo(EnumFixture.Direction value) { return value; } }')
+$null = & $binary csc $bad "-reference:$reference" "-out:$output" 2>&1
+if ($LASTEXITCODE -ne 1) { throw 'Unsupported external enum was accepted as a reference type.' }
+if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before -or
+    (Get-FileHash -Algorithm SHA256 $reference).Hash -ne $referenceBefore) {
+    throw 'Unsupported external enum changed a previous output'
+}
+Write-Output 'Unsupported external enum rejected; previous outputs preserved.'
+$valid = Join-Path $work 'InternalVisibility.cs'
+$validOutput = Join-Path $work 'InternalVisibility.dll'
+[IO.File]::WriteAllText($valid, 'enum Hidden { A = 4 } internal class InternalClass { public static Hidden Value() { return Hidden.A; } } public class PublicClass { internal Hidden Field; private protected Hidden Access() { return Hidden.A; } public static int Run() { return (int)InternalClass.Value(); } }')
+& $binary csc $valid "-out:$validOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Legal internal enum visibility was rejected.' }
+& dotnet $enumOracle --invoke $validOutput 'PublicClass' 'Run' '4'
+if ($LASTEXITCODE -ne 0) { throw 'Legal internal enum visibility failed at runtime.' }
 exit 0

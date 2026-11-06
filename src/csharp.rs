@@ -3237,6 +3237,16 @@ fn resolve_type(
                     if !entry.get().is_visible() {
                         return Err(format!("referenced type '{name}' is inaccessible"));
                     }
+                    if entry
+                        .get()
+                        .extends
+                        .as_ref()
+                        .is_some_and(|base| base.full_name() == "System.Enum")
+                    {
+                        return Err(format!(
+                            "referenced enum type '{name}' is not supported yet"
+                        ));
+                    }
                     let imported = module
                         .import_foreign_type(
                             &TypeDefOrRef::TypeDef(entry.clone()),
@@ -3275,12 +3285,78 @@ fn resolve_type(
     })
 }
 
+fn less_visible_enum<'a>(ty: &'a Ty, enums: &EnumValues) -> Option<&'a str> {
+    match ty {
+        Ty::Enum(name, _) => enums
+            .get(name)
+            .filter(|info| !info.is_public)
+            .map(|_| name.as_str()),
+        Ty::Array(element) => less_visible_enum(element, enums),
+        Ty::Generic(_, arguments) => arguments
+            .iter()
+            .find_map(|argument| less_visible_enum(argument, enums)),
+        _ => None,
+    }
+}
+
+fn validate_enum_api_accessibility(
+    program: &Program,
+    sources: &[(String, String)],
+) -> Result<(), CompileError> {
+    for decl in &program.types {
+        if !decl.is_public {
+            continue;
+        }
+        let visible = |visibility| {
+            matches!(
+                visibility,
+                Visibility::Public | Visibility::Protected | Visibility::ProtectedInternal
+            )
+        };
+        let check = |ty: &Ty, description: &str| {
+            if let Some(name) = less_visible_enum(ty, &program.enums) {
+                Err(type_error(
+                    decl,
+                    sources,
+                    format!("enum '{name}' is less accessible than {description}"),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        for field in &decl.fields {
+            if visible(field.visibility) {
+                check(&field.ty, &format!("field '{}.{}'", decl.name, field.name))?;
+            }
+        }
+        for property in &decl.properties {
+            if visible(property.visibility) {
+                check(
+                    &property.ty,
+                    &format!("property '{}.{}'", decl.name, property.name),
+                )?;
+            }
+        }
+        for method in &decl.methods {
+            if visible(method.visibility) {
+                let description = format!("method '{}.{}'", decl.name, method.name);
+                check(&method.ret, &description)?;
+                for (parameter, _) in &method.params {
+                    check(parameter, &description)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn emit(
     program: &Program,
     assembly_name: &str,
     sources: &[(String, String)],
     references: &[String],
 ) -> Result<Vec<u8>, CompileError> {
+    validate_enum_api_accessibility(program, sources)?;
     let externals = Externals::load(references, sources)?;
     if program.types.is_empty() && program.enums.is_empty() {
         return Err(CompileError {
