@@ -22,6 +22,7 @@ use hao::{
     },
 };
 
+use crate::emitter::TrackedEmitter;
 use crate::syntax::{self, SyntaxError};
 
 #[derive(Debug, Clone)]
@@ -218,6 +219,7 @@ struct Block {
 struct CatchClause {
     ty: Option<Ty>,
     name: Option<String>,
+    filter: Option<Expr>,
     body: Block,
 }
 
@@ -1352,10 +1354,9 @@ impl<'a> Parser<'a> {
                 let body = self.parse_block()?;
                 let mut catches = Vec::new();
                 while self.eat("catch") {
-                    if catches
-                        .last()
-                        .is_some_and(|clause: &CatchClause| clause.ty.is_none())
-                    {
+                    if catches.last().is_some_and(|clause: &CatchClause| {
+                        clause.ty.is_none() && clause.filter.is_none()
+                    }) {
                         return Err(self.error("a general catch must be the last catch clause"));
                     }
                     let (ty, name) = if self.eat("(") {
@@ -1370,11 +1371,21 @@ impl<'a> Parser<'a> {
                     } else {
                         (None, None)
                     };
-                    if self.check("when") {
-                        return Err(self.error("exception filters are not supported yet"));
-                    }
+                    let filter = if self.eat("when") {
+                        self.expect("(")?;
+                        let condition = self.parse_expression()?;
+                        self.expect(")")?;
+                        Some(condition)
+                    } else {
+                        None
+                    };
                     let body = self.parse_block()?;
-                    catches.push(CatchClause { ty, name, body });
+                    catches.push(CatchClause {
+                        ty,
+                        name,
+                        filter,
+                        body,
+                    });
                 }
                 let finally = if self.eat("finally") {
                     Some(self.parse_block()?)
@@ -2747,7 +2758,7 @@ fn emit_body(
         finally_depth: 0,
         catches: Vec::new(),
         return_target: None,
-        emitter: Emitter::new(),
+        emitter: TrackedEmitter::new(),
         file: decl.file.clone(),
         source,
         offset: decl.offset,
@@ -2764,7 +2775,10 @@ fn emit_body(
                 .collect();
             let Some(body) = &method.body else {
                 if decl.is_interface {
-                    return Ok(context.emitter.finish());
+                    return context
+                        .emitter
+                        .finish()
+                        .map_err(|message| type_error(decl, sources, message));
                 }
                 return Err(context.error(format!(
                     "method '{}' has no body; extern methods are not supported",
@@ -2862,7 +2876,10 @@ fn emit_body(
         }
         context.emitter.ret();
     }
-    Ok(context.emitter.finish())
+    context
+        .emitter
+        .finish()
+        .map_err(|message| type_error(decl, sources, message))
 }
 
 #[derive(Clone, Copy)]
@@ -2890,7 +2907,7 @@ struct FnEmitter<'a> {
     finally_depth: usize,
     catches: Vec<usize>,
     return_target: Option<(EmitLabel, Option<u16>)>,
-    emitter: Emitter,
+    emitter: TrackedEmitter,
     file: String,
     source: String,
     offset: usize,
@@ -3294,7 +3311,9 @@ impl<'a> FnEmitter<'a> {
                         "catch for '{name}' is unreachable after a base exception"
                     )));
                 }
-                previous.push(name);
+                if clause.filter.is_none() {
+                    previous.push(name);
+                }
             }
         }
         let outer_start = self.emitter.label();
@@ -3320,8 +3339,7 @@ impl<'a> FnEmitter<'a> {
             };
             let start = self.emitter.label();
             let end = self.emitter.label();
-            self.emitter.mark(start);
-            let previous = if let Some(name) = &clause.name {
+            let binding = if let Some(name) = &clause.name {
                 if self.locals.contains_key(name)
                     || self.params.iter().any(|(parameter, _)| parameter == name)
                 {
@@ -3333,18 +3351,56 @@ impl<'a> FnEmitter<'a> {
                 let local = self
                     .emitter
                     .declare_local(TypeSig::Class(reference.clone()));
-                self.emitter.stloc(local);
-                Some((name.clone(), self.locals.insert(name.clone(), (local, ty))))
+                let previous = self.locals.insert(name.clone(), (local, ty));
+                Some((name.clone(), local, previous))
             } else {
-                self.emitter.pop();
                 None
             };
+            let filter_start = if let Some(filter) = &clause.filter {
+                let filter_start = self.emitter.position();
+                let filter_end = self.emitter.label();
+                if clause.ty.is_some() {
+                    let token = match &reference {
+                        TypeDefOrRef::TypeDef(entry) => MemberToken::TypeDef(entry.clone()),
+                        TypeDefOrRef::TypeRef(entry) => MemberToken::TypeRef(entry.clone()),
+                        TypeDefOrRef::TypeSpec(entry) => MemberToken::TypeSpec(entry.clone()),
+                    };
+                    let matches = self.emitter.label();
+                    self.emitter
+                        .emit(Instruction::new(OpCode::Isinst, Operand::Token(token)));
+                    self.emitter.dup().branch(OpCode::Brtrue, matches);
+                    self.emitter.pop().ldc_i4(0).branch(OpCode::Br, filter_end);
+                    self.emitter.mark(matches);
+                }
+                if let Some((_, local, _)) = &binding {
+                    self.emitter.stloc(*local);
+                } else {
+                    self.emitter.pop();
+                }
+                let actual = self.expr(filter)?;
+                self.convert_assignable(&actual, &Ty::Bool, "exception filter")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.mark(filter_end);
+                self.emitter.op(OpCode::Endfilter);
+                Some(filter_start)
+            } else {
+                None
+            };
+            let handler_position = self.emitter.position();
+            self.emitter.mark(start);
+            if filter_start.is_some() {
+                self.emitter.pop();
+            } else if let Some((_, local, _)) = &binding {
+                self.emitter.stloc(*local);
+            } else {
+                self.emitter.pop();
+            }
             self.protected_depth += 1;
             self.catches.push(self.finally_depth);
             self.scoped_block(&clause.body)?;
             self.catches.pop();
             self.protected_depth -= 1;
-            if let Some((name, prior)) = previous {
+            if let Some((name, _, prior)) = binding {
                 if let Some(prior) = prior {
                     self.locals.insert(name, prior);
                 } else {
@@ -3353,8 +3409,19 @@ impl<'a> FnEmitter<'a> {
             }
             self.emitter.branch(OpCode::Leave, after_catches);
             self.emitter.mark(end);
-            self.emitter
-                .exception_handler(Some(reference), inner_start, inner_end, start, end);
+            if let Some(filter_start) = filter_start {
+                self.emitter.filter_handler(
+                    inner_start,
+                    inner_end,
+                    filter_start,
+                    start,
+                    end,
+                    handler_position,
+                );
+            } else {
+                self.emitter
+                    .exception_handler(Some(reference), inner_start, inner_end, start, end);
+            }
         }
         self.emitter.mark(after_catches);
         if let Some(finally) = finally {

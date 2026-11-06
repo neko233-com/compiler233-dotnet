@@ -7,6 +7,7 @@ use tree_sitter::{Node, Parser, Tree};
 pub mod compile;
 pub mod csc;
 pub mod csharp;
+mod emitter;
 pub mod frontend;
 pub mod reference;
 pub mod subset;

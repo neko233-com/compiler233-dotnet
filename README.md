@@ -124,7 +124,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 表达式体：在现有表达式和语句子集内支持方法、构造函数、只读属性及 `get`/`set` 访问器的 `=>` 写法；接口成员的表达式体和更广的表达式仍未覆盖。
 - 基础类型实例调用：支持 `int`、`float`、`bool`、`string` 和 `object` 的无参 `ToString` / `GetHashCode`，以及 `int`、`float` 的 `ToString(string)`；其他重载尚未覆盖。
 - 数值：支持部分 `int` 到 `float` 的隐式转换与混合运算；测试覆盖舍入、求值顺序和 `NaN` 的大小比较。完整数值类型与转换规则仍未实现。
-- 异常处理：支持部分 `try`/`catch`/`finally`、`throw` 和重新抛出，并测试嵌套异常及跨保护区的返回、`break`、`continue`；异常筛选器和完整异常类型解析仍未覆盖。
+- 异常处理：支持部分 `try`/`catch`/`finally`、`throw`、重新抛出及 `catch ... when` 筛选器；测试覆盖筛选器在栈展开前执行、筛选器抛异常、变量修改、嵌套异常及跨保护区的返回、`break`、`continue`。完整异常类型解析和语言语义仍未覆盖。
 - 数组：一维数组构造、`a[i]` 读写、`a.Length` 和 `foreach` 遍历；`int`、`float`、`bool`、`string`、`object` 的元素指令与部分边界异常有运行时对照测试。
 - 继承：基类（本地或引用程序集）、`virtual`/`override` 虚调用、`: base(args)` 基类构造、基类方法继承与基类-派生类赋值兼容
 - 接口：`interface` 声明（抽象方法、无方法体）、类实现接口（`InterfaceImpl` + 隐式实现标记为 `virtual final newslot`）、接口类型变量与 `callvirt` 派发
@@ -137,9 +137,9 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 泛型类型实例：`List<int>` 等引用程序集里的泛型类型，字段/局部/参数签名用`GenericInst`，成员通过`TypeSpec`父的 MemberRef 调用（`list.Add(x)`、`list.Count`），`new List<int>()` 可用；泛型**类型定义**仍不支持
 - 调用：本程序集的静态/实例方法与构造函数；BCL 的 `System.Math.Max/Min/Abs`、`System.Convert.ToString`、`System.String.Concat`、`System.Console.Write/WriteLine`（按需添加 `System.Console` 程序集引用）
 
-尚未支持、会被明确拒绝而不是静默降级：泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、异常筛选器、`async`/`switch`。
+尚未支持、会被明确拒绝而不是静默降级：泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、`async`/`switch`。
 
-验收方式：`./tests/compile.ps1` 用 Roslyn 编译同一批源码，分别加载两个程序集并执行 `Demo.Program.Run()`，结果不一致即失败。
+验收方式：`./tests/compile.ps1` 用 Roslyn 编译同一批源码并比较运行结果；`./tests/exceptions.ps1` 专门比较异常与筛选器行为、无效输入和引用程序集下游加载。
 
 ## 发布
 

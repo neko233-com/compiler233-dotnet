@@ -16,7 +16,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Exception fixture failed to compile' }
 $manifest = Join-Path $work 'manifest.txt'
 [IO.File]::WriteAllLines($manifest, @($source))
 $oracle = Join-Path $root 'tests/CompileOracle/bin/Release/net10.0/CompileOracle.dll'
-foreach ($method in @('Catch', 'Multiple', 'GeneralCatch', 'ReturnFinally', 'RethrowFinally', 'LoopLeave', 'LoopInsideTry', 'Custom', 'CatchVariable', 'FinallyOnUnhandled', 'AllPathsReturn', 'FinallyThrows', 'VoidFinally', 'StringFinally', 'BoolFinally', 'NestedRethrow')) {
+foreach ($method in @('Catch', 'Multiple', 'GeneralCatch', 'ReturnFinally', 'RethrowFinally', 'LoopLeave', 'LoopInsideTry', 'Custom', 'CatchVariable', 'FinallyOnUnhandled', 'AllPathsReturn', 'FinallyThrows', 'VoidFinally', 'StringFinally', 'BoolFinally', 'NestedRethrow', 'FilterBeforeFinally', 'FilterTrue', 'FilterTypeMismatch', 'FilterThrows', 'FilterMutation', 'FilterGeneral', 'FilterMultiple', 'FilterTrueBeforeFinally', 'FilterWithFinallyAndRethrow', 'FilterGeneralBeforeTyped', 'FilterCustomException')) {
     $result = & dotnet $oracle $manifest $output 'ExceptionFixture.Runner' $method 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "Runtime mismatch for $method`: $result" }
     Write-Output $result.Trim()
@@ -41,6 +41,7 @@ foreach ($invalid in @(
     'class C { void F() { throw 1; } }',
     'class C { void F() { try {} finally { return; } } }',
     'class C { void F() { try {} catch (int) {} } }',
+    'using System; class C { void F() { try {} catch (Exception e) when (1) {} } }',
     'using System; class C { void F() { try {} catch (Exception) {} catch (ArgumentException) {} } }',
     'class C { int F() { try { int hidden = 1; } finally {} return hidden; } }',
     'class C { void F() { try { int hidden = 1; } finally { int value = hidden; } } }',
@@ -54,12 +55,5 @@ foreach ($invalid in @(
     if ($LASTEXITCODE -ne 1) { throw "Invalid exception code was accepted: $invalid" }
     if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Failed compilation changed previous output' }
 }
-$unsupported = 'using System; class C { void F() { try {} catch (Exception e) when (e != null) {} } }'
-[IO.File]::WriteAllText($bad, $unsupported)
-& dotnet $diagnosticOracle --probe $bad $output accept
-if ($LASTEXITCODE -ne 0) { throw 'Roslyn rejected the valid exception filter' }
-$filterDiagnostic = & $binary csc $bad "-out:$output" 2>&1 | Out-String
-if ($LASTEXITCODE -ne 1 -or $filterDiagnostic -notmatch 'exception filters are not supported') { throw "Unsupported filter was not reported: $filterDiagnostic" }
-if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Unsupported filter changed previous output' }
 Write-Output 'Invalid exception code rejected by Roslyn and compiler233; previous output preserved.'
 exit 0

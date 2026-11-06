@@ -4,6 +4,8 @@ namespace ExceptionFixture {
     public static class Runner {
         static int state;
         static int Divide(int value) => 10 / value;
+        static bool Filter(int mark, bool result) { state = state * 10 + mark; return result; }
+        static bool BrokenFilter() { state = state * 10 + 1; return Divide(0) > 0; }
         public static int Catch() {
             int result = 0;
             try { result = Divide(0); }
@@ -89,6 +91,79 @@ namespace ExceptionFixture {
                 try { throw new ArgumentException(); }
                 catch (ArgumentException) { try { throw; } finally { state += 1; } }
             } catch (ArgumentException) { return state; }
+        }
+        public static int FilterBeforeFinally() {
+            state = 0;
+            try { try { throw new ArgumentException(); } finally { state = state * 10 + 2; } }
+            catch (ArgumentException error) when (Filter(1, false)) { state = 99; }
+            catch (ArgumentException) { state = state * 10 + 3; }
+            return state;
+        }
+        public static int FilterTrue() {
+            state = 0;
+            try { throw new ArgumentException(); }
+            catch (ArgumentException error) when (error != null && Filter(1, true)) { state = state * 10 + 2; }
+            return state;
+        }
+        public static int FilterTypeMismatch() {
+            state = 0;
+            try { throw new ArgumentException(); }
+            catch (DivideByZeroException error) when (Filter(1, true)) { state = 99; }
+            catch (ArgumentException) { state = state * 10 + 2; }
+            return state;
+        }
+        public static int FilterThrows() {
+            state = 0;
+            try { throw new ArgumentException(); }
+            catch (ArgumentException error) when (BrokenFilter()) { state = 99; }
+            catch (ArgumentException) { state = state * 10 + 2; }
+            return state;
+        }
+        public static int FilterMutation() {
+            try { throw new ArgumentException(); }
+            catch (Exception error) when ((error = null) == null) { if (error == null) return 4; }
+            return -1;
+        }
+        public static int FilterGeneral() {
+            state = 0;
+            try { throw new ArgumentException(); }
+            catch when (Filter(1, true)) { state = state * 10 + 2; }
+            return state;
+        }
+        public static int FilterMultiple() {
+            state = 0;
+            try { throw new ArgumentException(); }
+            catch (Exception error) when (Filter(1, false)) { state = 99; }
+            catch (ArgumentException error) when (Filter(2, true)) { state = state * 10 + 3; }
+            return state;
+        }
+        public static int FilterTrueBeforeFinally() {
+            state = 0;
+            try { try { throw new ArgumentException(); } finally { state = state * 10 + 2; } }
+            catch (ArgumentException) when (Filter(1, true)) { state = state * 10 + 3; }
+            return state;
+        }
+        public static int FilterWithFinallyAndRethrow() {
+            state = 0;
+            try {
+                try { throw new ArgumentException(); }
+                catch (ArgumentException) when (Filter(1, true)) { state = state * 10 + 2; throw; }
+                finally { state = state * 10 + 3; }
+            } catch (ArgumentException) { state = state * 10 + 4; }
+            return state;
+        }
+        public static int FilterGeneralBeforeTyped() {
+            state = 0;
+            try { throw new ArgumentException(); }
+            catch when (Filter(1, false)) { state = 99; }
+            catch (ArgumentException) { state = state * 10 + 2; }
+            return state;
+        }
+        public static int FilterCustomException() {
+            state = 0;
+            try { throw new CustomException(); }
+            catch (CustomException error) when (error != null && Filter(1, true)) { state = state * 10 + 2; }
+            return state;
         }
     }
 }
