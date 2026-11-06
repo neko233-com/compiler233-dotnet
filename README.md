@@ -131,15 +131,17 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 外部基类继承：`class X : System.Exception` 可编译，构造函数 `: base(args)`、继承的字段与属性（`get_X`）沿引用程序集的 `extends` 链解析
 - 静态/实例方法、参数，重载按参数个数解析
 - 语句：局部声明、赋值、`if/else`、`while`、`do ... while`、`for`、`return`、`break`/`continue`、`base.M(...)` 基类调用、块
+- `switch`：支持 `int`、`bool`、`string` 的字面量分支和 `default`，密集整数分支使用 CLR 跳转表；非字面量常量、模式匹配和直接写在分支中的局部声明尚未支持。
+- 普通字符串字面量支持常见字符转义、`\x`、`\u`、`\U` 和成对的 UTF-16 代理项；目前会拒绝包含未配对代理项的字面量。
 - 表达式：`int/float/bool/string/object` 与 `null` 字面量、`enum` 常量、算术与比较（含字符串/布尔相等、`== null`）、`&&/||` 短路、`??`、`?:` 三元、`(T)x` 转换与 `as`、`!`、`++`/`--`、`+=`/`-=`（含字段与属性）、字符串 `+` 拼接、赋值表达式、`string.Empty`/`int.MaxValue` 等预定义成员
 - 外部引用：`-reference:` 指定的程序集参与类型与方法解析（全名、唯一短名、`System.Text.Regex` 这类限定名），跨程序集静态/实例调用可用；`tests/compile.ps1` 会对 `System.Text.RegularExpressions` 与 Roslyn 构建的泛型库做真实对照
 - 泛型方法调用：`Foo<T>(...)` 通过 MethodSpec 实例化（外部程序集的方法），返回类型按实参替换`MVar`
 - 泛型类型实例：`List<int>` 等引用程序集里的泛型类型，字段/局部/参数签名用`GenericInst`，成员通过`TypeSpec`父的 MemberRef 调用（`list.Add(x)`、`list.Count`），`new List<int>()` 可用；泛型**类型定义**仍不支持
 - 调用：本程序集的静态/实例方法与构造函数；BCL 的 `System.Math.Max/Min/Abs`、`System.Convert.ToString`、`System.String.Concat`、`System.Console.Write/WriteLine`（按需添加 `System.Console` 程序集引用）
 
-尚未支持、会被明确拒绝而不是静默降级：泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、`async`/`switch`。
+尚未支持、会被明确拒绝而不是静默降级：泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、`async` 和 `switch` 模式匹配等扩展形式。
 
-验收方式：`./tests/compile.ps1` 用 Roslyn 编译同一批源码并比较运行结果；`./tests/exceptions.ps1` 专门比较异常与筛选器行为、无效输入和引用程序集下游加载；`./tests/loops.ps1` 对照 `do ... while` 的控制流与作用域。
+验收方式：`./tests/compile.ps1` 用 Roslyn 编译同一批源码并比较运行结果；`./tests/exceptions.ps1` 专门比较异常与筛选器行为、无效输入和引用程序集下游加载；`./tests/loops.ps1` 和 `./tests/switch.ps1` 对照循环、分支与异常控制流。
 
 ## 发布
 

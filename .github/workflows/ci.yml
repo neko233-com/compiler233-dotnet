@@ -57,6 +57,8 @@ jobs:
         shell: pwsh
       - run: ./tests/loops.ps1
         shell: pwsh
+      - run: ./tests/switch.ps1
+        shell: pwsh
       - run: ./tests/preprocessor.ps1
         shell: pwsh
       - run: ./tests/output-safety.ps1

@@ -223,6 +223,18 @@ struct CatchClause {
     body: Block,
 }
 
+#[derive(Debug)]
+struct SwitchSection {
+    labels: Vec<SwitchLabel>,
+    body: Block,
+}
+
+#[derive(Debug)]
+enum SwitchLabel {
+    Case(Expr),
+    Default,
+}
+
 fn block_terminates(block: &Block) -> bool {
     block
         .statements
@@ -244,8 +256,109 @@ fn block_terminates(block: &Block) -> bool {
                     || (block_terminates(body)
                         && catches.iter().all(|clause| block_terminates(&clause.body)))
             }
+            Stmt::Switch { sections, .. } => {
+                sections.iter().any(|section| {
+                    section
+                        .labels
+                        .iter()
+                        .any(|label| matches!(label, SwitchLabel::Default))
+                }) && sections.iter().all(|section| {
+                    block_terminates(&section.body) && !escapes_switch(&section.body, 0, 0)
+                })
+            }
             _ => false,
         })
+}
+
+fn escapes_switch(block: &Block, nested_breakables: usize, nested_loops: usize) -> bool {
+    block.statements.iter().any(|statement| match statement {
+        Stmt::Break => nested_breakables == 0,
+        Stmt::Continue => nested_loops == 0,
+        Stmt::Block(body) => escapes_switch(body, nested_breakables, nested_loops),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            escapes_switch(then_branch, nested_breakables, nested_loops)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|body| escapes_switch(body, nested_breakables, nested_loops))
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. } => {
+            escapes_switch(body, nested_breakables + 1, nested_loops + 1)
+        }
+        Stmt::Switch { sections, .. } => sections
+            .iter()
+            .any(|section| escapes_switch(&section.body, nested_breakables + 1, nested_loops)),
+        Stmt::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            escapes_switch(body, nested_breakables, nested_loops)
+                || catches
+                    .iter()
+                    .any(|clause| escapes_switch(&clause.body, nested_breakables, nested_loops))
+                || finally
+                    .as_ref()
+                    .is_some_and(|body| escapes_switch(body, nested_breakables, nested_loops))
+        }
+        _ => false,
+    })
+}
+
+fn switch_section_exits(block: &Block) -> bool {
+    block
+        .statements
+        .last()
+        .is_some_and(|statement| match statement {
+            Stmt::Break | Stmt::Continue | Stmt::Return(_) | Stmt::Throw(_) => true,
+            Stmt::Block(block) => switch_section_exits(block),
+            Stmt::If {
+                then_branch,
+                else_branch: Some(otherwise),
+                ..
+            } => switch_section_exits(then_branch) && switch_section_exits(otherwise),
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                finally.as_ref().is_some_and(switch_section_exits)
+                    || (switch_section_exits(body)
+                        && catches
+                            .iter()
+                            .all(|clause| switch_section_exits(&clause.body)))
+            }
+            Stmt::Switch { .. } => block_terminates(block),
+            _ => false,
+        })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SwitchConstant {
+    Int(i32),
+    Bool(bool),
+    String(String),
+    Null,
+}
+
+fn switch_constant(value: &Expr) -> Option<SwitchConstant> {
+    match value {
+        Expr::Int(value) => Some(SwitchConstant::Int(*value)),
+        Expr::Negate(value) => match value.as_ref() {
+            Expr::Int(value) => value.checked_neg().map(SwitchConstant::Int),
+            _ => None,
+        },
+        Expr::Bool(value) => Some(SwitchConstant::Bool(*value)),
+        Expr::Str(value) => Some(SwitchConstant::String(value.clone())),
+        Expr::Null => Some(SwitchConstant::Null),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -279,6 +392,10 @@ enum Stmt {
     DoWhile {
         body: Block,
         condition: Expr,
+    },
+    Switch {
+        value: Expr,
+        sections: Vec<SwitchSection>,
     },
     For {
         init: Option<Box<Stmt>>,
@@ -340,6 +457,7 @@ fn contains_do(block: &Block) -> bool {
                 || catches.iter().any(|clause| contains_do(&clause.body))
                 || finally.as_ref().is_some_and(contains_do)
         }
+        Stmt::Switch { sections, .. } => sections.iter().any(|section| contains_do(&section.body)),
         _ => false,
     })
 }
@@ -443,6 +561,11 @@ fn validate_do_scopes<'a>(
                 }
                 if let Some(body) = finally {
                     validate_do_scopes(body, params, ancestors, inside_do)?;
+                }
+            }
+            Stmt::Switch { sections, .. } => {
+                for section in sections {
+                    validate_do_scopes(&section.body, params, ancestors, inside_do)?;
                 }
             }
             _ => {}
@@ -1453,6 +1576,46 @@ impl<'a> Parser<'a> {
                 self.expect(";")?;
                 return Ok(Stmt::DoWhile { body, condition });
             }
+            "switch" => {
+                self.bump();
+                self.expect("(")?;
+                let value = self.parse_expression()?;
+                self.expect(")")?;
+                self.expect("{")?;
+                let mut sections = Vec::new();
+                while !self.check("}") && !self.at_end() {
+                    let mut labels = Vec::new();
+                    loop {
+                        if self.eat("case") {
+                            let value = self.parse_expression()?;
+                            self.expect(":")?;
+                            labels.push(SwitchLabel::Case(value));
+                        } else if self.eat("default") {
+                            self.expect(":")?;
+                            labels.push(SwitchLabel::Default);
+                        } else {
+                            break;
+                        }
+                    }
+                    if labels.is_empty() {
+                        return Err(self.error("a switch section requires a case or default label"));
+                    }
+                    let mut statements = Vec::new();
+                    while !self.check("case")
+                        && !self.check("default")
+                        && !self.check("}")
+                        && !self.at_end()
+                    {
+                        statements.push(self.parse_statement()?);
+                    }
+                    sections.push(SwitchSection {
+                        labels,
+                        body: Block { statements },
+                    });
+                }
+                self.expect("}")?;
+                return Ok(Stmt::Switch { value, sections });
+            }
             "for" => {
                 self.bump();
                 self.expect("(")?;
@@ -1578,8 +1741,8 @@ impl<'a> Parser<'a> {
                     body,
                 });
             }
-            "switch" | "case" | "default" | "goto" | "lock" | "using" | "yield" | "checked"
-            | "unchecked" | "fixed" | "unsafe" => {
+            "case" | "default" | "goto" | "lock" | "using" | "yield" | "checked" | "unchecked"
+            | "fixed" | "unsafe" => {
                 return Err(self.error(format!(
                     "'{}' statements are not supported by the bounded core yet",
                     self.text()
@@ -1837,6 +2000,14 @@ impl<'a> Parser<'a> {
         match self.text() {
             "-" => {
                 self.bump();
+                // This decimal literal is a special C# int constant when it
+                // is the direct operand of unary minus.
+                if self.token().kind == syntax::TokenKind::Number
+                    && self.text().replace('_', "") == "2147483648"
+                {
+                    self.bump();
+                    return Ok(Expr::Int(i32::MIN));
+                }
                 Ok(Expr::Negate(Box::new(self.parse_unary()?)))
             }
             "!" => {
@@ -2055,10 +2226,12 @@ impl<'a> Parser<'a> {
                 let text = self.text().to_string();
                 self.bump();
                 let cleaned = text.replace('_', "");
-                let is_float = cleaned.contains('.')
-                    || cleaned.contains('e')
-                    || cleaned.contains('E')
-                    || cleaned.ends_with(['f', 'F', 'd', 'D', 'm', 'M']);
+                let radix_integer = matches!(cleaned.get(..2), Some("0x" | "0X" | "0b" | "0B"));
+                let is_float = !radix_integer
+                    && (cleaned.contains('.')
+                        || cleaned.contains('e')
+                        || cleaned.contains('E')
+                        || cleaned.ends_with(['f', 'F', 'd', 'D', 'm', 'M']));
                 if is_float {
                     let numeric = cleaned.trim_end_matches(['f', 'F', 'd', 'D', 'm', 'M']);
                     let value = numeric.parse::<f32>().map_err(|_| {
@@ -2153,44 +2326,89 @@ impl<'a> Parser<'a> {
 }
 
 fn unquote(raw: &str) -> Result<String, CompileError> {
-    let body = raw
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .ok_or_else(|| CompileError {
+    fn error(message: &str) -> CompileError {
+        CompileError {
             file: String::new(),
             line: 1,
             column: 1,
-            message: "unsupported string literal".into(),
+            message: message.into(),
             syntax: true,
-        })?;
-    let mut value = String::with_capacity(body.len());
-    let mut characters = body.chars();
+        }
+    }
+    fn hex(
+        characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        minimum: usize,
+        maximum: usize,
+    ) -> Result<u32, CompileError> {
+        let mut value = 0u32;
+        let mut count = 0;
+        while count < maximum {
+            let Some(digit) = characters
+                .peek()
+                .and_then(|character| character.to_digit(16))
+            else {
+                break;
+            };
+            characters.next();
+            value = (value << 4) | digit;
+            count += 1;
+        }
+        if count < minimum {
+            return Err(error("invalid hexadecimal string escape"));
+        }
+        Ok(value)
+    }
+    let body = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or_else(|| error("unsupported string literal"))?;
+    if !body.contains('\\') {
+        return Ok(body.to_string());
+    }
+    let mut value = Vec::with_capacity(body.len());
+    let mut characters = body.chars().peekable();
     while let Some(character) = characters.next() {
         if character != '\\' {
-            value.push(character);
+            value.extend_from_slice(character.encode_utf16(&mut [0; 2]));
             continue;
         }
         let Some(escaped) = characters.next() else {
-            return Err(CompileError {
-                file: String::new(),
-                line: 1,
-                column: 1,
-                message: "unterminated escape sequence".into(),
-                syntax: true,
-            });
+            return Err(error("unterminated escape sequence"));
         };
-        value.push(match escaped {
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
-            '\\' => '\\',
-            '"' => '"',
-            '\'' => '\'',
-            '0' => '\0',
-            other => other,
-        });
+        match escaped {
+            'u' => value.push(hex(&mut characters, 4, 4)? as u16),
+            'x' => value.push(hex(&mut characters, 1, 4)? as u16),
+            'U' => {
+                let scalar = hex(&mut characters, 8, 8)?;
+                if scalar <= 0xffff {
+                    value.push(scalar as u16);
+                } else {
+                    let scalar = char::from_u32(scalar)
+                        .ok_or_else(|| error("invalid Unicode scalar in string escape"))?;
+                    value.extend_from_slice(scalar.encode_utf16(&mut [0; 2]));
+                }
+            }
+            _ => {
+                let decoded = match escaped {
+                    '0' => 0,
+                    'a' => 7,
+                    'b' => 8,
+                    'f' => 12,
+                    'n' => 10,
+                    'r' => 13,
+                    't' => 9,
+                    'v' => 11,
+                    '\\' => 92,
+                    '\'' => 39,
+                    '"' => 34,
+                    _ => return Err(error("invalid string escape sequence")),
+                };
+                value.push(decoded);
+            }
+        }
     }
-    Ok(value)
+    String::from_utf16(&value)
+        .map_err(|_| error("unpaired UTF-16 surrogate string literals are not supported yet"))
 }
 
 // ---------------------------------------------------------------- emission
@@ -2904,7 +3122,7 @@ fn emit_body(
         base: base.cloned(),
         locals: HashMap::new(),
         params: Vec::new(),
-        loops: Vec::new(),
+        controls: Vec::new(),
         protected_depth: 0,
         finally_depth: 0,
         catches: Vec::new(),
@@ -3037,9 +3255,9 @@ fn emit_body(
 }
 
 #[derive(Clone, Copy)]
-struct LoopTarget {
+struct ControlTarget {
     end: EmitLabel,
-    next: EmitLabel,
+    next: Option<EmitLabel>,
     protected_depth: usize,
     finally_depth: usize,
 }
@@ -3056,7 +3274,7 @@ struct FnEmitter<'a> {
     base: Option<String>,
     locals: HashMap<String, (u16, Ty)>,
     params: Vec<(String, Ty)>,
-    loops: Vec<LoopTarget>,
+    controls: Vec<ControlTarget>,
     protected_depth: usize,
     finally_depth: usize,
     catches: Vec<usize>,
@@ -3465,6 +3683,161 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    fn switch_statement(
+        &mut self,
+        value: &Expr,
+        sections: &[SwitchSection],
+    ) -> Result<(), CompileError> {
+        let value_type = self.expr(value)?;
+        let signature = match value_type {
+            Ty::Int => TypeSig::INT32,
+            Ty::Bool => TypeSig::BOOL,
+            Ty::String => TypeSig::STRING,
+            _ => return Err(self.error("switch supports int, bool, and string values")),
+        };
+        let value_local = self.emitter.declare_local(signature);
+        self.emitter.stloc(value_local);
+        let end = self.emitter.label();
+        let targets: Vec<_> = sections.iter().map(|_| self.emitter.label()).collect();
+        let mut default = None;
+        let mut constants = std::collections::HashSet::new();
+        let mut cases = Vec::new();
+        for (section, target) in sections.iter().zip(&targets) {
+            if !switch_section_exits(&section.body) {
+                return Err(self.error("a switch section cannot fall through"));
+            }
+            if section
+                .body
+                .statements
+                .iter()
+                .any(|statement| matches!(statement, Stmt::Local { .. }))
+            {
+                return Err(self
+                    .error("direct local declarations in switch sections are not supported yet"));
+            }
+            for label in &section.labels {
+                match label {
+                    SwitchLabel::Default => {
+                        if default.replace(*target).is_some() {
+                            return Err(
+                                self.error("a switch cannot have more than one default label")
+                            );
+                        }
+                    }
+                    SwitchLabel::Case(expression) => {
+                        let Some(constant) = switch_constant(expression) else {
+                            return Err(self.error("only literal switch case values are supported"));
+                        };
+                        let compatible = matches!(
+                            (&value_type, &constant),
+                            (Ty::Int, SwitchConstant::Int(_))
+                                | (Ty::Bool, SwitchConstant::Bool(_))
+                                | (Ty::String, SwitchConstant::String(_) | SwitchConstant::Null)
+                        );
+                        if !compatible {
+                            return Err(
+                                self.error("case value is incompatible with the switch type")
+                            );
+                        }
+                        if !constants.insert(constant.clone()) {
+                            return Err(self.error("duplicate switch case value"));
+                        }
+                        cases.push((constant, *target));
+                    }
+                }
+            }
+        }
+        let string_equality = if cases
+            .iter()
+            .any(|(constant, _)| matches!(constant, SwitchConstant::String(_)))
+        {
+            Some(
+                self.module
+                    .import_corlib_method(
+                        "System.String",
+                        "op_Equality",
+                        MethodSig::new_static(
+                            TypeSig::BOOL,
+                            vec![TypeSig::STRING, TypeSig::STRING],
+                        ),
+                    )
+                    .map_err(|error| self.error(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let bounds = if value_type == Ty::Int && cases.len() >= 4 {
+            let mut values = cases.iter().filter_map(|(constant, _)| match constant {
+                SwitchConstant::Int(value) => Some(*value),
+                _ => None,
+            });
+            values.next().map(|first| {
+                values.fold((first, first), |(min, max), value| {
+                    (min.min(value), max.max(value))
+                })
+            })
+        } else {
+            None
+        };
+        let dense_bounds = bounds.filter(|(min, max)| {
+            let width = i64::from(*max) - i64::from(*min) + 1;
+            width <= 4096 && (width as usize) <= cases.len().saturating_mul(2)
+        });
+        if let Some((min, max)) = dense_bounds {
+            let width = (i64::from(max) - i64::from(min) + 1) as usize;
+            let mut table = vec![default.unwrap_or(end); width];
+            for (constant, target) in &cases {
+                let SwitchConstant::Int(value) = constant else {
+                    unreachable!()
+                };
+                table[(i64::from(*value) - i64::from(min)) as usize] = *target;
+            }
+            self.emitter.ldloc(value_local);
+            if min != 0 {
+                self.emitter.ldc_i4(min).op(OpCode::Sub);
+            }
+            self.emitter.switch(table);
+        } else {
+            for (constant, target) in &cases {
+                self.emitter.ldloc(value_local);
+                match constant {
+                    SwitchConstant::Int(value) => {
+                        self.emitter.ldc_i4(*value).op(OpCode::Ceq);
+                    }
+                    SwitchConstant::Bool(value) => {
+                        self.emitter.ldc_i4(i32::from(*value)).op(OpCode::Ceq);
+                    }
+                    SwitchConstant::String(value) => {
+                        self.emitter.ldstr(value.clone()).call(
+                            string_equality
+                                .as_ref()
+                                .expect("string equality is imported")
+                                .clone(),
+                        );
+                    }
+                    SwitchConstant::Null => {
+                        self.emitter.ldnull().op(OpCode::Ceq);
+                    }
+                }
+                self.emitter.branch(OpCode::Brtrue, *target);
+            }
+        }
+        self.emitter.branch(OpCode::Br, default.unwrap_or(end));
+        self.controls.push(ControlTarget {
+            end,
+            next: None,
+            protected_depth: self.protected_depth,
+            finally_depth: self.finally_depth,
+        });
+        for (section, target) in sections.iter().zip(targets) {
+            self.emitter.mark(target);
+            self.scoped_block(&section.body)?;
+        }
+        self.controls.pop();
+        self.emitter.mark(end);
+        Ok(())
+    }
+
     fn try_statement(
         &mut self,
         body: &Block,
@@ -3617,6 +3990,7 @@ impl<'a> FnEmitter<'a> {
 
     fn statement(&mut self, statement: &Stmt) -> Result<(), CompileError> {
         match statement {
+            Stmt::Switch { value, sections } => self.switch_statement(value, sections),
             Stmt::Try {
                 body,
                 catches,
@@ -3653,8 +4027,8 @@ impl<'a> FnEmitter<'a> {
             Stmt::Block(block) => self.scoped_block(block),
             Stmt::Empty => Ok(()),
             Stmt::Break => {
-                let Some(target) = self.loops.last().copied() else {
-                    return Err(self.error("'break' outside of a loop"));
+                let Some(target) = self.controls.last().copied() else {
+                    return Err(self.error("'break' outside of a loop or switch"));
                 };
                 if self.finally_depth > target.finally_depth {
                     return Err(self.error("cannot leave a finally block"));
@@ -3670,7 +4044,12 @@ impl<'a> FnEmitter<'a> {
                 Ok(())
             }
             Stmt::Continue => {
-                let Some(target) = self.loops.last().copied() else {
+                let Some((target, next)) = self
+                    .controls
+                    .iter()
+                    .rev()
+                    .find_map(|target| target.next.map(|next| (*target, next)))
+                else {
                     return Err(self.error("'continue' outside of a loop"));
                 };
                 if self.finally_depth > target.finally_depth {
@@ -3682,7 +4061,7 @@ impl<'a> FnEmitter<'a> {
                     } else {
                         OpCode::Br
                     },
-                    target.next,
+                    next,
                 );
                 Ok(())
             }
@@ -3870,14 +4249,14 @@ impl<'a> FnEmitter<'a> {
                     .ok_or_else(|| self.error(format!("unsupported array element {ty:?}")))?;
                 self.emitter.op(opcode);
                 self.emitter.stloc(element_local);
-                self.loops.push(LoopTarget {
+                self.controls.push(ControlTarget {
                     end,
-                    next: step,
+                    next: Some(step),
                     protected_depth: self.protected_depth,
                     finally_depth: self.finally_depth,
                 });
                 self.scoped_block(body)?;
-                self.loops.pop();
+                self.controls.pop();
                 self.emitter.mark(step);
                 self.emitter.ldloc(index_local);
                 self.emitter.ldc_i4(1);
@@ -4118,14 +4497,14 @@ impl<'a> FnEmitter<'a> {
                 self.convert_assignable(&actual, &Ty::Bool, "while condition")
                     .map_err(|message| self.error(message))?;
                 self.emitter.branch(OpCode::Brfalse, end);
-                self.loops.push(LoopTarget {
+                self.controls.push(ControlTarget {
                     end,
-                    next: top,
+                    next: Some(top),
                     protected_depth: self.protected_depth,
                     finally_depth: self.finally_depth,
                 });
                 self.scoped_block(body)?;
-                self.loops.pop();
+                self.controls.pop();
                 self.emitter.branch(OpCode::Br, top);
                 self.emitter.mark(end);
                 Ok(())
@@ -4135,14 +4514,14 @@ impl<'a> FnEmitter<'a> {
                 let test = self.emitter.label();
                 let end = self.emitter.label();
                 self.emitter.mark(top);
-                self.loops.push(LoopTarget {
+                self.controls.push(ControlTarget {
                     end,
-                    next: test,
+                    next: Some(test),
                     protected_depth: self.protected_depth,
                     finally_depth: self.finally_depth,
                 });
                 self.scoped_block(body)?;
-                self.loops.pop();
+                self.controls.pop();
                 self.emitter.mark(test);
                 let actual = self.expr(condition)?;
                 self.convert_assignable(&actual, &Ty::Bool, "do-while condition")
@@ -4176,14 +4555,14 @@ impl<'a> FnEmitter<'a> {
                         .map_err(|message| self.error(message))?;
                     self.emitter.branch(OpCode::Brfalse, end);
                 }
-                self.loops.push(LoopTarget {
+                self.controls.push(ControlTarget {
                     end,
-                    next: step_label,
+                    next: Some(step_label),
                     protected_depth: self.protected_depth,
                     finally_depth: self.finally_depth,
                 });
                 self.scoped_block(body)?;
-                self.loops.pop();
+                self.controls.pop();
                 self.emitter.mark(step_label);
                 if let Some(step) = step {
                     let ty = self.expr(step)?;

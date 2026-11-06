@@ -44,6 +44,11 @@ impl TrackedEmitter {
         self.inner.branch(opcode, target);
         self
     }
+    pub(crate) fn switch(&mut self, targets: Vec<EmitLabel>) -> &mut Self {
+        self.instructions += 1;
+        self.inner.switch(targets);
+        self
+    }
     pub(crate) fn ldarg(&mut self, index: u16) -> &mut Self {
         self.instructions += 1;
         self.inner.ldarg(index);
