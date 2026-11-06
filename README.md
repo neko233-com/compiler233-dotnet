@@ -10,7 +10,7 @@
 - **性能**：在等价的正确性和功能覆盖下，对标 Roslyn 的冷启动、完整与增量编译、并发吞吐、p50/p95/p99、分配量及峰值内存，目标是在主要工作负载上显著领先。
 - **集成**：逐步覆盖多文件项目、引用解析、CLI/MSBuild、可复现构建及开发工具接口。达到兼容性要求前，不宣称可以替代 `csc`、MSBuild 或 Roslyn API。
 - **替代目标**：包括 csc 命令行契约、C# 和 Visual Basic、分析器与源生成器，以及 `Microsoft.CodeAnalysis` 托管 API 兼容；这些能力目前只有少量 csc/C# 子集实现。HotReload233 的接入点是 csc 进程契约，待相关能力及实际链路验证后再接入。
-- **平台**：Windows x86-64、Linux x86-64、macOS **ARM64**。macOS Intel 不在支持范围；项目会明确拒绝该编译目标。平台 CI 通过只说明当前已实现功能通过该平台的检查。
+- **平台**：当前优先实现并验收 Windows x86-64；macOS **ARM64** 在后续补全，macOS Intel 不在目标范围。现有 Linux 和 macOS CI / 发布配置保留，但不作为当前 Windows 阶段的验收前提。平台 CI 通过只说明当前已实现功能通过该平台的检查。
 
 ## 当前已实现
 
@@ -161,12 +161,12 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 ## 后续里程碑
 
-- **M0（进行中）**：csc 命令行前端、诊断与退出码、`-report` 报告、CLI 契约测试、tag 驱动的多平台发布；完整选项语义和产物兼容尚未完成。
+- **M0（进行中）**：csc 命令行前端、诊断与退出码、`-report` 报告、CLI 契约测试、tag 驱动的发布；当前以 Windows 验收，完整选项语义和产物兼容尚未完成。
 - **M1（已完成）**：Roslyn 差分门禁——同输入双编译，输出 accept / reject / false_reject / false_accept 分类与覆盖率，false_accept 默认上限 0；语料可指向任意 `.cs` 目录。
 - **M2（进行中）**：自研词法 + 递归下降解析已落地，覆盖预处理/条件编译、命名空间、类型、成员、语句与表达式；当次语料与条件分支的语法层结果见上文。剩余工作：trivia/span 保真、增量解析，以及更多语料和编译条件下的长尾构造。
 - **M3（进行中）**：部分名字/类型检查与 CIL 发射已打通，由 `tests/compile.ps1` 与 Roslyn 执行结果对照；仍需完整的泛型定义、lambda、异常、async 及其语义验证。
 - **M4**：CIL、元数据、便携 PDB、引用程序集，以及目标框架矩阵（netstandard2.0/2.1、net472、net8/9/10）。
-- **M5**：性能对标（冷启动、全量/增量 p50/p95、峰值内存）与 GitHub tag 发布（win-x64、linux-x64、macos-arm64）。
+- **M5**：性能对标（冷启动、全量/增量 p50/p95、峰值内存）与 GitHub tag 发布；当前先验证 win-x64，后续补全 macos-arm64。
 - **M6**：Visual Basic、分析器与源生成器，以及 `Microsoft.CodeAnalysis` 托管 API 兼容。
 
 MIT License；依赖项遵循各自许可证。
