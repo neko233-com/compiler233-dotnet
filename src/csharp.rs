@@ -276,6 +276,10 @@ enum Stmt {
         condition: Expr,
         body: Block,
     },
+    DoWhile {
+        body: Block,
+        condition: Expr,
+    },
     For {
         init: Option<Box<Stmt>>,
         condition: Option<Expr>,
@@ -313,6 +317,139 @@ enum Stmt {
         collection: Expr,
         body: Block,
     },
+}
+
+fn contains_do(block: &Block) -> bool {
+    block.statements.iter().any(|statement| match statement {
+        Stmt::DoWhile { .. } => true,
+        Stmt::While { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Block(body) => contains_do(body),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => contains_do(then_branch) || else_branch.as_ref().is_some_and(contains_do),
+        Stmt::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            contains_do(body)
+                || catches.iter().any(|clause| contains_do(&clause.body))
+                || finally.as_ref().is_some_and(contains_do)
+        }
+        _ => false,
+    })
+}
+
+// Validate declaration spaces around do-while bodies before emission. A C# local
+// conflicts with a declaration in an enclosing scope even when that declaration
+// occurs later in the source, so checking only the locals emitted so far is not
+// enough. Other declaration-space rules remain part of the broader binder work.
+fn validate_do_scopes<'a>(
+    block: &'a Block,
+    params: &[(String, Ty)],
+    ancestors: &mut Vec<Vec<&'a str>>,
+    inside_do: bool,
+) -> Result<(), String> {
+    fn conflicts(name: &str, params: &[(String, Ty)], scopes: &[Vec<&str>]) -> bool {
+        params.iter().any(|(param, _)| param == name)
+            || scopes.iter().any(|scope| scope.contains(&name))
+    }
+    let names: Vec<&str> = block
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::Local { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if inside_do {
+        let mut seen = std::collections::HashSet::new();
+        for name in &names {
+            if !seen.insert(*name) || conflicts(name, params, ancestors) {
+                return Err(format!(
+                    "local variable '{name}' conflicts with an existing variable"
+                ));
+            }
+        }
+    }
+    ancestors.push(names);
+    for statement in &block.statements {
+        match statement {
+            Stmt::DoWhile { body, .. } => validate_do_scopes(body, params, ancestors, true)?,
+            Stmt::While { body, .. } | Stmt::Block(body) => {
+                validate_do_scopes(body, params, ancestors, inside_do)?;
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                validate_do_scopes(then_branch, params, ancestors, inside_do)?;
+                if let Some(branch) = else_branch {
+                    validate_do_scopes(branch, params, ancestors, inside_do)?;
+                }
+            }
+            Stmt::For { init, body, .. } => {
+                let name = init.as_deref().and_then(|init| match init {
+                    Stmt::Local { name, .. } => Some(name.as_str()),
+                    _ => None,
+                });
+                if let Some(name) = name {
+                    if inside_do && conflicts(name, params, ancestors) {
+                        return Err(format!(
+                            "local variable '{name}' conflicts with an existing variable"
+                        ));
+                    }
+                    ancestors.push(vec![name]);
+                }
+                validate_do_scopes(body, params, ancestors, inside_do)?;
+                if name.is_some() {
+                    ancestors.pop();
+                }
+            }
+            Stmt::ForEach { name, body, .. } => {
+                if inside_do && conflicts(name, params, ancestors) {
+                    return Err(format!(
+                        "local variable '{name}' conflicts with an existing variable"
+                    ));
+                }
+                ancestors.push(vec![name.as_str()]);
+                validate_do_scopes(body, params, ancestors, inside_do)?;
+                ancestors.pop();
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                validate_do_scopes(body, params, ancestors, inside_do)?;
+                for clause in catches {
+                    if let Some(name) = &clause.name {
+                        if inside_do && conflicts(name, params, ancestors) {
+                            return Err(format!(
+                                "local variable '{name}' conflicts with an existing variable"
+                            ));
+                        }
+                        ancestors.push(vec![name.as_str()]);
+                    }
+                    validate_do_scopes(&clause.body, params, ancestors, inside_do)?;
+                    if clause.name.is_some() {
+                        ancestors.pop();
+                    }
+                }
+                if let Some(body) = finally {
+                    validate_do_scopes(body, params, ancestors, inside_do)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    ancestors.pop();
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1302,6 +1439,20 @@ impl<'a> Parser<'a> {
                 let body = self.parse_statement_block()?;
                 return Ok(Stmt::While { condition, body });
             }
+            "do" => {
+                self.bump();
+                let is_block = self.check("{");
+                let body = self.parse_statement_block()?;
+                if !is_block && matches!(body.statements.first(), Some(Stmt::Local { .. })) {
+                    return Err(self.error("a local declaration cannot be an embedded statement"));
+                }
+                self.expect("while")?;
+                self.expect("(")?;
+                let condition = self.parse_expression()?;
+                self.expect(")")?;
+                self.expect(";")?;
+                return Ok(Stmt::DoWhile { body, condition });
+            }
             "for" => {
                 self.bump();
                 self.expect("(")?;
@@ -1427,8 +1578,8 @@ impl<'a> Parser<'a> {
                     body,
                 });
             }
-            "switch" | "do" | "case" | "default" | "goto" | "lock" | "using" | "yield"
-            | "checked" | "unchecked" | "fixed" | "unsafe" => {
+            "switch" | "case" | "default" | "goto" | "lock" | "using" | "yield" | "checked"
+            | "unchecked" | "fixed" | "unsafe" => {
                 return Err(self.error(format!(
                     "'{}' statements are not supported by the bounded core yet",
                     self.text()
@@ -2796,6 +2947,7 @@ fn emit_body(
                     }
                 }
             }
+            context.validate_do_scopes(body)?;
             context.block(body)?;
             if method.is_ctor || method.ret == Ty::Void {
                 context.emitter.ret();
@@ -2827,6 +2979,7 @@ fn emit_body(
             context.return_ty = property.ty.clone();
             match &property.getter {
                 Some(body) => {
+                    context.validate_do_scopes(body)?;
                     context.block(body)?;
                     if !block_terminates(body) {
                         return Err(context.error("a getter must return a value"));
@@ -2846,6 +2999,7 @@ fn emit_body(
             context.params = vec![("value".to_string(), property.ty.clone())];
             match &property.setter {
                 Some(body) => {
+                    context.validate_do_scopes(body)?;
                     context.block(body)?;
                     context.emitter.ret();
                 }
@@ -3210,7 +3364,24 @@ impl<'a> FnEmitter<'a> {
         Ok(())
     }
 
+    fn validate_do_scopes(&self, block: &Block) -> Result<(), CompileError> {
+        if !contains_do(block) {
+            return Ok(());
+        }
+        validate_do_scopes(block, &self.params, &mut Vec::new(), false)
+            .map_err(|message| self.error(message))
+    }
+
     fn scoped_block(&mut self, block: &Block) -> Result<(), CompileError> {
+        // Nested control-flow statements restore their own scopes; only a
+        // declaration directly in this block changes this scope's bindings.
+        if !block
+            .statements
+            .iter()
+            .any(|statement| matches!(statement, Stmt::Local { .. }))
+        {
+            return self.block(block);
+        }
         let locals = self.locals.clone();
         let result = self.block(block);
         self.locals = locals;
@@ -3479,7 +3650,7 @@ impl<'a> FnEmitter<'a> {
                 }
                 Ok(())
             }
-            Stmt::Block(block) => self.block(block),
+            Stmt::Block(block) => self.scoped_block(block),
             Stmt::Empty => Ok(()),
             Stmt::Break => {
                 let Some(target) = self.loops.last().copied() else {
@@ -3705,7 +3876,7 @@ impl<'a> FnEmitter<'a> {
                     protected_depth: self.protected_depth,
                     finally_depth: self.finally_depth,
                 });
-                self.block(body)?;
+                self.scoped_block(body)?;
                 self.loops.pop();
                 self.emitter.mark(step);
                 self.emitter.ldloc(index_local);
@@ -3930,11 +4101,11 @@ impl<'a> FnEmitter<'a> {
                 let alternative = self.emitter.label();
                 let end = self.emitter.label();
                 self.emitter.branch(OpCode::Brfalse, alternative);
-                self.block(then_branch)?;
+                self.scoped_block(then_branch)?;
                 self.emitter.branch(OpCode::Br, end);
                 self.emitter.mark(alternative);
                 if let Some(branch) = else_branch {
-                    self.block(branch)?;
+                    self.scoped_block(branch)?;
                 }
                 self.emitter.mark(end);
                 Ok(())
@@ -3953,9 +4124,30 @@ impl<'a> FnEmitter<'a> {
                     protected_depth: self.protected_depth,
                     finally_depth: self.finally_depth,
                 });
-                self.block(body)?;
+                self.scoped_block(body)?;
                 self.loops.pop();
                 self.emitter.branch(OpCode::Br, top);
+                self.emitter.mark(end);
+                Ok(())
+            }
+            Stmt::DoWhile { body, condition } => {
+                let top = self.emitter.label();
+                let test = self.emitter.label();
+                let end = self.emitter.label();
+                self.emitter.mark(top);
+                self.loops.push(LoopTarget {
+                    end,
+                    next: test,
+                    protected_depth: self.protected_depth,
+                    finally_depth: self.finally_depth,
+                });
+                self.scoped_block(body)?;
+                self.loops.pop();
+                self.emitter.mark(test);
+                let actual = self.expr(condition)?;
+                self.convert_assignable(&actual, &Ty::Bool, "do-while condition")
+                    .map_err(|message| self.error(message))?;
+                self.emitter.branch(OpCode::Brtrue, top);
                 self.emitter.mark(end);
                 Ok(())
             }
@@ -3965,6 +4157,12 @@ impl<'a> FnEmitter<'a> {
                 step,
                 body,
             } => {
+                let previous_local = init.as_deref().and_then(|statement| match statement {
+                    Stmt::Local { name, .. } => {
+                        Some((name.clone(), self.locals.get(name).cloned()))
+                    }
+                    _ => None,
+                });
                 if let Some(init) = init {
                     self.statement(init)?;
                 }
@@ -3984,7 +4182,7 @@ impl<'a> FnEmitter<'a> {
                     protected_depth: self.protected_depth,
                     finally_depth: self.finally_depth,
                 });
-                self.block(body)?;
+                self.scoped_block(body)?;
                 self.loops.pop();
                 self.emitter.mark(step_label);
                 if let Some(step) = step {
@@ -3995,6 +4193,13 @@ impl<'a> FnEmitter<'a> {
                 }
                 self.emitter.branch(OpCode::Br, top);
                 self.emitter.mark(end);
+                if let Some((name, previous)) = previous_local {
+                    if let Some(previous) = previous {
+                        self.locals.insert(name, previous);
+                    } else {
+                        self.locals.remove(&name);
+                    }
+                }
                 Ok(())
             }
         }

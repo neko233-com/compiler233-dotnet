@@ -130,7 +130,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 接口：`interface` 声明（抽象方法、无方法体）、类实现接口（`InterfaceImpl` + 隐式实现标记为 `virtual final newslot`）、接口类型变量与 `callvirt` 派发
 - 外部基类继承：`class X : System.Exception` 可编译，构造函数 `: base(args)`、继承的字段与属性（`get_X`）沿引用程序集的 `extends` 链解析
 - 静态/实例方法、参数，重载按参数个数解析
-- 语句：局部声明、赋值、`if/else`、`while`、`for`、`return`、`break`/`continue`、`base.M(...)` 基类调用、块
+- 语句：局部声明、赋值、`if/else`、`while`、`do ... while`、`for`、`return`、`break`/`continue`、`base.M(...)` 基类调用、块
 - 表达式：`int/float/bool/string/object` 与 `null` 字面量、`enum` 常量、算术与比较（含字符串/布尔相等、`== null`）、`&&/||` 短路、`??`、`?:` 三元、`(T)x` 转换与 `as`、`!`、`++`/`--`、`+=`/`-=`（含字段与属性）、字符串 `+` 拼接、赋值表达式、`string.Empty`/`int.MaxValue` 等预定义成员
 - 外部引用：`-reference:` 指定的程序集参与类型与方法解析（全名、唯一短名、`System.Text.Regex` 这类限定名），跨程序集静态/实例调用可用；`tests/compile.ps1` 会对 `System.Text.RegularExpressions` 与 Roslyn 构建的泛型库做真实对照
 - 泛型方法调用：`Foo<T>(...)` 通过 MethodSpec 实例化（外部程序集的方法），返回类型按实参替换`MVar`
@@ -139,7 +139,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 尚未支持、会被明确拒绝而不是静默降级：泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、`async`/`switch`。
 
-验收方式：`./tests/compile.ps1` 用 Roslyn 编译同一批源码并比较运行结果；`./tests/exceptions.ps1` 专门比较异常与筛选器行为、无效输入和引用程序集下游加载。
+验收方式：`./tests/compile.ps1` 用 Roslyn 编译同一批源码并比较运行结果；`./tests/exceptions.ps1` 专门比较异常与筛选器行为、无效输入和引用程序集下游加载；`./tests/loops.ps1` 对照 `do ... while` 的控制流与作用域。
 
 ## 发布
 
