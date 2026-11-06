@@ -2690,7 +2690,12 @@ impl<'a> FnEmitter<'a> {
         if *expected == Ty::Object && is_reference(actual) {
             return Ok(());
         }
-        if *actual == Ty::Null && matches!(expected, Ty::String | Ty::Class(_) | Ty::Array(_)) {
+        if *actual == Ty::Null
+            && matches!(
+                expected,
+                Ty::Object | Ty::String | Ty::Class(_) | Ty::Array(_)
+            )
+        {
             return Ok(());
         }
         if self.assignable(actual, expected) {
@@ -4187,6 +4192,12 @@ impl<'a> FnEmitter<'a> {
                 }
             }
             let receiver_type = self.expr(receiver)?;
+            if matches!(
+                receiver_type,
+                Ty::Int | Ty::Float | Ty::Bool | Ty::String | Ty::Object
+            ) {
+                return self.primitive_call(&receiver_type, name, generic_args, args);
+            }
             if let Ty::Generic(type_name, type_args) = &receiver_type {
                 let (token, params, ret) =
                     self.generic_member(type_name, type_args, name, args.len())?;
@@ -4238,6 +4249,60 @@ impl<'a> FnEmitter<'a> {
         }
         let current = self.current.clone();
         self.static_call(&current, name, generic_args, args)
+    }
+
+    /// The receiver is already on the evaluation stack and is evaluated once.
+    /// Value types are stored in a temporary and passed by address, avoiding boxing.
+    fn primitive_call(
+        &mut self,
+        receiver: &Ty,
+        name: &str,
+        generic_args: &[Ty],
+        args: &[Expr],
+    ) -> Result<Ty, CompileError> {
+        if !generic_args.is_empty() {
+            return Err(self.error("primitive methods do not accept type arguments"));
+        }
+        let (type_name, local_type) = match receiver {
+            Ty::Int => ("System.Int32", Some(TypeSig::INT32)),
+            Ty::Float => ("System.Single", Some(TypeSig::Primitive(PrimitiveType::R4))),
+            Ty::Bool => ("System.Boolean", Some(TypeSig::BOOL)),
+            Ty::String => ("System.String", None),
+            Ty::Object => ("System.Object", None),
+            _ => return Err(self.error("unsupported primitive receiver")),
+        };
+        let (ret, signature_ret, params) = match (name, args.len(), receiver) {
+            ("ToString", 0, _) => (Ty::String, TypeSig::STRING, vec![]),
+            ("ToString", 1, Ty::Int | Ty::Float) => {
+                (Ty::String, TypeSig::STRING, vec![TypeSig::STRING])
+            }
+            ("GetHashCode", 0, _) => (Ty::Int, TypeSig::INT32, vec![]),
+            _ => return Err(self.error(format!("unsupported method '{name}' for {receiver:?}"))),
+        };
+        if let Some(local_type) = local_type {
+            let temporary = self.emitter.declare_local(local_type);
+            self.emitter.stloc(temporary).ldloca(temporary);
+        }
+        if args.len() == 1 {
+            let actual = self.expr(&args[0])?;
+            if actual == Ty::Null {
+                return Err(self.error("ToString(null) is ambiguous between format and provider"));
+            }
+            self.require_assignable(&actual, &Ty::String, "argument")
+                .map_err(|message| self.error(message))?;
+        }
+        let token = self.import_bcl_method(
+            "System.Runtime",
+            type_name,
+            name,
+            MethodSig::new_instance(signature_ret, params),
+        )?;
+        if matches!(receiver, Ty::String | Ty::Object) {
+            self.emitter.callvirt(token);
+        } else {
+            self.emitter.call(token);
+        }
+        Ok(ret)
     }
 
     fn static_call(
