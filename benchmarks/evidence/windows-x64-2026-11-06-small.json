@@ -1,0 +1,1189 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-11-06T12:11:59.2837312Z",
+  "compiler_git_head": "69132038edd3dda341de7e445412bca18c73bf49",
+  "tracked_files_dirty": true,
+  "dirty_scope": "Only README and CI configuration were modified; compiler source matched compiler_git_head. Benchmark source and script were untracked.",
+  "os": "Microsoft Windows 10.0.26300",
+  "architecture": "X64",
+  "cpu": {
+    "Name": "AMD Ryzen 9 9950X 16-Core Processor",
+    "NumberOfCores": 16,
+    "NumberOfLogicalProcessors": 32
+  },
+  "logical_processors": 32,
+  "dotnet_sdk": "10.0.114",
+  "installed_dotnet_runtimes": [
+    "Microsoft.AspNetCore.App 10.0.14",
+    "Microsoft.NETCore.App 10.0.14",
+    "Microsoft.WindowsDesktop.App 10.0.14"
+  ],
+  "roslyn_version": "5.0.0-2.26522.126 (0427b9ab)",
+  "roslyn_runtime_framework": {
+    "name": "Microsoft.NETCore.App",
+    "version": "10.0.14"
+  },
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "rust_target": "x86_64-pc-windows-msvc",
+  "performance_environment": {},
+  "benchmark_script_sha256": "204b6288261e32e2c840308a8ee8b9eb9f9defb58a0c10d70cd68d05dc658736",
+  "compiler233_sha256": "912f118ac4f79231a47c44222e874c05962000d7a176202e6d5743644e603c27",
+  "dotnet_executable_sha256": "1e881ec1786c31ba712d052258b4ad4202ac155df5965794030037878abb822f",
+  "roslyn_files": [
+    {
+      "name": "csc.dll",
+      "sha256": "07a7433884f244374cdb5d954d490b8215d55f19583b0a0124f41bb16a093305"
+    },
+    {
+      "name": "csc.deps.json",
+      "sha256": "66c871614036e7b078d521de6a60df409ce4c86b97c7a22385414901965a1b52"
+    },
+    {
+      "name": "csc.runtimeconfig.json",
+      "sha256": "4fa05f2f44a6518556a169c70c248bb71977110bc891b13fbd4e2a08d8406ad2"
+    },
+    {
+      "name": "Microsoft.CodeAnalysis.dll",
+      "sha256": "8e7a4dbdf980ef5a8059f840dc30229c3ed50aa0942ec97e650efbb943e26127"
+    },
+    {
+      "name": "Microsoft.CodeAnalysis.CSharp.dll",
+      "sha256": "b42165d9d2a45434d0b8d670ce1287d1cd8fef9d5345144c13d1fde796e6cdca"
+    }
+  ],
+  "reference": {
+    "name": "System.Runtime.dll",
+    "version": "10.0.14",
+    "sha256": "83718200954acb9052d8ff716053bca0fb8f591cacd59d5fe821ae8a19565382"
+  },
+  "sources": [
+    {
+      "name": "benchmarks/corpus/Equivalent.cs",
+      "sha256": "03bebde1ffa8affd1da95d93906150fd30bb444039954e32b1ce693d3022d5eb"
+    }
+  ],
+  "common_arguments": [
+    "-noconfig",
+    "-nologo",
+    "-target:library",
+    "-langversion:9.0",
+    "-reference:<System.Runtime.dll>",
+    "-out:<fresh-output>",
+    "<sources>"
+  ],
+  "generated_methods": 0,
+  "generated_methods_executed": 0,
+  "generated_expected_result": 0,
+  "warmup": 5,
+  "iterations": 100,
+  "order": "Alternating compiler233-first and roslyn-first.",
+  "percentile_method": "nearest-rank, ceil(p * sample count)",
+  "memory_source": "GetProcessMemoryInfo: PeakWorkingSetSize and PeakPagefileUsage after process exit.",
+  "limitations": [
+    "Both commands use the same sources, target kind and single reference assembly; compiler capabilities and emitted metadata remain different.",
+    "Every timed run creates a fresh PE; only the listed entry points were executed against a Roslyn oracle before timing, so this is not complete language or API equivalence.",
+    "Memory values are Windows per-process lifetime peaks for working set and commit charge; parent and child processes are excluded.",
+    "Each timed run starts a new process after warmups; filesystem caches and machine load are not isolated.",
+    "The workload is synthetic and does not measure real projects, incremental builds, analyzers, generators or full Roslyn replacement."
+  ],
+  "validation": [
+    {
+      "compiler": "compiler233",
+      "type": "CompilerBench.Runner",
+      "method": "Arithmetic",
+      "result": "CompilerBench.Runner.Arithmetic(): Roslyn=23, compiler233=23"
+    },
+    {
+      "compiler": "compiler233",
+      "type": "CompilerBench.Runner",
+      "method": "Loops",
+      "result": "CompilerBench.Runner.Loops(): Roslyn=11, compiler233=11"
+    },
+    {
+      "compiler": "compiler233",
+      "type": "CompilerBench.Runner",
+      "method": "Dispatch",
+      "result": "CompilerBench.Runner.Dispatch(): Roslyn=801, compiler233=801"
+    },
+    {
+      "compiler": "compiler233",
+      "type": "CompilerBench.Runner",
+      "method": "Text",
+      "result": "CompilerBench.Runner.Text(): Roslyn=alpha, compiler233=alpha"
+    },
+    {
+      "compiler": "compiler233",
+      "type": "CompilerBench.Runner",
+      "method": "Arrays",
+      "result": "CompilerBench.Runner.Arrays(): Roslyn=12, compiler233=12"
+    },
+    {
+      "compiler": "roslyn",
+      "type": "CompilerBench.Runner",
+      "method": "Arithmetic",
+      "result": "CompilerBench.Runner.Arithmetic(): Roslyn=23, compiler233=23"
+    },
+    {
+      "compiler": "roslyn",
+      "type": "CompilerBench.Runner",
+      "method": "Loops",
+      "result": "CompilerBench.Runner.Loops(): Roslyn=11, compiler233=11"
+    },
+    {
+      "compiler": "roslyn",
+      "type": "CompilerBench.Runner",
+      "method": "Dispatch",
+      "result": "CompilerBench.Runner.Dispatch(): Roslyn=801, compiler233=801"
+    },
+    {
+      "compiler": "roslyn",
+      "type": "CompilerBench.Runner",
+      "method": "Text",
+      "result": "CompilerBench.Runner.Text(): Roslyn=alpha, compiler233=alpha"
+    },
+    {
+      "compiler": "roslyn",
+      "type": "CompilerBench.Runner",
+      "method": "Arrays",
+      "result": "CompilerBench.Runner.Arrays(): Roslyn=12, compiler233=12"
+    }
+  ],
+  "compiler233": {
+    "samples": [
+      {
+        "milliseconds": 46.9666,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25509888
+      },
+      {
+        "milliseconds": 46.6852,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 43.2751,
+        "peak_working_set_bytes": 30453760,
+        "peak_commit_bytes": 25821184
+      },
+      {
+        "milliseconds": 48.0968,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 50.6571,
+        "peak_working_set_bytes": 30470144,
+        "peak_commit_bytes": 25817088
+      },
+      {
+        "milliseconds": 46.2751,
+        "peak_working_set_bytes": 30523392,
+        "peak_commit_bytes": 25870336
+      },
+      {
+        "milliseconds": 49.2799,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 43.2616,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 44.3913,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 45.555,
+        "peak_working_set_bytes": 30519296,
+        "peak_commit_bytes": 25882624
+      },
+      {
+        "milliseconds": 46.3419,
+        "peak_working_set_bytes": 30560256,
+        "peak_commit_bytes": 25903104
+      },
+      {
+        "milliseconds": 43.9958,
+        "peak_working_set_bytes": 30543872,
+        "peak_commit_bytes": 25886720
+      },
+      {
+        "milliseconds": 42.5189,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 42.9042,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 43.5278,
+        "peak_working_set_bytes": 30523392,
+        "peak_commit_bytes": 25878528
+      },
+      {
+        "milliseconds": 42.4158,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 52.3194,
+        "peak_working_set_bytes": 30494720,
+        "peak_commit_bytes": 25833472
+      },
+      {
+        "milliseconds": 42.1915,
+        "peak_working_set_bytes": 30154752,
+        "peak_commit_bytes": 25477120
+      },
+      {
+        "milliseconds": 44.7624,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 44.4734,
+        "peak_working_set_bytes": 30511104,
+        "peak_commit_bytes": 25853952
+      },
+      {
+        "milliseconds": 43.018,
+        "peak_working_set_bytes": 30195712,
+        "peak_commit_bytes": 25530368
+      },
+      {
+        "milliseconds": 47.4873,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 57.7288,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 44.3045,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 47.8563,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 45.0684,
+        "peak_working_set_bytes": 30318592,
+        "peak_commit_bytes": 25657344
+      },
+      {
+        "milliseconds": 45.9642,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 45.3257,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 43.7611,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25509888
+      },
+      {
+        "milliseconds": 44.4751,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 43.2147,
+        "peak_working_set_bytes": 30175232,
+        "peak_commit_bytes": 25513984
+      },
+      {
+        "milliseconds": 43.8968,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 46.7366,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 48.9656,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 47.7391,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 43.6838,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 41.287,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 47.6251,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 49.0631,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25513984
+      },
+      {
+        "milliseconds": 44.274,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 44.9377,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25493504
+      },
+      {
+        "milliseconds": 44.134,
+        "peak_working_set_bytes": 30490624,
+        "peak_commit_bytes": 25825280
+      },
+      {
+        "milliseconds": 43.2765,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 45.1373,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 44.9691,
+        "peak_working_set_bytes": 30175232,
+        "peak_commit_bytes": 25509888
+      },
+      {
+        "milliseconds": 46.9371,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 45.9052,
+        "peak_working_set_bytes": 30543872,
+        "peak_commit_bytes": 25911296
+      },
+      {
+        "milliseconds": 49.2029,
+        "peak_working_set_bytes": 30195712,
+        "peak_commit_bytes": 25534464
+      },
+      {
+        "milliseconds": 44.6795,
+        "peak_working_set_bytes": 30519296,
+        "peak_commit_bytes": 25890816
+      },
+      {
+        "milliseconds": 42.0871,
+        "peak_working_set_bytes": 30560256,
+        "peak_commit_bytes": 25907200
+      },
+      {
+        "milliseconds": 43.5944,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 44.7647,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25509888
+      },
+      {
+        "milliseconds": 45.5835,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25509888
+      },
+      {
+        "milliseconds": 44.5741,
+        "peak_working_set_bytes": 30511104,
+        "peak_commit_bytes": 25862144
+      },
+      {
+        "milliseconds": 45.3348,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 44.0993,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 43.3776,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 46.9714,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 45.3473,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 45.9824,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 41.9618,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 47.2218,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 43.3778,
+        "peak_working_set_bytes": 30515200,
+        "peak_commit_bytes": 25882624
+      },
+      {
+        "milliseconds": 46.7978,
+        "peak_working_set_bytes": 30511104,
+        "peak_commit_bytes": 25853952
+      },
+      {
+        "milliseconds": 44.0143,
+        "peak_working_set_bytes": 30498816,
+        "peak_commit_bytes": 25837568
+      },
+      {
+        "milliseconds": 47.1892,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 48.6711,
+        "peak_working_set_bytes": 30515200,
+        "peak_commit_bytes": 25886720
+      },
+      {
+        "milliseconds": 44.0596,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 46.344,
+        "peak_working_set_bytes": 30281728,
+        "peak_commit_bytes": 25616384
+      },
+      {
+        "milliseconds": 45.062,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 44.8934,
+        "peak_working_set_bytes": 30277632,
+        "peak_commit_bytes": 25612288
+      },
+      {
+        "milliseconds": 50.4499,
+        "peak_working_set_bytes": 30162944,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 47.6667,
+        "peak_working_set_bytes": 30195712,
+        "peak_commit_bytes": 25526272
+      },
+      {
+        "milliseconds": 51.8266,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 46.932,
+        "peak_working_set_bytes": 30515200,
+        "peak_commit_bytes": 25882624
+      },
+      {
+        "milliseconds": 46.5631,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 47.3721,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 45.9492,
+        "peak_working_set_bytes": 30515200,
+        "peak_commit_bytes": 25837568
+      },
+      {
+        "milliseconds": 44.3818,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 48.3254,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 46.6939,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 47.764,
+        "peak_working_set_bytes": 30519296,
+        "peak_commit_bytes": 25874432
+      },
+      {
+        "milliseconds": 46.3023,
+        "peak_working_set_bytes": 30523392,
+        "peak_commit_bytes": 25866240
+      },
+      {
+        "milliseconds": 50.1468,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 47.2672,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25509888
+      },
+      {
+        "milliseconds": 49.0818,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25509888
+      },
+      {
+        "milliseconds": 43.5526,
+        "peak_working_set_bytes": 30511104,
+        "peak_commit_bytes": 25849856
+      },
+      {
+        "milliseconds": 49.2841,
+        "peak_working_set_bytes": 30175232,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 45.1705,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 48.1024,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 44.8745,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25493504
+      },
+      {
+        "milliseconds": 47.5352,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 44.0499,
+        "peak_working_set_bytes": 30515200,
+        "peak_commit_bytes": 25874432
+      },
+      {
+        "milliseconds": 44.3007,
+        "peak_working_set_bytes": 30527488,
+        "peak_commit_bytes": 25878528
+      },
+      {
+        "milliseconds": 43.7708,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25501696
+      },
+      {
+        "milliseconds": 43.6057,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 43.6214,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25497600
+      },
+      {
+        "milliseconds": 44.0067,
+        "peak_working_set_bytes": 30273536,
+        "peak_commit_bytes": 25608192
+      },
+      {
+        "milliseconds": 42.2422,
+        "peak_working_set_bytes": 30171136,
+        "peak_commit_bytes": 25505792
+      },
+      {
+        "milliseconds": 46.5043,
+        "peak_working_set_bytes": 30167040,
+        "peak_commit_bytes": 25493504
+      }
+    ],
+    "wall_percentiles_ms": {
+      "p50": 45.1705,
+      "p95": 50.1468,
+      "p99": 52.3194
+    },
+    "peak_working_set_percentiles_bytes": {
+      "p50": 30171136.0,
+      "p95": 30523392.0,
+      "p99": 30560256.0
+    },
+    "peak_commit_percentiles_bytes": {
+      "p50": 25505792.0,
+      "p95": 25886720.0,
+      "p99": 25907200.0
+    }
+  },
+  "roslyn": {
+    "samples": [
+      {
+        "milliseconds": 468.6825,
+        "peak_working_set_bytes": 74280960,
+        "peak_commit_bytes": 37482496
+      },
+      {
+        "milliseconds": 466.2271,
+        "peak_working_set_bytes": 74498048,
+        "peak_commit_bytes": 37679104
+      },
+      {
+        "milliseconds": 458.9724,
+        "peak_working_set_bytes": 74399744,
+        "peak_commit_bytes": 37584896
+      },
+      {
+        "milliseconds": 461.1102,
+        "peak_working_set_bytes": 74330112,
+        "peak_commit_bytes": 37478400
+      },
+      {
+        "milliseconds": 469.4048,
+        "peak_working_set_bytes": 74465280,
+        "peak_commit_bytes": 37683200
+      },
+      {
+        "milliseconds": 490.0467,
+        "peak_working_set_bytes": 74420224,
+        "peak_commit_bytes": 37617664
+      },
+      {
+        "milliseconds": 477.0552,
+        "peak_working_set_bytes": 74334208,
+        "peak_commit_bytes": 37523456
+      },
+      {
+        "milliseconds": 495.7363,
+        "peak_working_set_bytes": 74285056,
+        "peak_commit_bytes": 37543936
+      },
+      {
+        "milliseconds": 468.3698,
+        "peak_working_set_bytes": 74317824,
+        "peak_commit_bytes": 37441536
+      },
+      {
+        "milliseconds": 468.4964,
+        "peak_working_set_bytes": 74346496,
+        "peak_commit_bytes": 37560320
+      },
+      {
+        "milliseconds": 468.0064,
+        "peak_working_set_bytes": 74178560,
+        "peak_commit_bytes": 37429248
+      },
+      {
+        "milliseconds": 453.6752,
+        "peak_working_set_bytes": 74215424,
+        "peak_commit_bytes": 37392384
+      },
+      {
+        "milliseconds": 455.3604,
+        "peak_working_set_bytes": 74342400,
+        "peak_commit_bytes": 37515264
+      },
+      {
+        "milliseconds": 453.5546,
+        "peak_working_set_bytes": 74477568,
+        "peak_commit_bytes": 37609472
+      },
+      {
+        "milliseconds": 487.9698,
+        "peak_working_set_bytes": 74125312,
+        "peak_commit_bytes": 37314560
+      },
+      {
+        "milliseconds": 575.0524,
+        "peak_working_set_bytes": 74108928,
+        "peak_commit_bytes": 37318656
+      },
+      {
+        "milliseconds": 457.508,
+        "peak_working_set_bytes": 74403840,
+        "peak_commit_bytes": 37593088
+      },
+      {
+        "milliseconds": 455.5036,
+        "peak_working_set_bytes": 74383360,
+        "peak_commit_bytes": 37531648
+      },
+      {
+        "milliseconds": 469.8709,
+        "peak_working_set_bytes": 74489856,
+        "peak_commit_bytes": 37691392
+      },
+      {
+        "milliseconds": 475.2305,
+        "peak_working_set_bytes": 74293248,
+        "peak_commit_bytes": 37449728
+      },
+      {
+        "milliseconds": 480.3672,
+        "peak_working_set_bytes": 74391552,
+        "peak_commit_bytes": 37601280
+      },
+      {
+        "milliseconds": 467.8863,
+        "peak_working_set_bytes": 74633216,
+        "peak_commit_bytes": 37736448
+      },
+      {
+        "milliseconds": 494.9753,
+        "peak_working_set_bytes": 74321920,
+        "peak_commit_bytes": 37482496
+      },
+      {
+        "milliseconds": 462.7057,
+        "peak_working_set_bytes": 74444800,
+        "peak_commit_bytes": 37666816
+      },
+      {
+        "milliseconds": 474.5709,
+        "peak_working_set_bytes": 74342400,
+        "peak_commit_bytes": 37478400
+      },
+      {
+        "milliseconds": 455.0083,
+        "peak_working_set_bytes": 74436608,
+        "peak_commit_bytes": 37642240
+      },
+      {
+        "milliseconds": 461.9713,
+        "peak_working_set_bytes": 74518528,
+        "peak_commit_bytes": 37617664
+      },
+      {
+        "milliseconds": 469.4643,
+        "peak_working_set_bytes": 74252288,
+        "peak_commit_bytes": 37408768
+      },
+      {
+        "milliseconds": 462.1421,
+        "peak_working_set_bytes": 74330112,
+        "peak_commit_bytes": 37539840
+      },
+      {
+        "milliseconds": 497.6057,
+        "peak_working_set_bytes": 74539008,
+        "peak_commit_bytes": 37687296
+      },
+      {
+        "milliseconds": 460.8034,
+        "peak_working_set_bytes": 74567680,
+        "peak_commit_bytes": 37744640
+      },
+      {
+        "milliseconds": 457.9511,
+        "peak_working_set_bytes": 74326016,
+        "peak_commit_bytes": 37507072
+      },
+      {
+        "milliseconds": 466.3463,
+        "peak_working_set_bytes": 74428416,
+        "peak_commit_bytes": 37425152
+      },
+      {
+        "milliseconds": 485.5831,
+        "peak_working_set_bytes": 74231808,
+        "peak_commit_bytes": 37392384
+      },
+      {
+        "milliseconds": 481.1168,
+        "peak_working_set_bytes": 74612736,
+        "peak_commit_bytes": 37789696
+      },
+      {
+        "milliseconds": 474.0225,
+        "peak_working_set_bytes": 74559488,
+        "peak_commit_bytes": 37720064
+      },
+      {
+        "milliseconds": 474.083,
+        "peak_working_set_bytes": 74559488,
+        "peak_commit_bytes": 37736448
+      },
+      {
+        "milliseconds": 474.1991,
+        "peak_working_set_bytes": 74366976,
+        "peak_commit_bytes": 37511168
+      },
+      {
+        "milliseconds": 490.9378,
+        "peak_working_set_bytes": 74424320,
+        "peak_commit_bytes": 37535744
+      },
+      {
+        "milliseconds": 467.0811,
+        "peak_working_set_bytes": 74473472,
+        "peak_commit_bytes": 37613568
+      },
+      {
+        "milliseconds": 455.4672,
+        "peak_working_set_bytes": 74924032,
+        "peak_commit_bytes": 38219776
+      },
+      {
+        "milliseconds": 452.1898,
+        "peak_working_set_bytes": 74383360,
+        "peak_commit_bytes": 37634048
+      },
+      {
+        "milliseconds": 457.8046,
+        "peak_working_set_bytes": 74473472,
+        "peak_commit_bytes": 37629952
+      },
+      {
+        "milliseconds": 472.4821,
+        "peak_working_set_bytes": 74457088,
+        "peak_commit_bytes": 37683200
+      },
+      {
+        "milliseconds": 456.6388,
+        "peak_working_set_bytes": 74440704,
+        "peak_commit_bytes": 37580800
+      },
+      {
+        "milliseconds": 523.4705,
+        "peak_working_set_bytes": 74412032,
+        "peak_commit_bytes": 37625856
+      },
+      {
+        "milliseconds": 477.1869,
+        "peak_working_set_bytes": 74207232,
+        "peak_commit_bytes": 37400576
+      },
+      {
+        "milliseconds": 502.8527,
+        "peak_working_set_bytes": 74416128,
+        "peak_commit_bytes": 37601280
+      },
+      {
+        "milliseconds": 478.8335,
+        "peak_working_set_bytes": 74375168,
+        "peak_commit_bytes": 37502976
+      },
+      {
+        "milliseconds": 461.116,
+        "peak_working_set_bytes": 74473472,
+        "peak_commit_bytes": 37646336
+      },
+      {
+        "milliseconds": 451.6373,
+        "peak_working_set_bytes": 74461184,
+        "peak_commit_bytes": 37679104
+      },
+      {
+        "milliseconds": 456.7674,
+        "peak_working_set_bytes": 74301440,
+        "peak_commit_bytes": 37400576
+      },
+      {
+        "milliseconds": 455.5458,
+        "peak_working_set_bytes": 74285056,
+        "peak_commit_bytes": 37466112
+      },
+      {
+        "milliseconds": 475.1543,
+        "peak_working_set_bytes": 74317824,
+        "peak_commit_bytes": 37584896
+      },
+      {
+        "milliseconds": 456.4002,
+        "peak_working_set_bytes": 74342400,
+        "peak_commit_bytes": 37560320
+      },
+      {
+        "milliseconds": 471.9969,
+        "peak_working_set_bytes": 74194944,
+        "peak_commit_bytes": 37400576
+      },
+      {
+        "milliseconds": 459.8202,
+        "peak_working_set_bytes": 74448896,
+        "peak_commit_bytes": 37593088
+      },
+      {
+        "milliseconds": 463.8812,
+        "peak_working_set_bytes": 74534912,
+        "peak_commit_bytes": 37724160
+      },
+      {
+        "milliseconds": 460.9165,
+        "peak_working_set_bytes": 74903552,
+        "peak_commit_bytes": 38109184
+      },
+      {
+        "milliseconds": 455.3063,
+        "peak_working_set_bytes": 74346496,
+        "peak_commit_bytes": 37494784
+      },
+      {
+        "milliseconds": 478.9741,
+        "peak_working_set_bytes": 74424320,
+        "peak_commit_bytes": 37617664
+      },
+      {
+        "milliseconds": 470.9259,
+        "peak_working_set_bytes": 74420224,
+        "peak_commit_bytes": 37593088
+      },
+      {
+        "milliseconds": 485.1994,
+        "peak_working_set_bytes": 74432512,
+        "peak_commit_bytes": 37588992
+      },
+      {
+        "milliseconds": 459.3387,
+        "peak_working_set_bytes": 74403840,
+        "peak_commit_bytes": 37531648
+      },
+      {
+        "milliseconds": 451.5858,
+        "peak_working_set_bytes": 74481664,
+        "peak_commit_bytes": 37675008
+      },
+      {
+        "milliseconds": 455.1758,
+        "peak_working_set_bytes": 74272768,
+        "peak_commit_bytes": 37474304
+      },
+      {
+        "milliseconds": 478.0852,
+        "peak_working_set_bytes": 74334208,
+        "peak_commit_bytes": 37511168
+      },
+      {
+        "milliseconds": 488.1853,
+        "peak_working_set_bytes": 75132928,
+        "peak_commit_bytes": 38248448
+      },
+      {
+        "milliseconds": 537.5975,
+        "peak_working_set_bytes": 74297344,
+        "peak_commit_bytes": 37560320
+      },
+      {
+        "milliseconds": 470.2364,
+        "peak_working_set_bytes": 74518528,
+        "peak_commit_bytes": 37670912
+      },
+      {
+        "milliseconds": 458.0386,
+        "peak_working_set_bytes": 74403840,
+        "peak_commit_bytes": 37531648
+      },
+      {
+        "milliseconds": 472.4441,
+        "peak_working_set_bytes": 74420224,
+        "peak_commit_bytes": 37654528
+      },
+      {
+        "milliseconds": 480.2199,
+        "peak_working_set_bytes": 74465280,
+        "peak_commit_bytes": 37593088
+      },
+      {
+        "milliseconds": 511.6651,
+        "peak_working_set_bytes": 74559488,
+        "peak_commit_bytes": 37732352
+      },
+      {
+        "milliseconds": 477.2459,
+        "peak_working_set_bytes": 74280960,
+        "peak_commit_bytes": 37408768
+      },
+      {
+        "milliseconds": 468.5344,
+        "peak_working_set_bytes": 74186752,
+        "peak_commit_bytes": 37322752
+      },
+      {
+        "milliseconds": 470.9671,
+        "peak_working_set_bytes": 74366976,
+        "peak_commit_bytes": 37584896
+      },
+      {
+        "milliseconds": 454.75,
+        "peak_working_set_bytes": 74473472,
+        "peak_commit_bytes": 37720064
+      },
+      {
+        "milliseconds": 455.2978,
+        "peak_working_set_bytes": 74420224,
+        "peak_commit_bytes": 37625856
+      },
+      {
+        "milliseconds": 470.4798,
+        "peak_working_set_bytes": 74141696,
+        "peak_commit_bytes": 37273600
+      },
+      {
+        "milliseconds": 465.8536,
+        "peak_working_set_bytes": 74637312,
+        "peak_commit_bytes": 37773312
+      },
+      {
+        "milliseconds": 488.7924,
+        "peak_working_set_bytes": 74473472,
+        "peak_commit_bytes": 37617664
+      },
+      {
+        "milliseconds": 451.1204,
+        "peak_working_set_bytes": 74141696,
+        "peak_commit_bytes": 37289984
+      },
+      {
+        "milliseconds": 473.6232,
+        "peak_working_set_bytes": 74362880,
+        "peak_commit_bytes": 37511168
+      },
+      {
+        "milliseconds": 582.5375,
+        "peak_working_set_bytes": 74362880,
+        "peak_commit_bytes": 37502976
+      },
+      {
+        "milliseconds": 460.6317,
+        "peak_working_set_bytes": 74575872,
+        "peak_commit_bytes": 37711872
+      },
+      {
+        "milliseconds": 454.455,
+        "peak_working_set_bytes": 74498048,
+        "peak_commit_bytes": 37691392
+      },
+      {
+        "milliseconds": 476.7804,
+        "peak_working_set_bytes": 74358784,
+        "peak_commit_bytes": 37576704
+      },
+      {
+        "milliseconds": 477.0672,
+        "peak_working_set_bytes": 74477568,
+        "peak_commit_bytes": 37650432
+      },
+      {
+        "milliseconds": 475.0372,
+        "peak_working_set_bytes": 74141696,
+        "peak_commit_bytes": 37335040
+      },
+      {
+        "milliseconds": 466.7702,
+        "peak_working_set_bytes": 74309632,
+        "peak_commit_bytes": 37556224
+      },
+      {
+        "milliseconds": 461.7185,
+        "peak_working_set_bytes": 74211328,
+        "peak_commit_bytes": 37392384
+      },
+      {
+        "milliseconds": 480.6351,
+        "peak_working_set_bytes": 74428416,
+        "peak_commit_bytes": 37556224
+      },
+      {
+        "milliseconds": 482.0641,
+        "peak_working_set_bytes": 74399744,
+        "peak_commit_bytes": 37572608
+      },
+      {
+        "milliseconds": 499.8882,
+        "peak_working_set_bytes": 74350592,
+        "peak_commit_bytes": 37437440
+      },
+      {
+        "milliseconds": 467.2065,
+        "peak_working_set_bytes": 74354688,
+        "peak_commit_bytes": 37593088
+      },
+      {
+        "milliseconds": 460.083,
+        "peak_working_set_bytes": 74428416,
+        "peak_commit_bytes": 37613568
+      },
+      {
+        "milliseconds": 468.2346,
+        "peak_working_set_bytes": 74457088,
+        "peak_commit_bytes": 37572608
+      },
+      {
+        "milliseconds": 502.6299,
+        "peak_working_set_bytes": 74260480,
+        "peak_commit_bytes": 37498880
+      },
+      {
+        "milliseconds": 516.2776,
+        "peak_working_set_bytes": 74178560,
+        "peak_commit_bytes": 37347328
+      }
+    ],
+    "wall_percentiles_ms": {
+      "p50": 468.6825,
+      "p95": 511.6651,
+      "p99": 575.0524
+    },
+    "peak_working_set_percentiles_bytes": {
+      "p50": 74399744.0,
+      "p95": 74612736.0,
+      "p99": 74924032.0
+    },
+    "peak_commit_percentiles_bytes": {
+      "p50": 37576704.0,
+      "p95": 37744640.0,
+      "p99": 38219776.0
+    }
+  }
+}

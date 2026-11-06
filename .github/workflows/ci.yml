@@ -59,6 +59,9 @@ jobs:
         shell: pwsh
       - run: ./tests/switch.ps1
         shell: pwsh
+      - run: ./tests/equivalent-bench.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
       - run: ./tests/preprocessor.ps1
         shell: pwsh
       - run: ./tests/output-safety.ps1

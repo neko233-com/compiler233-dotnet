@@ -164,6 +164,14 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 原生前端的语法覆盖和语法树内容比 Roslyn 少，因此该微基准**不是功能等价的速度比较**。[本机实验记录](benchmarks/RESULTS.md)仅用于跟踪早期实现。正式性能结论需要固定工具版本、代表性项目、正确性验证、多次独立运行、内存与完整编译测量。
 
+Windows x64 上可运行端到端子集对照：
+
+```powershell
+./benchmarks/equivalent-compile.ps1 -Iterations 100 -Warmup 5 -ExtraMethods 200
+```
+
+脚本为双方使用同一批源码、目标类型和 `System.Runtime` 引用，先用 Roslyn oracle 运行指定入口，再交替启动独立编译进程并记录全部样本与 p50/p95/p99。JSON 报告保存在 `benchmarks/results/equivalent-compile/`，包含工具及输入 SHA-256、命令参数、版本和校验结果。每个样本读取 Windows [进程峰值工作集和提交量](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters)，不包含父进程或子进程。该合成语料不覆盖完整 C#、实际工程、增量编译、分析器或生成器，不能证明完整 Roslyn 替代或总体性能领先。
+
 ## 后续里程碑
 
 - **M0（进行中）**：csc 命令行前端、诊断与退出码、`-report` 报告、CLI 契约测试、tag 驱动的发布；当前以 Windows 验收，完整选项语义和产物兼容尚未完成。
