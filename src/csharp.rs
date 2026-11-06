@@ -844,7 +844,11 @@ impl<'a> Parser<'a> {
                 self.expect(")")?;
                 base_args = Some(args);
             }
-            let body = self.parse_block()?;
+            let body = if self.eat("=>") {
+                self.parse_expression_body(true)?
+            } else {
+                self.parse_block()?
+            };
             decl.methods.push(MethodDecl {
                 name,
                 is_static: false,
@@ -860,6 +864,22 @@ impl<'a> Parser<'a> {
 
         let ty = self.parse_type_reference()?;
         let name = self.identifier()?;
+        if self.eat("=>") {
+            if decl.is_interface || ty == Ty::Void {
+                return Err(self.error("expression-bodied property is not supported here"));
+            }
+            let getter = self.parse_expression_body(false)?;
+            decl.properties.push(PropertyDecl {
+                name,
+                ty,
+                is_static,
+                has_getter: true,
+                has_setter: false,
+                getter: Some(getter),
+                setter: None,
+            });
+            return Ok(());
+        }
         if self.check("{") {
             // Property with accessors: `int Value { get; set; }`.
             self.bump();
@@ -878,6 +898,11 @@ impl<'a> Parser<'a> {
                 let accessor = self.identifier_like()?;
                 let body = if self.eat(";") {
                     None
+                } else if self.eat("=>") {
+                    if decl.is_interface {
+                        return Err(self.error("interface accessor bodies are not supported"));
+                    }
+                    Some(self.parse_expression_body(accessor != "get")?)
                 } else {
                     Some(self.parse_block()?)
                 };
@@ -911,6 +936,11 @@ impl<'a> Parser<'a> {
             let params = self.parse_parameter_list()?;
             let body = if self.check("{") {
                 Some(self.parse_block()?)
+            } else if self.eat("=>") {
+                if decl.is_interface {
+                    return Err(self.error("interface method bodies are not supported"));
+                }
+                Some(self.parse_expression_body(ty == Ty::Void)?)
             } else {
                 self.expect(";")?;
                 None
@@ -948,6 +978,37 @@ impl<'a> Parser<'a> {
             current_name = self.identifier()?;
         }
         self.expect(";")
+    }
+
+    fn parse_expression_body(&mut self, is_void: bool) -> Result<Block, CompileError> {
+        let statement = if is_void {
+            let statement = self.parse_simple_statement()?;
+            match &statement {
+                Stmt::Assign { .. }
+                | Stmt::AssignOp { .. }
+                | Stmt::AssignMember { .. }
+                | Stmt::AssignMemberOp { .. }
+                | Stmt::AssignIndex { .. }
+                | Stmt::Expression(
+                    Expr::Call { .. }
+                    | Expr::New { .. }
+                    | Expr::Increment { .. }
+                    | Expr::Assign { .. },
+                ) => statement,
+                _ => {
+                    return Err(
+                        self.error("expression-bodied void member requires a statement expression")
+                    );
+                }
+            }
+        } else {
+            let expression = self.parse_expression()?;
+            self.expect(";")?;
+            Stmt::Return(Some(expression))
+        };
+        Ok(Block {
+            statements: vec![statement],
+        })
     }
 
     fn parse_type_reference(&mut self) -> Result<Ty, CompileError> {

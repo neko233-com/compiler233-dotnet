@@ -39,6 +39,8 @@ jobs:
         shell: pwsh
       - run: ./tests/refout.ps1
         shell: pwsh
+      - run: ./tests/expression.ps1
+        shell: pwsh
       - run: ./tests/preprocessor.ps1
         shell: pwsh
       - run: ./tests/output-safety.ps1
