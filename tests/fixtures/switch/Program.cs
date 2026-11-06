@@ -99,6 +99,9 @@ namespace SwitchFixture {
             return state;
         }
         public static int NestedSwitchCases() { return NestedSwitchReturn(1) * 10 + NestedSwitchReturn(2); }
+        public static int ConstantExpression() {
+            switch (2) { case 1 + 1: return 23; default: return -1; }
+        }
         public static int EmptySwitchEvaluatesOnce() { state = 0; switch (Probe()) {} return state; }
         public static int LoopBreakAndContinue() {
             int total = 0;

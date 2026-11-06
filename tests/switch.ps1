@@ -17,7 +17,7 @@ $manifest = Join-Path $work 'manifest.txt'
 & $binary csc $source "-out:$output"
 if ($LASTEXITCODE -ne 0) { throw 'Switch fixture failed to compile' }
 $oracle = Join-Path $root 'tests/CompileOracle/bin/Release/net10.0/CompileOracle.dll'
-foreach ($method in @('IntegerCases', 'StringCases', 'EscapedStringCases', 'EscapedExpression', 'BooleanCases', 'RadixCases', 'DenseCases', 'DenseExtremeCases', 'DenseMinCases', 'DenseWithFilter', 'NestedSwitchCases', 'EmptySwitchEvaluatesOnce', 'LoopBreakAndContinue', 'NestedLoopBreak', 'NestedSwitchContinue', 'BreakThroughFinally', 'SwitchInsideFinally', 'ContinueThroughFinally', 'BlockScopes', 'NestedDo')) {
+foreach ($method in @('IntegerCases', 'StringCases', 'EscapedStringCases', 'EscapedExpression', 'BooleanCases', 'RadixCases', 'DenseCases', 'DenseExtremeCases', 'DenseMinCases', 'DenseWithFilter', 'NestedSwitchCases', 'ConstantExpression', 'EmptySwitchEvaluatesOnce', 'LoopBreakAndContinue', 'NestedLoopBreak', 'NestedSwitchContinue', 'BreakThroughFinally', 'SwitchInsideFinally', 'ContinueThroughFinally', 'BlockScopes', 'NestedDo')) {
     $result = & dotnet $oracle $manifest $output 'SwitchFixture.Runner' $method 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "Runtime mismatch for $method`: $result" }
     Write-Output $result.Trim()
@@ -48,7 +48,6 @@ foreach ($invalid in @(
     if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Failed compilation changed previous output' }
 }
 foreach ($unsupported in @(
-    'class C { void F(int x) { switch (x) { case 1 + 1: break; } } }',
     'class C { void F(int x) { switch (x) { case 1: int local = 2; break; } } }',
     'class C { string F() { return "\uD800"; } }'
 )) {
