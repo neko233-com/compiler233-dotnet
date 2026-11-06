@@ -45,6 +45,34 @@ static HashSet<ushort> ReadOpcodes(MethodInfo method)
     }
     return result;
 }
+if (args.Length == 3 && args[0] == "--readonly")
+{
+    foreach (string path in args[1..])
+    {
+        using var stream = File.OpenRead(path);
+        using var pe = new PEReader(stream);
+        var reader = pe.GetMetadataReader();
+        var holder = reader.TypeDefinitions.Select(reader.GetTypeDefinition)
+            .Single(type => reader.GetString(type.Namespace) == "ReadonlyFixture" && reader.GetString(type.Name) == "Holder");
+        foreach (var (name, isStatic) in new[] {
+            ("A", false), ("B", false), ("C", false), ("Numbers", false), ("Pick", false), ("Global", true), ("Inline", true)
+        })
+        {
+            var field = holder.GetFields().Select(reader.GetFieldDefinition)
+                .Single(field => reader.GetString(field.Name) == name);
+            if (!field.Attributes.HasFlag(FieldAttributes.InitOnly) || field.Attributes.HasFlag(FieldAttributes.Static) != isStatic)
+                throw new Exception($"Incorrect readonly field metadata: {name} in {path}");
+        }
+        var trigger = holder.GetFields().Select(reader.GetFieldDefinition)
+            .Single(field => reader.GetString(field.Name) == "Trigger");
+        if (trigger.Attributes.HasFlag(FieldAttributes.InitOnly)) throw new Exception("Mutable field marked readonly");
+    }
+    var assembly = LoadAssembly(args[1]);
+    object? result = assembly.GetType("ReadonlyFixture.Holder", true)!.GetMethod("Run")!.Invoke(null, null);
+    if (!Equals(result, 39)) throw new Exception($"Readonly fixture returned {result}");
+    Console.WriteLine("Readonly field metadata, constructor writes and reference mutation passed (39).");
+    return;
+}
 if (args.Length == 3 && args[0] == "--static")
 {
     foreach (string path in args[1..])

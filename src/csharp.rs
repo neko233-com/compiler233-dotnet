@@ -288,6 +288,7 @@ struct FieldDecl {
     name: String,
     ty: Ty,
     is_static: bool,
+    is_readonly: bool,
     visibility: Visibility,
     init: Option<Expr>,
 }
@@ -1493,6 +1494,11 @@ impl<'a> Parser<'a> {
                     )?;
                 }
                 "class" | "struct" | "interface" | "record" => {
+                    if text == "struct" || text == "record" {
+                        return Err(
+                            self.error(format!("'{text}' declarations are not supported yet"))
+                        );
+                    }
                     let is_static = type_modifiers.iter().any(|modifier| modifier == "static");
                     if is_static
                         && (text != "class"
@@ -2043,6 +2049,7 @@ impl<'a> Parser<'a> {
     fn parse_member(&mut self, decl: &mut TypeDecl) -> Result<(), CompileError> {
         self.skip_attribute_lists()?;
         let mut is_static = false;
+        let mut is_readonly = false;
         let mut access_bits = 0;
         let mut virtual_kind = VirtualKind::None;
         let mut invalid_constructor_modifier = false;
@@ -2076,11 +2083,14 @@ impl<'a> Parser<'a> {
                     virtual_kind = VirtualKind::Override;
                     self.bump();
                 }
-                "readonly" | "const" => {
-                    return Err(
-                        self.error(format!("'{}' members are not supported yet", self.text()))
-                    );
+                "readonly" => {
+                    if is_readonly {
+                        return Err(self.error("duplicate readonly modifier"));
+                    }
+                    is_readonly = true;
+                    self.bump();
                 }
+                "const" => return Err(self.error("const members are not supported yet")),
                 "sealed" | "unsafe" | "extern" | "async" | "partial" => {
                     if self.text() != "unsafe" {
                         invalid_constructor_modifier = true;
@@ -2112,7 +2122,7 @@ impl<'a> Parser<'a> {
             if name != decl.name {
                 return Err(self.error("constructor name must match its declaring type"));
             }
-            if invalid_constructor_modifier || virtual_kind != VirtualKind::None {
+            if invalid_constructor_modifier || is_readonly || virtual_kind != VirtualKind::None {
                 return Err(self.error("invalid constructor modifier"));
             }
             if decl.is_interface && !is_static {
@@ -2192,6 +2202,9 @@ impl<'a> Parser<'a> {
 
         let ty = self.parse_type_reference()?;
         let name = self.identifier()?;
+        if is_readonly && (self.check("=>") || self.check("{") || self.check("(")) {
+            return Err(self.error("readonly is supported only on fields"));
+        }
         if self.eat("=>") {
             if decl.is_interface || ty == Ty::Void {
                 return Err(self.error("expression-bodied property is not supported here"));
@@ -2333,6 +2346,23 @@ impl<'a> Parser<'a> {
         }
 
         // Field declarators, with optional initializers.
+        if is_readonly && (invalid_constructor_modifier || virtual_kind != VirtualKind::None) {
+            return Err(self.error("invalid readonly field modifier"));
+        }
+        if decl.is_interface && !is_static {
+            return Err(self.error("interfaces cannot declare instance fields"));
+        }
+        fn valid_field_type(ty: &Ty) -> bool {
+            match ty {
+                Ty::Void | Ty::Null => false,
+                Ty::Array(element) => valid_field_type(element),
+                Ty::Generic(_, arguments) => arguments.iter().all(valid_field_type),
+                _ => true,
+            }
+        }
+        if !valid_field_type(&ty) {
+            return Err(self.error("invalid field type"));
+        }
         let mut current_name = name;
         loop {
             let init = if self.eat("=") {
@@ -2344,6 +2374,7 @@ impl<'a> Parser<'a> {
                 name: current_name.clone(),
                 ty: ty.clone(),
                 is_static,
+                is_readonly,
                 visibility,
                 init,
             });
@@ -3702,6 +3733,18 @@ fn resolve_type(
                             "referenced enum type '{name}' is not supported yet"
                         ));
                     }
+                    if entry
+                        .get()
+                        .extends
+                        .as_ref()
+                        .is_some_and(|base| base.full_name() == "System.ValueType")
+                        && !(entry.get().full_name() == "System.Enum"
+                            && trusted_corlib(externals, *index))
+                    {
+                        return Err(format!(
+                            "referenced value type '{name}' is not supported yet"
+                        ));
+                    }
                     let imported = module
                         .import_foreign_type(
                             &TypeDefOrRef::TypeDef(entry.clone()),
@@ -3720,6 +3763,14 @@ fn resolve_type(
             };
             if !entry.get().is_visible() {
                 return Err(format!("referenced type '{name}' is inaccessible"));
+            }
+            if entry
+                .get()
+                .extends
+                .as_ref()
+                .is_some_and(|base| base.full_name() == "System.ValueType")
+            {
+                return Err(format!("generic value type '{name}' is not supported yet"));
             }
             let open = module
                 .import_foreign_type(
@@ -4159,6 +4210,11 @@ fn emit(
             let signature = resolve_type(&field.ty, &types, &externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
             let flags = field.visibility.field_flags()
+                | if field.is_readonly {
+                    FieldFlags::InitOnly
+                } else {
+                    FieldFlags::empty()
+                }
                 | if field.is_static {
                     FieldFlags::Static
                 } else {
@@ -4488,6 +4544,7 @@ fn emit_body(
         namespace: decl.namespace.clone(),
         enum_imports: &decl.enum_imports,
         is_static: true,
+        field_write_context: FieldWriteContext::Normal,
         return_ty: Ty::Void,
         externals,
         enums,
@@ -4536,6 +4593,7 @@ fn emit_body(
                         context.field_store(field, initializer)?;
                     }
                 }
+                context.field_write_context = FieldWriteContext::InstanceConstructor;
             }
             context.validate_do_scopes(body)?;
             context.block(body)?;
@@ -4602,6 +4660,7 @@ fn emit_body(
         }
         Job::StaticCtor => {
             context.is_static = true;
+            context.field_write_context = FieldWriteContext::StaticConstructor;
             for field in &decl.fields {
                 if !field.is_static {
                     continue;
@@ -4638,6 +4697,13 @@ struct ControlTarget {
     finally_depth: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldWriteContext {
+    Normal,
+    InstanceConstructor,
+    StaticConstructor,
+}
+
 struct FnEmitter<'a> {
     module: &'a mut Module,
     types: &'a HashMap<String, Entry<TypeDef>>,
@@ -4646,6 +4712,7 @@ struct FnEmitter<'a> {
     namespace: String,
     enum_imports: &'a EnumImports,
     is_static: bool,
+    field_write_context: FieldWriteContext,
     return_ty: Ty,
     externals: &'a Externals,
     enums: &'a EnumValues,
@@ -4773,6 +4840,37 @@ impl<'a> FnEmitter<'a> {
         )
     }
 
+    fn require_field_writable(
+        &self,
+        field: &Entry<Field>,
+        local: bool,
+        this_receiver: bool,
+    ) -> Result<(), CompileError> {
+        let field = field.get();
+        if !field.flags.contains(FieldFlags::InitOnly) {
+            return Ok(());
+        }
+        let same_type = local
+            && field.declaring_type.upgrade().is_some_and(|owner| {
+                let owner = owner.get();
+                owner.name == self.current && owner.namespace == self.namespace
+            });
+        let allowed = same_type
+            && if field.flags.contains(FieldFlags::Static) {
+                self.field_write_context == FieldWriteContext::StaticConstructor
+            } else {
+                this_receiver && self.field_write_context == FieldWriteContext::InstanceConstructor
+            };
+        if allowed {
+            Ok(())
+        } else {
+            Err(self.error(format!(
+                "readonly field '{}' cannot be assigned here",
+                field.name
+            )))
+        }
+    }
+
     fn argument_index(&self, position: usize) -> u16 {
         if self.is_static {
             position as u16
@@ -4878,6 +4976,9 @@ impl<'a> FnEmitter<'a> {
                 return Ok(None);
             };
             self.require_field_access(&field.entry, true, None)?;
+            if writing {
+                self.require_field_writable(&field.entry, true, true)?;
+            }
             let flags = field.entry.get().flags;
             (field.ty, MemberToken::Field(field.entry), flags)
         } else {
@@ -4900,6 +5001,9 @@ impl<'a> FnEmitter<'a> {
                 return Ok(None);
             };
             self.require_field_access(&field, false, None)?;
+            if writing {
+                self.require_field_writable(&field, false, true)?;
+            }
             let (flags, signature) = {
                 let field = field.get();
                 (field.flags, field.signature.ty.clone())
@@ -4932,11 +5036,6 @@ impl<'a> FnEmitter<'a> {
         }
         if flags.contains(FieldFlags::Literal) {
             return Err(self.error("referenced constant fields are not supported yet"));
-        }
-        if writing && flags.contains(FieldFlags::InitOnly) {
-            return Err(self.error(format!(
-                "readonly field '{owner}.{name}' cannot be assigned"
-            )));
         }
         Ok(Some((ty, token)))
     }
@@ -5866,6 +5965,7 @@ impl<'a> FnEmitter<'a> {
                     && let Some(field) = self.field_symbol(&current, name)
                     && !field.is_static
                 {
+                    self.require_field_writable(&field.entry, true, true)?;
                     self.validate_compound(&field.ty, op)?;
                     if self.is_static {
                         return Err(self.error(format!(
@@ -6083,6 +6183,14 @@ impl<'a> FnEmitter<'a> {
                 };
                 if let Some(field) = self.field_symbol(&type_name, name) {
                     self.require_field_access(&field.entry, true, Some(&type_name))?;
+                    if field.is_static {
+                        return Err(self.error(format!("'{type_name}.{name}' is static")));
+                    }
+                    self.require_field_writable(
+                        &field.entry,
+                        true,
+                        matches!(target, Expr::Name(receiver) if receiver == "this"),
+                    )?;
                     self.validate_compound(&field.ty, op)?;
                     self.emitter.dup();
                     self.emitter.emit(Instruction::new(
@@ -6153,6 +6261,11 @@ impl<'a> FnEmitter<'a> {
                     if field.is_static {
                         return Err(self.error(format!("'{type_name}.{name}' is static")));
                     }
+                    self.require_field_writable(
+                        &field.entry,
+                        true,
+                        matches!(target, Expr::Name(receiver) if receiver == "this"),
+                    )?;
                     let actual = self.expr(value)?;
                     self.convert_expression(
                         &actual,
@@ -6419,6 +6532,7 @@ impl<'a> FnEmitter<'a> {
             self.assign_property(name, value, false)?;
             return Ok(());
         };
+        self.require_field_writable(&field.entry, true, true)?;
         if field.is_static {
             let actual = self.expr(value)?;
             self.convert_expression(
@@ -6488,6 +6602,7 @@ impl<'a> FnEmitter<'a> {
         let Some(field) = self.field_symbol(&self.current.clone(), name) else {
             return self.assign_property(name, value, true);
         };
+        self.require_field_writable(&field.entry, true, true)?;
         if field.is_static {
             let actual = self.expr(value)?;
             self.convert_expression(
@@ -6814,6 +6929,7 @@ impl<'a> FnEmitter<'a> {
             }
             return Ok(());
         };
+        self.require_field_writable(&field.entry, true, true)?;
         if !field.is_static {
             if self.is_static {
                 return Err(self.error(format!(
@@ -6911,6 +7027,7 @@ impl<'a> FnEmitter<'a> {
                 if !field.is_static {
                     return Err(self.error(format!("'{type_name}.{name}' is not static")));
                 }
+                self.require_field_writable(&field.entry, true, true)?;
                 (field.ty, IncrementMemberTarget::Field(field.entry))
             } else {
                 let property = self
@@ -6974,6 +7091,11 @@ impl<'a> FnEmitter<'a> {
             if field.is_static {
                 return Err(self.error(format!("'{type_name}.{name}' is static")));
             }
+            self.require_field_writable(
+                &field.entry,
+                true,
+                matches!(target, Expr::Name(receiver) if receiver == "this"),
+            )?;
             (field.ty, IncrementMemberTarget::Field(field.entry))
         } else {
             let property = self
@@ -7850,6 +7972,7 @@ impl<'a> FnEmitter<'a> {
                 if field.is_static {
                     return Err(self.error(format!("'{name}' is static")));
                 }
+                self.require_field_writable(&field.entry, true, false)?;
                 self.emitter.dup();
                 let actual = self.expr(value)?;
                 self.convert_expression(&actual, &field.ty, value, "initializer")

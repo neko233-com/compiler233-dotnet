@@ -63,6 +63,7 @@ cargo test --locked
 ./tests/output-safety.ps1
 ./tests/enums.ps1
 ./tests/statics.ps1
+./tests/readonly.ps1
 ./benchmarks/check-subset.ps1
 ```
 
@@ -120,7 +121,8 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 - 命名空间（块式与文件级）、类（含静态类）、静态/实例字段与初始化器（实例初始化器在构造函数，静态初始化器在 `.cctor`）
 - 静态类：生成 CLR 静态类标记并拒绝实例成员；显式静态构造函数按字段初始化器之后执行，并保留 CLR 的初始化失败行为。静态类的实例化和作为变量、参数或返回值类型使用会被拒绝。
-- 静态字段：支持通过类型名、受支持的命名空间导入或别名读取、赋值、复合赋值和自增自减；支持部分引用程序集字段及外部 `readonly` 字段读取。源代码中的 `const` / `readonly` 成员声明和外部常量字段暂不支持。
+- 静态字段：支持通过类型名、受支持的命名空间导入或别名读取、赋值、复合赋值和自增自减；支持部分引用程序集字段及外部 `readonly` 字段读取。源代码中的 `const` 声明和外部常量字段暂不支持。
+- `readonly` 字段：对当前支持的字段类型生成 CLR `InitOnly` 元数据，在声明、所属构造函数及受支持的静态初始化器中允许赋值；其他直接写入会被拒绝。只读引用指向的对象仍可修改。
 - 对象：`new T(...)`（按参数个数匹配构造函数）、`new T { Name = value }` 对象初始化器（字段与属性）、`obj.field` 读写、`obj.Method(...)` 与 `this.Method(...)` 调用
 - 属性：`get`/`set` 访问器（自动属性生成后备字段）、`obj.Prop` 读取与 `obj.Prop = v` 赋值、静态属性
 - 表达式体：在现有表达式和语句子集内支持方法、构造函数、只读属性及 `get`/`set` 访问器的 `=>` 写法；接口成员的表达式体和更广的表达式仍未覆盖。
@@ -142,7 +144,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 泛型类型实例：`List<int>` 等引用程序集里的泛型类型，字段/局部/参数签名用`GenericInst`，成员通过`TypeSpec`父的 MemberRef 调用（`list.Add(x)`、`list.Count`），`new List<int>()` 可用；泛型**类型定义**仍不支持
 - 调用：本程序集的静态/实例方法与构造函数；BCL 的 `System.Math.Max/Min/Abs`、`System.Convert.ToString`、`System.String.Concat`、`System.Console.Write/WriteLine`（按需添加 `System.Console` 程序集引用）
 
-尚未支持、会被明确拒绝而不是静默降级：可选参数默认值、泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、`async` 和 `switch` 模式匹配等扩展形式。
+尚未支持、会被明确拒绝而不是静默降级：`struct` / `record` 声明、未受支持的外部值类型、可选参数默认值、泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、`async` 和 `switch` 模式匹配等扩展形式。
 
 当前针对性测试包括 `./tests/enums.ps1`：检查枚举字段与方法元数据、引用程序集、实际运行结果、下游调用和失败时旧产物保护。仓库保留既有的差分测试及历史数据；这些有限用例不能代表完整功能或生产验收。
 

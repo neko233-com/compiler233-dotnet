@@ -76,7 +76,6 @@ foreach ($invalid in @(
     'static class S { } class C { void M() { new S(); } }',
     'class S { public int Field; } class C { int M() { return S.Field; } }',
     'class S { private static int Field; } class C { int M() { return S.Field; } }',
-    'static class S { public static readonly int Field = 1; }',
     'class S { public const int Field = 1; }',
     'class C { static Different() { } }'
 )) {
