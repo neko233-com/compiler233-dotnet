@@ -817,6 +817,18 @@ enum Expr {
         delta: i32,
         prefix: bool,
     },
+    IncrementMember {
+        target: Box<Expr>,
+        name: String,
+        delta: i32,
+        prefix: bool,
+    },
+    IncrementIndex {
+        target: Box<Expr>,
+        index: Box<Expr>,
+        delta: i32,
+        prefix: bool,
+    },
 }
 
 pub fn compile(
@@ -2792,20 +2804,29 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, CompileError> {
-        if (self.check("++") || self.check("--"))
-            && self
-                .tokens
-                .get(self.position + 1)
-                .is_some_and(|token| token.kind == syntax::TokenKind::Identifier)
-        {
+        if self.check("++") || self.check("--") {
             let delta = if self.check("++") { 1 } else { -1 };
             self.bump();
-            let name = self.identifier()?;
-            return Ok(Expr::Increment {
-                name,
-                delta,
-                prefix: true,
-            });
+            return match self.parse_unary()? {
+                Expr::Name(name) => Ok(Expr::Increment {
+                    name,
+                    delta,
+                    prefix: true,
+                }),
+                Expr::Member { target, name } => Ok(Expr::IncrementMember {
+                    target,
+                    name,
+                    delta,
+                    prefix: true,
+                }),
+                Expr::Index { target, index } => Ok(Expr::IncrementIndex {
+                    target,
+                    index,
+                    delta,
+                    prefix: true,
+                }),
+                _ => Err(self.error("increment requires an assignable variable or member")),
+            };
         }
         match self.text() {
             "-" => {
@@ -2873,18 +2894,6 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self) -> Result<Expr, CompileError> {
         let mut expression = self.parse_primary()?;
-        if let Expr::Name(name) = &expression
-            && (self.check("++") || self.check("--"))
-        {
-            let delta = if self.check("++") { 1 } else { -1 };
-            let name = name.clone();
-            self.bump();
-            return Ok(Expr::Increment {
-                name,
-                delta,
-                prefix: false,
-            });
-        }
         loop {
             if self.check(".") {
                 self.bump();
@@ -2944,6 +2953,30 @@ impl<'a> Parser<'a> {
                     _ => return Err(self.error("only a named method can be called")),
                 }
                 continue;
+            }
+            if self.check("++") || self.check("--") {
+                let delta = if self.check("++") { 1 } else { -1 };
+                self.bump();
+                return match expression {
+                    Expr::Name(name) => Ok(Expr::Increment {
+                        name,
+                        delta,
+                        prefix: false,
+                    }),
+                    Expr::Member { target, name } => Ok(Expr::IncrementMember {
+                        target,
+                        name,
+                        delta,
+                        prefix: false,
+                    }),
+                    Expr::Index { target, index } => Ok(Expr::IncrementIndex {
+                        target,
+                        index,
+                        delta,
+                        prefix: false,
+                    }),
+                    _ => Err(self.error("increment requires an assignable variable or member")),
+                };
             }
             return Ok(expression);
         }
@@ -4322,6 +4355,14 @@ struct FnEmitter<'a> {
     file: String,
     source: String,
     offset: usize,
+}
+
+enum IncrementMemberTarget {
+    Field(Entry<Field>),
+    Property {
+        getter: Entry<Method>,
+        setter: Entry<Method>,
+    },
 }
 
 impl<'a> FnEmitter<'a> {
@@ -6172,6 +6213,238 @@ impl<'a> FnEmitter<'a> {
 }
 
 impl<'a> FnEmitter<'a> {
+    fn increment_top(&mut self, ty: &Ty, delta: i32) -> Result<(), CompileError> {
+        match ty {
+            Ty::Int => {
+                self.emitter.ldc_i4(delta.abs());
+            }
+            Ty::Enum(_, base) if base.width() == 8 => {
+                self.emitter.emit(Instruction::new(
+                    OpCode::Ldc_I8,
+                    Operand::Int64(i64::from(delta.abs())),
+                ));
+            }
+            Ty::Enum(_, _) => {
+                self.emitter.ldc_i4(delta.abs());
+            }
+            _ => {
+                return Err(
+                    self.error(format!("increment requires an integer or enum, got {ty:?}"))
+                );
+            }
+        }
+        self.emitter
+            .op(if delta > 0 { OpCode::Add } else { OpCode::Sub });
+        if let Ty::Enum(_, base) = ty
+            && base.width() < 4
+        {
+            self.emitter.op(base.conversion());
+        }
+        Ok(())
+    }
+
+    fn increment_member(
+        &mut self,
+        target: &Expr,
+        name: &str,
+        delta: i32,
+        prefix: bool,
+    ) -> Result<Ty, CompileError> {
+        if let Some(type_name) = Self::type_path(target)
+            && self.types.contains_key(&type_name)
+            && !self.locals.contains_key(&type_name)
+            && !self
+                .params
+                .iter()
+                .any(|(parameter, _)| parameter == &type_name)
+            && self.field_symbol(&self.current, &type_name).is_none()
+            && self
+                .symbols
+                .get(&self.current)
+                .and_then(|symbol| symbol.properties.get(&type_name))
+                .is_none()
+        {
+            let (ty, member) = if let Some(field) = self.field_symbol(&type_name, name) {
+                self.require_field_access(&field.entry, true, None)?;
+                if !field.is_static {
+                    return Err(self.error(format!("'{type_name}.{name}' is not static")));
+                }
+                (field.ty, IncrementMemberTarget::Field(field.entry))
+            } else {
+                let property = self
+                    .symbols
+                    .get(&type_name)
+                    .and_then(|symbol| symbol.properties.get(name))
+                    .cloned()
+                    .ok_or_else(|| self.error(format!("unknown member '{type_name}.{name}'")))?;
+                if !property.is_static {
+                    return Err(self.error(format!("'{type_name}.{name}' is not static")));
+                }
+                let (Some(getter), Some(setter)) = (property.getter, property.setter) else {
+                    return Err(self.error(format!(
+                        "property '{type_name}.{name}' requires both accessors"
+                    )));
+                };
+                self.require_method_access(&getter, true, None)?;
+                self.require_method_access(&setter, true, None)?;
+                (
+                    property.ty,
+                    IncrementMemberTarget::Property { getter, setter },
+                )
+            };
+            match &member {
+                IncrementMemberTarget::Field(field) => {
+                    self.emitter.emit(Instruction::new(
+                        OpCode::Ldsfld,
+                        Operand::Token(MemberToken::Field(field.clone())),
+                    ));
+                }
+                IncrementMemberTarget::Property { getter, .. } => {
+                    self.emitter.call(getter.clone());
+                }
+            }
+            if !prefix {
+                self.emitter.dup();
+            }
+            self.increment_top(&ty, delta)?;
+            if prefix {
+                self.emitter.dup();
+            }
+            match member {
+                IncrementMemberTarget::Field(field) => {
+                    self.emitter.emit(Instruction::new(
+                        OpCode::Stsfld,
+                        Operand::Token(MemberToken::Field(field)),
+                    ));
+                }
+                IncrementMemberTarget::Property { setter, .. } => {
+                    self.emitter.call(setter);
+                }
+            }
+            return Ok(ty);
+        }
+        let receiver_type = self.expr(target)?;
+        let Ty::Class(type_name) = &receiver_type else {
+            return Err(self.error(format!("type {receiver_type:?} has no assignable members")));
+        };
+        let (ty, member) = if let Some(field) = self.field_symbol(type_name, name) {
+            self.require_field_access(&field.entry, true, Some(type_name))?;
+            if field.is_static {
+                return Err(self.error(format!("'{type_name}.{name}' is static")));
+            }
+            (field.ty, IncrementMemberTarget::Field(field.entry))
+        } else {
+            let property = self
+                .symbols
+                .get(type_name)
+                .and_then(|symbol| symbol.properties.get(name))
+                .cloned()
+                .ok_or_else(|| self.error(format!("unknown member '{type_name}.{name}'")))?;
+            if property.is_static {
+                return Err(self.error(format!("'{type_name}.{name}' is static")));
+            }
+            let (Some(getter), Some(setter)) = (property.getter, property.setter) else {
+                return Err(self.error(format!(
+                    "property '{type_name}.{name}' requires both accessors"
+                )));
+            };
+            self.require_method_access(&getter, true, Some(type_name))?;
+            self.require_method_access(&setter, true, Some(type_name))?;
+            (
+                property.ty,
+                IncrementMemberTarget::Property { getter, setter },
+            )
+        };
+        let receiver_signature = resolve_type(
+            &receiver_type,
+            self.types,
+            self.externals,
+            &mut *self.module,
+        )
+        .map_err(|message| self.error(message))?;
+        let receiver = self.emitter.declare_local(receiver_signature);
+        self.emitter.stloc(receiver).ldloc(receiver);
+        match &member {
+            IncrementMemberTarget::Field(field) => {
+                self.emitter.emit(Instruction::new(
+                    OpCode::Ldfld,
+                    Operand::Token(MemberToken::Field(field.clone())),
+                ));
+            }
+            IncrementMemberTarget::Property { getter, .. } => {
+                self.emitter.callvirt(getter.clone());
+            }
+        }
+        if !prefix {
+            self.emitter.dup();
+        }
+        self.increment_top(&ty, delta)?;
+        if prefix {
+            self.emitter.dup();
+        }
+        let value_signature = resolve_type(&ty, self.types, self.externals, &mut *self.module)
+            .map_err(|message| self.error(message))?;
+        let value = self.emitter.declare_local(value_signature);
+        self.emitter.stloc(value).ldloc(receiver).ldloc(value);
+        match member {
+            IncrementMemberTarget::Field(field) => {
+                self.emitter.emit(Instruction::new(
+                    OpCode::Stfld,
+                    Operand::Token(MemberToken::Field(field)),
+                ));
+            }
+            IncrementMemberTarget::Property { setter, .. } => {
+                self.emitter.callvirt(setter);
+            }
+        }
+        Ok(ty)
+    }
+
+    fn increment_index(
+        &mut self,
+        target: &Expr,
+        index: &Expr,
+        delta: i32,
+        prefix: bool,
+    ) -> Result<Ty, CompileError> {
+        let array_type = self.expr(target)?;
+        let Ty::Array(element) = &array_type else {
+            return Err(self.error("increment indexing requires an array"));
+        };
+        let array_signature =
+            resolve_type(&array_type, self.types, self.externals, &mut *self.module)
+                .map_err(|message| self.error(message))?;
+        let array = self.emitter.declare_local(array_signature);
+        self.emitter.stloc(array);
+        let index_type = self.expr(index)?;
+        Self::require(&index_type, &Ty::Int, "array index")
+            .map_err(|message| self.error(message))?;
+        let position = self.emitter.declare_local(TypeSig::INT32);
+        self.emitter.stloc(position).ldloc(array).ldloc(position);
+        let load = array_element_opcode(element, false)
+            .ok_or_else(|| self.error(format!("unsupported array element {element:?}")))?;
+        self.emitter.op(load);
+        if !prefix {
+            self.emitter.dup();
+        }
+        self.increment_top(element, delta)?;
+        if prefix {
+            self.emitter.dup();
+        }
+        let signature = resolve_type(element, self.types, self.externals, &mut *self.module)
+            .map_err(|message| self.error(message))?;
+        let value = self.emitter.declare_local(signature);
+        self.emitter
+            .stloc(value)
+            .ldloc(array)
+            .ldloc(position)
+            .ldloc(value);
+        let store = array_element_opcode(element, true)
+            .ok_or_else(|| self.error(format!("unsupported array element {element:?}")))?;
+        self.emitter.op(store);
+        Ok((**element).clone())
+    }
+
     fn expr(&mut self, expression: &Expr) -> Result<Ty, CompileError> {
         match expression {
             Expr::Int(value, _) => {
@@ -6409,23 +6682,28 @@ impl<'a> FnEmitter<'a> {
                 prefix,
             } => {
                 let ty = self.load(name)?;
-                self.convert_assignable(&ty, &Ty::Int, "increment")
-                    .map_err(|message| self.error(message))?;
-                if *prefix {
-                    self.emitter.ldc_i4(delta.abs());
-                    self.emitter
-                        .op(if *delta > 0 { OpCode::Add } else { OpCode::Sub });
+                if !*prefix {
                     self.emitter.dup();
-                    self.store_top(name)?;
-                } else {
-                    self.emitter.dup();
-                    self.emitter.ldc_i4(delta.abs());
-                    self.emitter
-                        .op(if *delta > 0 { OpCode::Add } else { OpCode::Sub });
-                    self.store_top(name)?;
                 }
-                Ok(Ty::Int)
+                self.increment_top(&ty, *delta)?;
+                if *prefix {
+                    self.emitter.dup();
+                }
+                self.store_top(name)?;
+                Ok(ty)
             }
+            Expr::IncrementMember {
+                target,
+                name,
+                delta,
+                prefix,
+            } => self.increment_member(target, name, *delta, *prefix),
+            Expr::IncrementIndex {
+                target,
+                index,
+                delta,
+                prefix,
+            } => self.increment_index(target, index, *delta, *prefix),
             Expr::New { ty, args, fields } => match ty {
                 Ty::Class(type_name) => {
                     if !self.types.contains_key(type_name)

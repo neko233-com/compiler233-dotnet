@@ -31,12 +31,24 @@ namespace EnumFixture {
         public Bits Field = Bits.Both;
         public Bits Property { get; set; }
     }
+    public class CounterBox {
+        public UnsignedByte Value;
+        public int Gets;
+        public int Sets;
+        public UnsignedByte Property {
+            get { Gets = Gets + 1; return Value; }
+            set { Sets = Sets + 1; Value = value; }
+        }
+    }
 
     public static class Api {
         public static Direction Current = Direction.Positive;
         public static UnsignedLong ZeroField = 0;
         public static Bits FlagField = Bits.Read;
         public static int Calls = 0;
+        public static UnsignedByte StaticCounter = UnsignedByte.Zero;
+        public static UnsignedByte StaticProperty { get; set; }
+        public static CounterBox SharedCounter = new CounterBox();
         public static Direction Echo(Direction value) { return value; }
         public static Direction[] EchoArray(Direction[] value) { return value; }
         public static Direction Cast(int value) { return (Direction)value; }
@@ -44,6 +56,8 @@ namespace EnumFixture {
         public static UnsignedLong ZeroMethod() { return 1 - 1; }
         public static bool TrueTick() { Calls = Calls + 1; return true; }
         public static bool FalseTick() { Calls = Calls + 10; return false; }
+        public static CounterBox GetCounter() { Calls = Calls + 1; return SharedCounter; }
+        public static Direction NextDirection(Direction value) { return ++value; }
         public static int Run() {
             Direction value = Direction.Positive;
             if (value == Direction.Positive) return (int)Echo(value);
@@ -98,6 +112,61 @@ namespace EnumFixture {
             }
         }
         public static int FlagSwitch() { return FlagCase(Bits.Both) + FlagCase(~Bits.Read); }
+        public static int IncrementEnums() {
+            SignedByte a = SignedByte.Maximum; SignedByte oldA = a++;
+            if (oldA != SignedByte.Maximum || a != SignedByte.Minimum) return -1;
+            UnsignedByte b = UnsignedByte.Maximum;
+            if (++b != UnsignedByte.Zero || b != UnsignedByte.Zero) return -2;
+            SignedShort c = SignedShort.Maximum;
+            if (c++ != SignedShort.Maximum || c != SignedShort.Minimum) return -3;
+            UnsignedShort d = UnsignedShort.Maximum;
+            if (++d != UnsignedShort.Zero) return -4;
+            SignedInt e = SignedInt.Maximum;
+            if (e++ != SignedInt.Maximum || e != SignedInt.Minimum) return -5;
+            UnsignedInt f = UnsignedInt.Maximum;
+            if (++f != UnsignedInt.Zero) return -6;
+            SignedLong g = SignedLong.Maximum;
+            if (g++ != SignedLong.Maximum || g != SignedLong.Minimum) return -7;
+            UnsignedLong h = UnsignedLong.Zero;
+            if (h-- != UnsignedLong.Zero || h != UnsignedLong.Maximum) return -8;
+            StaticCounter = UnsignedByte.Maximum;
+            if (Api.StaticCounter++ != UnsignedByte.Maximum || StaticCounter != UnsignedByte.Zero) return -9;
+            StaticProperty = UnsignedByte.Maximum;
+            if (++Api.StaticProperty != UnsignedByte.Zero || StaticProperty != UnsignedByte.Zero) return -15;
+            if ((int)NextDirection(Direction.Zero) != 1) return -10;
+            SharedCounter.Value = UnsignedByte.Maximum;
+            SharedCounter.Gets = 0;
+            SharedCounter.Sets = 0;
+            Calls = 0;
+            UnsignedByte old = GetCounter().Property++;
+            if (old != UnsignedByte.Maximum || SharedCounter.Value != UnsignedByte.Zero) return -11;
+            if (Calls != 1 || SharedCounter.Gets != 1 || SharedCounter.Sets != 1) return -12;
+            Calls = 0;
+            int previousGets = GetCounter().Gets++;
+            if (previousGets != 1 || SharedCounter.Gets != 2 || Calls != 1) return -14;
+            SharedCounter.Value = UnsignedByte.Maximum;
+            if (++SharedCounter.Value != UnsignedByte.Zero) return -13;
+            UnsignedByte[] counters = new UnsignedByte[1];
+            counters[0] = UnsignedByte.Maximum;
+            int index = 0;
+            UnsignedByte beforeArray = counters[index++]++;
+            if (index != 1 || beforeArray != UnsignedByte.Maximum || counters[0] != UnsignedByte.Zero) return -16;
+            if ((int)(++counters[0]) != 1) return -17;
+            int[] integers = new int[1];
+            integers[0] = 4;
+            if (integers[0]++ != 4 || integers[0] != 5) return -18;
+            return 44;
+        }
+        public static int IncrementExceptions() {
+            int seen = 0;
+            int index = 0;
+            int[] missing = null;
+            try { missing[index++]++; } catch (System.NullReferenceException) { seen = seen + 1; }
+            if (index != 1) return -1;
+            int[] empty = new int[0];
+            try { ++empty[0]; } catch (System.IndexOutOfRangeException) { seen = seen + 1; }
+            return seen;
+        }
         public static int Classify(Direction value) {
             switch (value) {
                 case Direction.Negative: return 3;
