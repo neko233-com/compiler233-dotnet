@@ -4016,7 +4016,8 @@ impl<'a> FnEmitter<'a> {
             self.convert_assignable(&ty, &Ty::Bool, "logical operand")
                 .map_err(|message| self.error(message))?;
             self.emitter.branch(short_circuit, end);
-            self.emitter.ldc_i4(1);
+            self.emitter
+                .ldc_i4(if matches!(op, BinaryOp::And) { 1 } else { 0 });
             self.emitter.branch(OpCode::Br, done);
             self.emitter.mark(end);
             self.emitter
