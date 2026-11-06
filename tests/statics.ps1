@@ -29,10 +29,10 @@ $foreign = Join-Path $work 'StaticForeign.dll'
 Copy-Item -LiteralPath (Join-Path $root 'tests/StaticForeign/bin/Release/net10.0/StaticForeign.dll') -Destination $foreign
 $foreignSource = Join-Path $work 'ForeignConsumer.cs'
 $foreignOutput = Join-Path $work 'ForeignConsumer.dll'
-[IO.File]::WriteAllText($foreignSource, 'using ForeignFieldFixture; public static class ForeignConsumer { public static int Run() { Values.Counter = 3; Values.Counter += 4; int old = Values.Counter++; Values.Mode = Status.One; Values.Mode |= Status.Two; Values.Rate = 2f; Values.Text = "ok"; Values.Ready = true; Values.Numbers = new int[1]; Values.Numbers[0] = 9; Values.Codes = new Status[1]; Values.Codes[0] = Status.One; if (old != 7 || Values.Counter != 8 || Values.Mode != Status.Both) return -1; if (Values.Rate != 2f || Values.Text != "ok" || !Values.Ready || Values.Value != null || Values.Numbers[0] != 9 || Values.Codes[0] != Status.One) return -2; return Values.Counter + Values.ReadOnly; } }')
+[IO.File]::WriteAllText($foreignSource, 'using ForeignFieldFixture; public static class ForeignConsumer { public static int Run() { Values.Counter = 3; Values.Counter += 4; int old = Values.Counter++; Values.Mode = Status.One; Values.Mode |= Status.Two; Values.Rate = 2f; Values.Text = "ok"; Values.Ready = true; Values.Numbers = new int[1]; Values.Numbers[0] = 9; Values.Codes = new Status[1]; Values.Codes[0] = Status.One; if (old != 7 || Values.Counter != 8 || Values.Mode != Status.Both) return -1; if (Values.Rate != 2f || Values.Text != "ok" || !Values.Ready || Values.Value != null || Values.Numbers[0] != 9 || Values.Codes[0] != Status.One) return -2; if (!Values.Flag || Values.Ratio != 1.5f || Values.Label != "foreign" || Values.NoText != null || Values.ConstantStatus != Status.Two) return -3; switch (Status.Two) { case Values.ConstantStatus: break; default: return -4; } return Values.Counter + Values.ReadOnly + Values.Literal; } }')
 & $binary csc $foreignSource "-reference:$foreign" "-out:$foreignOutput"
 if ($LASTEXITCODE -ne 0) { throw 'Foreign static field consumer failed to compile' }
-& dotnet $oracle --invoke $foreignOutput 'ForeignConsumer' 'Run' '14'
+& dotnet $oracle --invoke $foreignOutput 'ForeignConsumer' 'Run' '23'
 if ($LASTEXITCODE -ne 0) { throw 'Foreign static field consumer failed to execute' }
 $runtime = & dotnet --list-runtimes | Where-Object { $_ -match '^Microsoft\.NETCore\.App ' } | Select-Object -Last 1
 if ($runtime -notmatch '^Microsoft\.NETCore\.App (\S+) \[(.+)\]$') { throw 'No .NET runtime found' }
@@ -76,7 +76,6 @@ foreach ($invalid in @(
     'static class S { } class C { void M() { new S(); } }',
     'class S { public int Field; } class C { int M() { return S.Field; } }',
     'class S { private static int Field; } class C { int M() { return S.Field; } }',
-    'class S { public const int Field = 1; }',
     'class C { static Different() { } }'
 )) {
     [IO.File]::WriteAllText($bad, $invalid)
@@ -100,7 +99,10 @@ if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before -or
 foreach ($invalid in @(
     'using ForeignFieldFixture; class C { void M() { Values.ReadOnly = 1; } }',
     'using ForeignFieldFixture; class C { void M() { Values.ReadOnly++; } }',
-    'using ForeignFieldFixture; class C { int M() { return Values.Literal; } }',
+    'using ForeignFieldFixture; class C { void M() { Values.Literal = 2; } }',
+    'using ForeignFieldFixture; class C { int M() { return Values.Max + 1; } }',
+    'using ForeignFieldFixture; class C { int M() { return 10 / Values.Zero; } }',
+    'using ForeignFieldFixture; class C { Status M() { return Values.MaximumStatus + 1; } }',
     'using ForeignFieldFixture; class C { int M() { return Values.Hidden; } }',
     'using ForeignFieldFixture; class C { int M() { return Instance.Number; } }',
     'class C { int M() { return Values.Counter; } }',

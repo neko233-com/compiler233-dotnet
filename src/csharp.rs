@@ -289,6 +289,7 @@ struct FieldDecl {
     ty: Ty,
     is_static: bool,
     is_readonly: bool,
+    is_const: bool,
     visibility: Visibility,
     init: Option<Expr>,
 }
@@ -2050,6 +2051,7 @@ impl<'a> Parser<'a> {
         self.skip_attribute_lists()?;
         let mut is_static = false;
         let mut is_readonly = false;
+        let mut is_const = false;
         let mut access_bits = 0;
         let mut virtual_kind = VirtualKind::None;
         let mut invalid_constructor_modifier = false;
@@ -2090,7 +2092,13 @@ impl<'a> Parser<'a> {
                     is_readonly = true;
                     self.bump();
                 }
-                "const" => return Err(self.error("const members are not supported yet")),
+                "const" => {
+                    if is_const {
+                        return Err(self.error("duplicate const modifier"));
+                    }
+                    is_const = true;
+                    self.bump();
+                }
                 "sealed" | "unsafe" | "extern" | "async" | "partial" => {
                     if self.text() != "unsafe" {
                         invalid_constructor_modifier = true;
@@ -2099,6 +2107,12 @@ impl<'a> Parser<'a> {
                 }
                 _ => break,
             }
+        }
+        if is_const {
+            if is_static || is_readonly {
+                return Err(self.error("const fields cannot be static or readonly"));
+            }
+            is_static = true;
         }
         let visibility = Visibility::from_bits(
             access_bits,
@@ -2122,7 +2136,11 @@ impl<'a> Parser<'a> {
             if name != decl.name {
                 return Err(self.error("constructor name must match its declaring type"));
             }
-            if invalid_constructor_modifier || is_readonly || virtual_kind != VirtualKind::None {
+            if invalid_constructor_modifier
+                || is_readonly
+                || is_const
+                || virtual_kind != VirtualKind::None
+            {
                 return Err(self.error("invalid constructor modifier"));
             }
             if decl.is_interface && !is_static {
@@ -2202,8 +2220,8 @@ impl<'a> Parser<'a> {
 
         let ty = self.parse_type_reference()?;
         let name = self.identifier()?;
-        if is_readonly && (self.check("=>") || self.check("{") || self.check("(")) {
-            return Err(self.error("readonly is supported only on fields"));
+        if (is_readonly || is_const) && (self.check("=>") || self.check("{") || self.check("(")) {
+            return Err(self.error("readonly and const are supported only on fields"));
         }
         if self.eat("=>") {
             if decl.is_interface || ty == Ty::Void {
@@ -2346,8 +2364,10 @@ impl<'a> Parser<'a> {
         }
 
         // Field declarators, with optional initializers.
-        if is_readonly && (invalid_constructor_modifier || virtual_kind != VirtualKind::None) {
-            return Err(self.error("invalid readonly field modifier"));
+        if (is_readonly || is_const)
+            && (invalid_constructor_modifier || virtual_kind != VirtualKind::None)
+        {
+            return Err(self.error("invalid field modifier"));
         }
         if decl.is_interface && !is_static {
             return Err(self.error("interfaces cannot declare instance fields"));
@@ -2370,11 +2390,15 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            if is_const && init.is_none() {
+                return Err(self.error("constant fields require an initializer"));
+            }
             decl.fields.push(FieldDecl {
                 name: current_name.clone(),
                 ty: ty.clone(),
                 is_static,
                 is_readonly,
+                is_const,
                 visibility,
                 init,
             });
@@ -3805,6 +3829,42 @@ fn less_visible_enum<'a>(ty: &'a Ty, enums: &EnumValues) -> Option<&'a str> {
     }
 }
 
+fn source_field_constant(field: &FieldDecl) -> Result<Constant, String> {
+    let expression = field
+        .init
+        .as_ref()
+        .ok_or("constant field has no initializer")?;
+    let null = || Constant {
+        element_type: ElementType::Class,
+        value: vec![0; 4],
+    };
+    match (&field.ty, expression) {
+        (Ty::Int, expression) => FnEmitter::constant_int(expression)
+            .map(|value| Constant {
+                element_type: ElementType::I4,
+                value: value.to_le_bytes().to_vec(),
+            })
+            .ok_or_else(|| "int constant initializer is unsupported or overflows".to_string()),
+        (Ty::Bool, Expr::Bool(value)) => Ok(Constant {
+            element_type: ElementType::Boolean,
+            value: vec![u8::from(*value)],
+        }),
+        (Ty::Bool, Expr::Default(Ty::Bool)) => Ok(Constant {
+            element_type: ElementType::Boolean,
+            value: vec![0],
+        }),
+        (Ty::String, Expr::Str(value)) => Ok(Constant {
+            element_type: ElementType::String,
+            value: value.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        }),
+        (Ty::String | Ty::Object, Expr::Null) => Ok(null()),
+        (Ty::String, Expr::Default(Ty::String)) | (Ty::Object, Expr::Default(Ty::Object)) => {
+            Ok(null())
+        }
+        _ => Err("constant field type or initializer is not supported yet".to_string()),
+    }
+}
+
 fn trusted_corlib(externals: &Externals, index: usize) -> bool {
     let Some(assembly) = externals.modules[index].assembly.as_ref() else {
         return false;
@@ -3947,6 +4007,28 @@ fn emit(
 ) -> Result<Vec<u8>, CompileError> {
     validate_enum_flags(program, externals, sources)?;
     validate_enum_api_accessibility(program, sources)?;
+    for decl in &program.types {
+        let mut names = std::collections::HashSet::new();
+        for field in &decl.fields {
+            if field.name == decl.name
+                || !names.insert(&field.name)
+                || decl
+                    .properties
+                    .iter()
+                    .any(|property| property.name == field.name)
+                || decl
+                    .methods
+                    .iter()
+                    .any(|method| !method.is_ctor && method.name == field.name)
+            {
+                return Err(type_error(
+                    decl,
+                    sources,
+                    format!("field '{}' conflicts with another member", field.name),
+                ));
+            }
+        }
+    }
     if program.types.is_empty() && program.enums.values().all(|entry| entry.is_external) {
         return Err(CompileError {
             file: sources
@@ -4210,6 +4292,11 @@ fn emit(
             let signature = resolve_type(&field.ty, &types, &externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
             let flags = field.visibility.field_flags()
+                | if field.is_const {
+                    FieldFlags::Literal | FieldFlags::HasDefault
+                } else {
+                    FieldFlags::empty()
+                }
                 | if field.is_readonly {
                     FieldFlags::InitOnly
                 } else {
@@ -4220,10 +4307,14 @@ fn emit(
                 } else {
                     FieldFlags::empty()
                 };
-            let entry = TypeDef::add_field(
-                &ty,
-                Field::new(flags, &field.name, FieldSig { ty: signature }),
-            );
+            let mut definition = Field::new(flags, &field.name, FieldSig { ty: signature });
+            if field.is_const {
+                definition.constant = Some(
+                    source_field_constant(field)
+                        .map_err(|message| type_error(decl, sources, message))?,
+                );
+            }
+            let entry = TypeDef::add_field(&ty, definition);
             symbol.fields.insert(
                 field.name.clone(),
                 FieldSymbol {
@@ -4464,7 +4555,7 @@ fn emit(
             && !decl
                 .fields
                 .iter()
-                .any(|field| field.is_static && field.init.is_some())
+                .any(|field| field.is_static && !field.is_const && field.init.is_some())
         {
             continue;
         }
@@ -4550,6 +4641,7 @@ fn emit_body(
         enums,
         base: base.cloned(),
         locals: HashMap::new(),
+        int_constant_cache: HashMap::new(),
         params: Vec::new(),
         controls: Vec::new(),
         protected_depth: 0,
@@ -4662,7 +4754,7 @@ fn emit_body(
             context.is_static = true;
             context.field_write_context = FieldWriteContext::StaticConstructor;
             for field in &decl.fields {
-                if !field.is_static {
+                if !field.is_static || field.is_const {
                     continue;
                 }
                 if let Some(initializer) = &field.init {
@@ -4718,6 +4810,7 @@ struct FnEmitter<'a> {
     enums: &'a EnumValues,
     base: Option<String>,
     locals: HashMap<String, (u16, Ty)>,
+    int_constant_cache: HashMap<usize, Option<i32>>,
     params: Vec<(String, Ty)>,
     controls: Vec<ControlTarget>,
     protected_depth: usize,
@@ -4738,9 +4831,220 @@ enum IncrementMemberTarget {
     },
 }
 
+enum StaticFieldValue {
+    Location(MemberToken),
+    Literal(Constant),
+}
+
+enum LiteralValue {
+    Int(i32),
+    Float(f32),
+    Bool(bool),
+    String(String),
+    Null,
+    Enum(i128, EnumBase),
+}
+
 impl<'a> FnEmitter<'a> {
     fn error(&self, message: impl Into<String>) -> CompileError {
         CompileError::new(&self.file, &self.source, self.offset, message)
+    }
+
+    fn decode_literal(&self, ty: &Ty, constant: &Constant) -> Result<LiteralValue, CompileError> {
+        let value = &constant.value;
+        let result = match (ty, constant.element_type) {
+            (Ty::Int, ElementType::I4) if value.len() == 4 => {
+                LiteralValue::Int(i32::from_le_bytes(value.as_slice().try_into().unwrap()))
+            }
+            (Ty::Float, ElementType::R4) if value.len() == 4 => {
+                LiteralValue::Float(f32::from_le_bytes(value.as_slice().try_into().unwrap()))
+            }
+            (Ty::Bool, ElementType::Boolean) if value.len() == 1 && value[0] <= 1 => {
+                LiteralValue::Bool(value[0] != 0)
+            }
+            (Ty::String, ElementType::String) if value.len() % 2 == 0 => LiteralValue::String(
+                constant
+                    .as_string()
+                    .ok_or_else(|| self.error("constant string contains unsupported UTF-16"))?,
+            ),
+            (Ty::String | Ty::Object | Ty::Class(_), ElementType::Class)
+                if value.as_slice() == [0, 0, 0, 0] =>
+            {
+                LiteralValue::Null
+            }
+            (Ty::Enum(_, base), element)
+                if element == base.element_type() && value.len() == base.width() =>
+            {
+                let raw = constant
+                    .as_i64()
+                    .ok_or_else(|| self.error("invalid enum constant"))?;
+                let number = if *base == EnumBase::U8 {
+                    raw as u64 as i128
+                } else {
+                    i128::from(raw)
+                };
+                LiteralValue::Enum(number, *base)
+            }
+            _ => return Err(self.error("constant metadata type or value is not supported")),
+        };
+        Ok(result)
+    }
+
+    fn emit_literal(&mut self, ty: &Ty, constant: &Constant) -> Result<(), CompileError> {
+        match self.decode_literal(ty, constant)? {
+            LiteralValue::Int(value) => {
+                self.emitter.ldc_i4(value);
+            }
+            LiteralValue::Float(value) => {
+                self.emitter
+                    .emit(Instruction::new(OpCode::Ldc_R4, Operand::Float32(value)));
+            }
+            LiteralValue::Bool(value) => {
+                self.emitter.ldc_i4(i32::from(value));
+            }
+            LiteralValue::String(value) => {
+                self.emitter.ldstr(value);
+            }
+            LiteralValue::Null => {
+                self.emitter.ldnull();
+            }
+            LiteralValue::Enum(value, base) if base.width() == 8 => {
+                self.emitter.emit(Instruction::new(
+                    OpCode::Ldc_I8,
+                    Operand::Int64(value as u64 as i64),
+                ));
+            }
+            LiteralValue::Enum(value, _) => {
+                self.emitter.ldc_i4(value as i32);
+            }
+        }
+        Ok(())
+    }
+
+    fn literal_reference(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Option<(Ty, Constant)>, CompileError> {
+        match expression {
+            Expr::Name(name) => {
+                if self.locals.contains_key(name)
+                    || self.params.iter().any(|(parameter, _)| parameter == name)
+                {
+                    return Ok(None);
+                }
+                let Some(field) = self.field_symbol(&self.current, name) else {
+                    return Ok(None);
+                };
+                let entry = field.entry.get();
+                if !entry.flags.contains(FieldFlags::Literal) {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    field.ty,
+                    entry
+                        .constant
+                        .clone()
+                        .ok_or_else(|| self.error("constant field has no metadata value"))?,
+                )))
+            }
+            Expr::Member { target, name } => match self.static_field(target, name, false)? {
+                Some((ty, StaticFieldValue::Literal(constant))) => Ok(Some((ty, constant))),
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn evaluate_int_constant(&mut self, expression: &Expr) -> Result<Option<i32>, CompileError> {
+        let key = std::ptr::from_ref(expression) as usize;
+        if let Some(cached) = self.int_constant_cache.get(&key) {
+            return Ok(*cached);
+        }
+        let result = match expression {
+            Expr::Int(value, true) => Some(*value),
+            Expr::Default(Ty::Int) => Some(0),
+            Expr::Member { target, name } if matches!(target.as_ref(), Expr::Name(type_name) if type_name == "int") => {
+                match name.as_str() {
+                    "MinValue" => Some(i32::MIN),
+                    "MaxValue" => Some(i32::MAX),
+                    _ => None,
+                }
+            }
+            Expr::Name(_) | Expr::Member { .. } => match self.literal_reference(expression)? {
+                Some((ty, constant)) if ty == Ty::Int => {
+                    match self.decode_literal(&ty, &constant)? {
+                        LiteralValue::Int(value) => Some(value),
+                        _ => return Err(self.error("invalid int constant metadata")),
+                    }
+                }
+                _ => None,
+            },
+            Expr::Negate(inner) => match self.evaluate_int_constant(inner)? {
+                Some(value) => Some(
+                    value
+                        .checked_neg()
+                        .ok_or_else(|| self.error("constant integer overflow"))?,
+                ),
+                None => None,
+            },
+            Expr::Complement(inner) => self.evaluate_int_constant(inner)?.map(|value| !value),
+            Expr::Binary(op, left, right)
+                if matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Remainder
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                ) =>
+            {
+                let left = self.evaluate_int_constant(left)?;
+                let right = self.evaluate_int_constant(right)?;
+                match (left, right) {
+                    (Some(left), Some(right)) => Some(
+                        match op {
+                            BinaryOp::Add => left.checked_add(right),
+                            BinaryOp::Subtract => left.checked_sub(right),
+                            BinaryOp::Multiply => left.checked_mul(right),
+                            BinaryOp::Divide => left.checked_div(right),
+                            BinaryOp::Remainder => left.checked_rem(right),
+                            BinaryOp::BitAnd => Some(left & right),
+                            BinaryOp::BitOr => Some(left | right),
+                            BinaryOp::BitXor => Some(left ^ right),
+                            _ => unreachable!(),
+                        }
+                        .ok_or_else(|| {
+                            self.error("constant integer overflow or division by zero")
+                        })?,
+                    ),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        self.int_constant_cache.insert(key, result);
+        Ok(result)
+    }
+
+    fn has_untracked_enum_constant(&mut self, expression: &Expr) -> Result<bool, CompileError> {
+        if self.enum_constant(expression).is_some() {
+            return Ok(false);
+        }
+        match expression {
+            Expr::Name(_) | Expr::Member { .. } => Ok(matches!(
+                self.literal_reference(expression)?,
+                Some((Ty::Enum(_, _), _))
+            )),
+            Expr::Binary(_, left, right) => Ok(self.has_untracked_enum_constant(left)?
+                || self.has_untracked_enum_constant(right)?),
+            Expr::Cast(_, inner) | Expr::Negate(inner) | Expr::Complement(inner) => {
+                self.has_untracked_enum_constant(inner)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn require_member_access(
@@ -4847,6 +5151,12 @@ impl<'a> FnEmitter<'a> {
         this_receiver: bool,
     ) -> Result<(), CompileError> {
         let field = field.get();
+        if field.flags.contains(FieldFlags::Literal) {
+            return Err(self.error(format!(
+                "constant field '{}' cannot be assigned",
+                field.name
+            )));
+        }
         if !field.flags.contains(FieldFlags::InitOnly) {
             return Ok(());
         }
@@ -4907,7 +5217,7 @@ impl<'a> FnEmitter<'a> {
         receiver: &Expr,
         name: &str,
         writing: bool,
-    ) -> Result<Option<(Ty, MemberToken)>, CompileError> {
+    ) -> Result<Option<(Ty, StaticFieldValue)>, CompileError> {
         let Some(path) = Self::type_path(receiver) else {
             return Ok(None);
         };
@@ -4971,7 +5281,7 @@ impl<'a> FnEmitter<'a> {
         let Some((local, owner)) = owner else {
             return Ok(None);
         };
-        let (ty, token, flags) = if local {
+        let (ty, value, flags) = if local {
             let Some(field) = self.field_symbol(&owner, name) else {
                 return Ok(None);
             };
@@ -4979,8 +5289,18 @@ impl<'a> FnEmitter<'a> {
             if writing {
                 self.require_field_writable(&field.entry, true, true)?;
             }
-            let flags = field.entry.get().flags;
-            (field.ty, MemberToken::Field(field.entry), flags)
+            let (flags, constant) = {
+                let entry = field.entry.get();
+                (entry.flags, entry.constant.clone())
+            };
+            let value = if flags.contains(FieldFlags::Literal) {
+                StaticFieldValue::Literal(
+                    constant.ok_or_else(|| self.error("constant field has no metadata value"))?,
+                )
+            } else {
+                StaticFieldValue::Location(MemberToken::Field(field.entry))
+            };
+            (field.ty, value, flags)
         } else {
             let short = owner.rsplit('.').next().unwrap_or(&owner);
             if self
@@ -5004,9 +5324,13 @@ impl<'a> FnEmitter<'a> {
             if writing {
                 self.require_field_writable(&field, false, true)?;
             }
-            let (flags, signature) = {
+            let (flags, signature, constant) = {
                 let field = field.get();
-                (field.flags, field.signature.ty.clone())
+                (
+                    field.flags,
+                    field.signature.ty.clone(),
+                    field.constant.clone(),
+                )
             };
             let ty = external_ty(&signature, self.enums, false);
             fn supported(ty: &Ty) -> bool {
@@ -5025,19 +5349,23 @@ impl<'a> FnEmitter<'a> {
             if !supported(&ty) {
                 return Err(self.error(format!("field '{owner}.{name}' has an unsupported type")));
             }
-            let token = self
-                .module
-                .import_foreign_field(&field, &self.externals.modules[index])
-                .map_err(|error| self.error(error.to_string()))?;
-            (ty, token, flags)
+            let value = if flags.contains(FieldFlags::Literal) {
+                StaticFieldValue::Literal(
+                    constant.ok_or_else(|| self.error("constant field has no metadata value"))?,
+                )
+            } else {
+                let token = self
+                    .module
+                    .import_foreign_field(&field, &self.externals.modules[index])
+                    .map_err(|error| self.error(error.to_string()))?;
+                StaticFieldValue::Location(token)
+            };
+            (ty, value, flags)
         };
         if !flags.contains(FieldFlags::Static) {
             return Err(self.error(format!("'{owner}.{name}' is not static")));
         }
-        if flags.contains(FieldFlags::Literal) {
-            return Err(self.error("referenced constant fields are not supported yet"));
-        }
-        Ok(Some((ty, token)))
+        Ok(Some((ty, value)))
     }
 
     fn method_symbol(
@@ -5560,10 +5888,42 @@ impl<'a> FnEmitter<'a> {
                     }
                     SwitchLabel::Case(expression) => {
                         let constant = if matches!(value_type, Ty::Enum(_, _)) {
-                            self.enum_switch_constant(expression, &value_type)
-                                .map(SwitchConstant::Enum)
+                            if let Some((ty, literal)) = self.literal_reference(expression)? {
+                                if ty != value_type {
+                                    None
+                                } else {
+                                    match self.decode_literal(&ty, &literal)? {
+                                        LiteralValue::Enum(value, _) => {
+                                            Some(SwitchConstant::Enum(value))
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                            } else {
+                                self.enum_switch_constant(expression, &value_type)
+                                    .map(SwitchConstant::Enum)
+                            }
                         } else {
-                            switch_constant(expression)
+                            if let Some(value) = switch_constant(expression) {
+                                Some(value)
+                            } else if let Some(value) = self.evaluate_int_constant(expression)? {
+                                Some(SwitchConstant::Int(value))
+                            } else if let Some((ty, literal)) =
+                                self.literal_reference(expression)?
+                            {
+                                match (ty, self.decode_literal(&value_type, &literal)?) {
+                                    (Ty::Bool, LiteralValue::Bool(value)) => {
+                                        Some(SwitchConstant::Bool(value))
+                                    }
+                                    (Ty::String, LiteralValue::String(value)) => {
+                                        Some(SwitchConstant::String(value))
+                                    }
+                                    (Ty::String, LiteralValue::Null) => Some(SwitchConstant::Null),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
                         };
                         let Some(constant) = constant else {
                             return Err(
@@ -6162,7 +6522,10 @@ impl<'a> FnEmitter<'a> {
                     "^=" => OpCode::Xor,
                     other => return Err(self.error(format!("unsupported operator '{other}'"))),
                 };
-                if let Some((ty, token)) = self.static_field(target, name, true)? {
+                if let Some((ty, field)) = self.static_field(target, name, true)? {
+                    let StaticFieldValue::Location(token) = field else {
+                        return Err(self.error("constant fields cannot be assigned"));
+                    };
                     self.validate_compound(&ty, op)?;
                     self.emitter.emit(Instruction::new(
                         OpCode::Ldsfld,
@@ -6239,7 +6602,10 @@ impl<'a> FnEmitter<'a> {
                 name,
                 value,
             } => {
-                if let Some((ty, token)) = self.static_field(target, name, true)? {
+                if let Some((ty, field)) = self.static_field(target, name, true)? {
+                    let StaticFieldValue::Location(token) = field else {
+                        return Err(self.error("constant fields cannot be assigned"));
+                    };
                     let actual = self.expr(value)?;
                     self.convert_expression(
                         &actual,
@@ -6756,6 +7122,16 @@ impl<'a> FnEmitter<'a> {
             }
             return Ok(property.ty);
         };
+        if field.entry.get().flags.contains(FieldFlags::Literal) {
+            let constant = field
+                .entry
+                .get()
+                .constant
+                .clone()
+                .ok_or_else(|| self.error("constant field has no metadata value"))?;
+            self.emit_literal(&field.ty, &constant)?;
+            return Ok(field.ty);
+        }
         if field.is_static {
             self.emitter.emit(Instruction::new(
                 OpCode::Ldsfld,
@@ -6992,7 +7368,10 @@ impl<'a> FnEmitter<'a> {
         delta: i32,
         prefix: bool,
     ) -> Result<Ty, CompileError> {
-        if let Some((ty, token)) = self.static_field(target, name, true)? {
+        if let Some((ty, field)) = self.static_field(target, name, true)? {
+            let StaticFieldValue::Location(token) = field else {
+                return Err(self.error("constant fields cannot be assigned"));
+            };
             self.emitter.emit(Instruction::new(
                 OpCode::Ldsfld,
                 Operand::Token(token.clone()),
@@ -7210,6 +7589,9 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn expr(&mut self, expression: &Expr) -> Result<Ty, CompileError> {
+        if matches!(expression, Expr::Negate(_) | Expr::Binary(_, _, _)) {
+            self.evaluate_int_constant(expression)?;
+        }
         match expression {
             Expr::Int(value, _) => {
                 self.emitter.ldc_i4(*value);
@@ -7830,9 +8212,14 @@ impl<'a> FnEmitter<'a> {
                 }
             }
         }
-        if let Some((ty, token)) = self.static_field(target, name, false)? {
-            self.emitter
-                .emit(Instruction::new(OpCode::Ldsfld, Operand::Token(token)));
+        if let Some((ty, field)) = self.static_field(target, name, false)? {
+            match field {
+                StaticFieldValue::Location(token) => {
+                    self.emitter
+                        .emit(Instruction::new(OpCode::Ldsfld, Operand::Token(token)));
+                }
+                StaticFieldValue::Literal(constant) => self.emit_literal(&ty, &constant)?,
+            }
             return Ok(ty);
         }
         // `Type.StaticProperty` does not evaluate the type name as a value.
@@ -8047,6 +8434,28 @@ impl<'a> FnEmitter<'a> {
 
         let mut left_ty = self.expr(left)?;
         let mut right_ty = self.expr(right)?;
+        if matches!(op, BinaryOp::Add | BinaryOp::Subtract)
+            && (matches!(left_ty, Ty::Enum(_, _)) || matches!(right_ty, Ty::Enum(_, _)))
+        {
+            if self.has_untracked_enum_constant(left)? || self.has_untracked_enum_constant(right)? {
+                return Err(self.error("arithmetic with enum constant fields is not supported yet"));
+            }
+            let number = if left_ty == Ty::Int {
+                Some(left)
+            } else if right_ty == Ty::Int {
+                Some(right)
+            } else {
+                None
+            };
+            if let Some(number) = number
+                && self.evaluate_int_constant(number)?.is_some()
+                && Self::constant_int(number).is_none()
+            {
+                return Err(
+                    self.error("enum arithmetic with integer constant fields is not supported yet")
+                );
+            }
+        }
         if matches!(op, BinaryOp::Add | BinaryOp::Subtract) {
             match (&left_ty, &right_ty) {
                 (Ty::Enum(_, base), Ty::Int) => {

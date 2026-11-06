@@ -47,8 +47,7 @@ foreach ($invalid in @(
     'interface I { readonly int F; }',
     'class C { readonly readonly int F; }',
     'readonly struct S { public readonly int F; }',
-    'record R { }',
-    'class C { public const int F = 1; }'
+    'record R { }'
 )) {
     [IO.File]::WriteAllText($bad, $invalid)
     $null = & $binary csc $bad "-out:$output" "-refout:$reference" 2>&1

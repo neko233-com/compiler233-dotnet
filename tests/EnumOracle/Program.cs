@@ -45,6 +45,58 @@ static HashSet<ushort> ReadOpcodes(MethodInfo method)
     }
     return result;
 }
+if (args.Length == 2 && args[0] == "--constant-consumer")
+{
+    using var stream = File.OpenRead(args[1]);
+    using var pe = new PEReader(stream);
+    var reader = pe.GetMetadataReader();
+    if (reader.AssemblyReferences.Select(reader.GetAssemblyReference).Any(item => reader.GetString(item.Name) == "Constants"))
+        throw new Exception("Consumer retained an unnecessary assembly reference for inlined constants");
+    var constantConsumer = LoadAssembly(args[1]).GetType("ConstantConsumer", true)!.GetMethod("Run")!;
+    if (!Equals(constantConsumer.Invoke(null, null), 42)) throw new Exception("Constant consumer failed");
+    Console.WriteLine("ConstantConsumer.Run returned 42 without a constants assembly reference.");
+    return;
+}
+if (args.Length == 3 && args[0] == "--constants")
+{
+    foreach (string path in args[1..])
+    {
+        using var stream = File.OpenRead(path);
+        using var pe = new PEReader(stream);
+        var reader = pe.GetMetadataReader();
+        var values = reader.TypeDefinitions.Select(reader.GetTypeDefinition)
+            .Single(type => reader.GetString(type.Namespace) == "ConstantFixture" && reader.GetString(type.Name) == "Values");
+        foreach (var (name, code) in new[] {
+            ("Answer", ConstantTypeCode.Int32), ("Negative", ConstantTypeCode.Int32), ("Zero", ConstantTypeCode.Int32),
+            ("Max", ConstantTypeCode.Int32), ("Enabled", ConstantTypeCode.Boolean), ("Disabled", ConstantTypeCode.Boolean),
+            ("Text", ConstantTypeCode.String), ("Empty", ConstantTypeCode.String),
+            ("Missing", ConstantTypeCode.NullReference), ("NullObject", ConstantTypeCode.NullReference)
+        })
+        {
+            var field = values.GetFields().Select(reader.GetFieldDefinition)
+                .Single(field => reader.GetString(field.Name) == name);
+            if (!field.Attributes.HasFlag(FieldAttributes.Static | FieldAttributes.Literal | FieldAttributes.HasDefault) ||
+                reader.GetConstant(field.GetDefaultValue()).TypeCode != code)
+                throw new Exception($"Incorrect constant metadata: {name} in {path}");
+        }
+        var only = reader.TypeDefinitions.Select(reader.GetTypeDefinition)
+            .Single(type => reader.GetString(type.Namespace) == "ConstantFixture" && reader.GetString(type.Name) == "OnlyConstants");
+        if (only.GetMethods().Select(reader.GetMethodDefinition).Any(method => reader.GetString(method.Name) == ".cctor"))
+            throw new Exception("Literal-only class unexpectedly has a type initializer");
+    }
+    var assembly = LoadAssembly(args[1]);
+    var type = assembly.GetType("ConstantFixture.Values", true)!;
+    foreach (var (name, value) in new (string, object?)[] {
+        ("Answer", 42), ("Negative", -10), ("Zero", 0), ("Max", int.MaxValue), ("Enabled", true), ("Disabled", false),
+        ("Text", "常量✓"), ("Empty", ""), ("Missing", null), ("NullObject", null)
+    })
+        if (!Equals(type.GetField(name)!.GetRawConstantValue(), value)) throw new Exception($"Incorrect literal value: {name}");
+    var runner = assembly.GetType("ConstantFixture.Runner", true)!.GetMethod("Run")!;
+    if (!Equals(runner.Invoke(null, null), 42)) throw new Exception("Constant fixture returned an unexpected result");
+    if (ReadOpcodes(runner).Contains(unchecked((ushort)OpCodes.Ldsfld.Value))) throw new Exception("Literal field was not inlined");
+    Console.WriteLine("Constant field metadata, inlining, switches and runtime passed (42).");
+    return;
+}
 if (args.Length == 3 && args[0] == "--readonly")
 {
     foreach (string path in args[1..])
