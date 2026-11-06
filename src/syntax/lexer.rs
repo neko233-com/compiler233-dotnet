@@ -129,6 +129,8 @@ struct Lexer<'a> {
     tokens: Vec<Token>,
     defines: Vec<String>,
     conditionals: Vec<Conditional>,
+    directives: Vec<&'static str>,
+    seen_token: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -139,6 +141,8 @@ impl<'a> Lexer<'a> {
             tokens: Vec::new(),
             defines: defines.to_vec(),
             conditionals: Vec::new(),
+            directives: Vec::new(),
+            seen_token: false,
         }
     }
 
@@ -146,8 +150,11 @@ impl<'a> Lexer<'a> {
         loop {
             self.skip_trivia()?;
             if self.position >= self.source.len() {
-                if !self.conditionals.is_empty() {
-                    return Err(self.error(self.position, "unterminated #if directive"));
+                if let Some(directive) = self.directives.last() {
+                    return Err(self.error(
+                        self.position,
+                        format!("unterminated #{directive} directive"),
+                    ));
                 }
                 let end = self.source.len();
                 self.tokens.push(Token {
@@ -186,6 +193,7 @@ impl<'a> Lexer<'a> {
                 start,
                 end: self.position,
             });
+            self.seen_token = true;
         }
     }
 
@@ -296,9 +304,13 @@ impl<'a> Lexer<'a> {
             .map_or(source.len(), |offset| start + offset);
         let line = &source[start..end];
         self.position = end;
-        let mut words = line[1..].split_whitespace();
-        let name = words.next().unwrap_or_default();
-        let rest: Vec<&str> = words.collect();
+        let directive = line[1..].trim_start();
+        let name_end = directive
+            .char_indices()
+            .find_map(|(offset, character)| (!is_identifier_part(character)).then_some(offset))
+            .unwrap_or(directive.len());
+        let name = &directive[..name_end];
+        let rest: Vec<&str> = directive[name_end..].split_whitespace().collect();
         match name {
             "if" => {
                 let parent_active = self.active();
@@ -310,8 +322,12 @@ impl<'a> Lexer<'a> {
                     taken: active,
                     seen_else: false,
                 });
+                self.directives.push("if");
             }
             "elif" => {
+                if self.directives.last() != Some(&"if") {
+                    return Err(self.error(start, "#elif without a matching #if"));
+                }
                 let Some((parent_active, taken, seen_else)) = self
                     .conditionals
                     .last()
@@ -329,6 +345,12 @@ impl<'a> Lexer<'a> {
                 }
             }
             "else" => {
+                if rest.first().is_some_and(|word| !word.starts_with("//")) {
+                    return Err(self.error(start, "unexpected text after #else"));
+                }
+                if self.directives.last() != Some(&"if") {
+                    return Err(self.error(start, "#else without a matching #if"));
+                }
                 let Some(seen_else) = self.conditionals.last().map(|frame| frame.seen_else) else {
                     return Err(self.error(start, "#else without a matching #if"));
                 };
@@ -342,22 +364,47 @@ impl<'a> Lexer<'a> {
                 }
             }
             "endif" => {
+                if rest.first().is_some_and(|word| !word.starts_with("//")) {
+                    return Err(self.error(start, "unexpected text after #endif"));
+                }
+                if self.directives.last() != Some(&"if") {
+                    return Err(self.error(start, "#endif without a matching #if"));
+                }
+                self.directives.pop();
                 if self.conditionals.pop().is_none() {
                     return Err(self.error(start, "#endif without a matching #if"));
                 }
             }
-            "define" => {
-                if self.active()
-                    && let Some(symbol) = rest.first()
-                {
-                    self.defines.push((*symbol).to_string());
+            "region" => self.directives.push("region"),
+            "endregion" => {
+                if self.directives.last() != Some(&"region") {
+                    return Err(self.error(start, "#endregion without a matching #region"));
                 }
+                self.directives.pop();
             }
-            "undef" => {
-                if self.active()
-                    && let Some(symbol) = rest.first()
+            "define" | "undef" => {
+                let declaration = rest.join(" ");
+                let symbol = declaration
+                    .split_once("//")
+                    .map_or(declaration.as_str(), |(before, _)| before)
+                    .trim();
+                if matches!(symbol, "true" | "false")
+                    || !symbol.chars().next().is_some_and(is_identifier_start)
+                    || !symbol.chars().all(is_identifier_part)
                 {
-                    self.defines.retain(|existing| existing != symbol);
+                    return Err(self.error(start, format!("invalid #{name} symbol")));
+                }
+                if self.active() && self.seen_token {
+                    return Err(
+                        self.error(start, format!("#{name} must appear before the first token"))
+                    );
+                }
+                if self.active() {
+                    if name == "define" {
+                        self.defines.push(symbol.to_string());
+                    } else {
+                        self.defines.retain(|existing| existing != symbol);
+                    }
                 }
             }
             "error" if self.active() => {
@@ -968,10 +1015,26 @@ mod tests {
             "#if true extra\n#endif\nclass C {}",
             "#if false\n#if FLAG &&\n#endif\n#endif\nclass C {}",
             "#if true\n#elif FLAG &&\n#endif\nclass C {}",
+            "#if true\n#else invalid\n#endif\nclass C {}",
+            "#if true\n#endif invalid\nclass C {}",
+            "class C {}\n#define TOO_LATE\n",
+            "class C {}\n#undef TOO_LATE\n",
+            "#define\nclass C {}",
+            "#define 123\nclass C {}",
+            "#define true\nclass C {}",
+            "#define A B\nclass C {}",
+            "#if false\n#define 123\n#endif\nclass C {}",
+            "#region broken\nclass C {}",
+            "#endregion\nclass C {}",
+            "#if true\n#region broken\n#endif\n#endregion\nclass C {}",
         ] {
             assert!(lex(source).is_err(), "{source}");
         }
         assert!(lex("#if true // comment\nclass C {}\n#endif").is_ok());
+        assert!(lex("#if true\n#else // comment\n#endif // comment\nclass C {}").is_ok());
+        assert!(lex("#define class // comment\n#undef class\nclass C {}").is_ok());
+        assert!(lex("#region group\n#if true\nclass C {}\n#endif\n#endregion group").is_ok());
+        assert!(lex("#if(true)\n#region x\n#endregion;\n#endif\nclass C {}").is_ok());
         assert!(
             lex_with_defines(
                 "#if A && (!B || C == false)\nclass C {}\n#endif",

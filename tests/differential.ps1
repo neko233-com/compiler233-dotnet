@@ -39,8 +39,9 @@ $unique = @($files | Sort-Object -Unique)
 if ($MaxFiles -gt 0 -and $unique.Count -gt $MaxFiles) { $unique = $unique[0..($MaxFiles - 1)] }
 if ($unique.Count -eq 0) { throw 'no C# files found in the corpus' }
 
-if (Test-Path $OutputDirectory) { Remove-Item $OutputDirectory -Recurse -Force }
-$work = Join-Path $OutputDirectory 'work'
+New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
+$outputRoot = (Resolve-Path -LiteralPath $OutputDirectory).Path
+$work = Join-Path $outputRoot ('.work-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force $work | Out-Null
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 
@@ -64,6 +65,7 @@ if ($Mode -eq 'frontend') {
     $frontendArguments = @('frontend', $manifest, "-report:$frontendReportPath")
     foreach ($symbol in $Define) { $frontendArguments += "-define:$symbol" }
     $frontendOutput = & $binary @frontendArguments 2>&1 | Out-String
+    if ($LASTEXITCODE -notin @(0, 1)) { throw "frontend failed with exit code $LASTEXITCODE`: $frontendOutput" }
     if (-not (Test-Path $frontendReportPath)) { throw "frontend run produced no report: $frontendOutput" }
     $frontendReport = Get-Content $frontendReportPath -Raw | ConvertFrom-Json
     foreach ($item in $frontendReport.files) { $oursByPath[$item.path.ToLowerInvariant()] = $item }
@@ -78,6 +80,7 @@ else {
         foreach ($symbol in $Define) { $arguments += "-define:$symbol" }
         $compilerOutput = & $binary @arguments 2>&1 | Out-String
         $exitCode = $LASTEXITCODE
+        if ($exitCode -notin @(0, 1)) { throw "compiler failed unexpectedly for $file with exit code $exitCode`: $compilerOutput" }
         $compilerReport = $null
         if (Test-Path $reportPath) { $compilerReport = Get-Content $reportPath -Raw | ConvertFrom-Json }
         if ($exitCode -eq 0 -and $null -eq $compilerReport) { throw "compiler reported success without a report: $file" }
@@ -156,7 +159,13 @@ Write-Output ("Differential [{0}]: {1} files | accept {2} | reject {3} | false_r
 Write-Output ("Roslyn accepted {0}/{1}; compiler233 accepted {2}/{1}" -f $roslynAccepted, $unique.Count, $compilerAccepted)
 Write-Output "Details: $summaryPath"
 
-if (-not $KeepWork) { Remove-Item $work -Recurse -Force }
+if (-not $KeepWork) {
+    $resolvedWork = (Resolve-Path -LiteralPath $work).Path
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $prefix = if ([IO.Path]::EndsInDirectorySeparator($outputRoot)) { $outputRoot } else { $outputRoot + [IO.Path]::DirectorySeparatorChar }
+    if (-not $resolvedWork.StartsWith($prefix, $comparison)) { throw 'Work directory escaped output directory' }
+    Remove-Item -LiteralPath $resolvedWork -Recurse -Force
+}
 
 $falseAccepts = @($results | Where-Object { $_.classification -eq 'false_accept' })
 if ($falseAccepts.Count -gt 0) {
@@ -166,3 +175,4 @@ if ($falseAccepts.Count -gt 0) {
 if ($falseAccepts.Count -gt $MaxFalseAccepts) {
     throw "false accepts exceeded the limit: $($falseAccepts.Count) > $MaxFalseAccepts"
 }
+exit 0

@@ -1,0 +1,2 @@
+#region unfinished
+class Valid {}
