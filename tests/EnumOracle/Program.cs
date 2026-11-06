@@ -45,6 +45,63 @@ static HashSet<ushort> ReadOpcodes(MethodInfo method)
     }
     return result;
 }
+if (args.Length == 3 && args[0] == "--structs")
+{
+    foreach (string path in args[1..])
+    {
+        using var stream = File.OpenRead(path);
+        using var pe = new PEReader(stream);
+        var reader = pe.GetMetadataReader();
+        var point = reader.TypeDefinitions.Select(reader.GetTypeDefinition)
+            .Single(type => reader.GetString(type.Namespace) == "StructFixture" && reader.GetString(type.Name) == "Point");
+        if (!point.Attributes.HasFlag(TypeAttributes.Public | TypeAttributes.Sealed) ||
+            (point.Attributes & TypeAttributes.LayoutMask) != TypeAttributes.SequentialLayout ||
+            point.BaseType.Kind != HandleKind.TypeReference)
+            throw new Exception($"Incorrect struct type metadata in {path}");
+        var parent = reader.GetTypeReference((TypeReferenceHandle)point.BaseType);
+        if (reader.GetString(parent.Namespace) != "System" || reader.GetString(parent.Name) != "ValueType")
+            throw new Exception($"Struct base type is not System.ValueType in {path}");
+        var fields = point.GetFields().Select(reader.GetFieldDefinition).ToArray();
+        if (fields.Length != 2 || !fields.Select(field => reader.GetString(field.Name)).SequenceEqual(["X", "Y"]) ||
+            fields.Any(field => field.Attributes != FieldAttributes.Public ||
+                !reader.GetBlobBytes(field.Signature).SequenceEqual(new byte[] { 0x06, 0x08 })) ||
+            point.GetMethods().Select(reader.GetMethodDefinition).Any(method => reader.GetString(method.Name) == ".ctor"))
+            throw new Exception($"Incorrect struct fields or synthetic constructor in {path}");
+    }
+    var assembly = LoadAssembly(args[1]);
+    var type = assembly.GetType("StructFixture.Point", true)!;
+    var runner = assembly.GetType("StructFixture.Runner", true)!;
+    if (!type.IsValueType || type.IsEnum || !type.IsLayoutSequential ||
+        System.Runtime.InteropServices.Marshal.SizeOf(type) != 8 ||
+        runner.GetMethod("Make")!.ReturnType != type ||
+        runner.GetMethod("ChangeCopy")!.GetParameters().Single().ParameterType != type ||
+        !Equals(runner.GetMethod("Run")!.Invoke(null, null), 12797) ||
+        !Equals(runner.GetMethod("ContainerCopy")!.Invoke(null, null), 384) ||
+        !Equals(assembly.GetType("StructConsumer.AliasRunner", true)!.GetMethod("Run")!.Invoke(null, null), 17))
+        throw new Exception("Struct layout, signatures, copying or runtime result was incorrect");
+    if (!ReadOpcodes(runner.GetMethod("Make")!).Contains(unchecked((ushort)OpCodes.Initobj.Value)) ||
+        !ReadOpcodes(runner.GetMethod("ChangeCopy")!).Contains(unchecked((ushort)OpCodes.Ldarga.Value)))
+        throw new Exception("Struct initialization or parameter address instruction missing");
+    var framework = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
+        .Select(path => MetadataReference.CreateFromFile(path));
+    const string source = "using StructFixture; public static class StructDownstream { public static int Run() { Point p = Runner.Make(); Point q = p; q.X = 8; if (Runner.ChangeCopy(p) != 9 || p.X != 3) return -1; return p.X * 100 + q.X * 10 + p.Y; } }";
+    var structCompilation = CSharpCompilation.Create("StructDownstream", [CSharpSyntaxTree.ParseText(source)],
+        framework.Concat([MetadataReference.CreateFromFile(args[2])]),
+        new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+    using var structBytes = new MemoryStream();
+    var emitted = structCompilation.Emit(structBytes);
+    if (!emitted.Success) throw new Exception("Downstream rejected struct reference: " + string.Join("\n", emitted.Diagnostics));
+    structBytes.Position = 0;
+    var structContext = new AssemblyLoadContext("struct-downstream", true);
+    string structImplementation = Path.GetFullPath(args[1]);
+    structContext.Resolving += (loader, name) => name.Name == AssemblyName.GetAssemblyName(structImplementation).Name
+        ? loader.LoadFromAssemblyPath(structImplementation) : null;
+    var structConsumer = structContext.LoadFromStream(structBytes);
+    if (!Equals(structConsumer.GetType("StructDownstream", true)!.GetMethod("Run")!.Invoke(null, null), 384))
+        throw new Exception("Struct downstream copy semantics failed");
+    Console.WriteLine("Struct metadata, reference, layout, value copies, parameter mutation and downstream execution passed.");
+    return;
+}
 if (args.Length == 2 && args[0] == "--constant-consumer")
 {
     using var stream = File.OpenRead(args[1]);

@@ -65,6 +65,7 @@ cargo test --locked
 ./tests/statics.ps1
 ./tests/readonly.ps1
 ./tests/constants.ps1
+./tests/structs.ps1
 ./benchmarks/check-subset.ps1
 ```
 
@@ -125,6 +126,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 静态字段：支持通过类型名、受支持的命名空间导入或别名读取、赋值、复合赋值和自增自减；支持部分引用程序集字段及外部 `readonly` 字段读取。
 - `readonly` 字段：对当前支持的字段类型生成 CLR `InitOnly` 元数据，在声明、所属构造函数及受支持的静态初始化器中允许赋值；其他直接写入会被拒绝。只读引用指向的对象仍可修改。
 - 常量字段：源代码支持部分 `int`、`bool`、`string` 常量及 `object` 空值常量，生成真实常量元数据并在使用处内联；部分外部浮点和枚举常量也可读取。引用其他常量的初始化器、源代码浮点 / 枚举常量声明及涉及常量字段的部分枚举算术仍不支持。
+- 结构体：支持仅包含 `public int` 字段的非泛型顶层结构体、`default(T)` 和无参 `new T()`、局部变量与按值参数的字段读写、值复制和方法参数 / 返回值；生成真实 CLR 值类型及引用程序集。结构体成员方法、构造函数、其他字段类型、接口、数组、装箱、泛型实参及引用程序集中的结构体仍未实现。
 - 对象：`new T(...)`（按参数个数匹配构造函数）、`new T { Name = value }` 对象初始化器（字段与属性）、`obj.field` 读写、`obj.Method(...)` 与 `this.Method(...)` 调用
 - 属性：`get`/`set` 访问器（自动属性生成后备字段）、`obj.Prop` 读取与 `obj.Prop = v` 赋值、静态属性
 - 表达式体：在现有表达式和语句子集内支持方法、构造函数、只读属性及 `get`/`set` 访问器的 `=>` 写法；接口成员的表达式体和更广的表达式仍未覆盖。
@@ -140,13 +142,13 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 - 语句：局部声明、赋值、`if/else`、`while`、`do ... while`、`for`、`return`、`break`/`continue`、`base.M(...)` 基类调用、块
 - `switch`：支持 `int`、`bool`、`string` 的字面量分支，以及枚举成员、零值和部分显式枚举常量分支；密集的 32 位整数或枚举分支使用 CLR 跳转表。更广的常量表达式、模式匹配和直接写在分支中的局部声明尚未支持。
 - 普通字符串字面量支持常见字符转义、`\x`、`\u`、`\U` 和成对的 UTF-16 代理项；目前会拒绝包含未配对代理项的字面量。
-- 表达式：`int/float/bool/string/object` 与 `null` 字面量、`enum` 常量、算术与比较（含字符串/布尔相等、`== null`）、`&&/||` 短路、`??`、`?:` 三元、`(T)x` 转换与 `as`、`!`、`++`/`--`、`+=`/`-=`（含字段与属性）、字符串 `+` 拼接、赋值表达式、`string.Empty`/`int.MaxValue` 等预定义成员；`default(T)` 支持上述基本类型及枚举，其他类型和无类型的 `default` 暂不支持。
+- 表达式：`int/float/bool/string/object` 与 `null` 字面量、`enum` 常量、算术与比较（含字符串/布尔相等、`== null`）、`&&/||` 短路、`??`、`?:` 三元、`(T)x` 转换与 `as`、`!`、`++`/`--`、`+=`/`-=`（含字段与属性）、字符串 `+` 拼接、赋值表达式、`string.Empty`/`int.MaxValue` 等预定义成员；`default(T)` 支持上述基本类型、枚举及受支持的结构体，其他类型和无类型的 `default` 暂不支持。
 - 外部引用：`-reference:` 指定的程序集参与类型与方法解析（全名、唯一短名、`System.Text.Regex` 这类限定名），跨程序集静态/实例调用可用；`tests/compile.ps1` 会对 `System.Text.RegularExpressions` 与 Roslyn 构建的泛型库做真实对照
 - 泛型方法调用：`Foo<T>(...)` 通过 MethodSpec 实例化（外部程序集的方法），返回类型按实参替换`MVar`
 - 泛型类型实例：`List<int>` 等引用程序集里的泛型类型，字段/局部/参数签名用`GenericInst`，成员通过`TypeSpec`父的 MemberRef 调用（`list.Add(x)`、`list.Count`），`new List<int>()` 可用；泛型**类型定义**仍不支持
 - 调用：本程序集的静态/实例方法与构造函数；BCL 的 `System.Math.Max/Min/Abs`、`System.Convert.ToString`、`System.String.Concat`、`System.Console.Write/WriteLine`（按需添加 `System.Console` 程序集引用）
 
-尚未支持、会被明确拒绝而不是静默降级：`struct` / `record` 声明、未受支持的外部值类型、可选参数默认值、泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、`async` 和 `switch` 模式匹配等扩展形式。
+尚未支持、会被明确拒绝而不是静默降级：未受支持的结构体形式、`record` 声明、未受支持的外部值类型、可选参数默认值、泛型类型定义（`class Foo<T>`）、多维/交错数组、lambda、`async` 和 `switch` 模式匹配等扩展形式。
 
 当前针对性测试包括 `./tests/enums.ps1`：检查枚举字段与方法元数据、引用程序集、实际运行结果、下游调用和失败时旧产物保护。仓库保留既有的差分测试及历史数据；这些有限用例不能代表完整功能或生产验收。
 

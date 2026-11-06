@@ -66,6 +66,21 @@ jobs:
         shell: pwsh
       - run: ./tests/output-safety.ps1
         shell: pwsh
+      - run: ./tests/enums.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+      - run: ./tests/statics.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+      - run: ./tests/readonly.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+      - run: ./tests/constants.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+      - run: ./tests/structs.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
       - run: ./tests/compile.ps1
         shell: pwsh
       - run: ./tests/differential.ps1

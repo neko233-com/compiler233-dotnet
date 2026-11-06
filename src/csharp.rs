@@ -4,7 +4,7 @@
 //! abstract syntax tree, resolves names against a two-pass symbol table and
 //! emits executable IL. Anything outside the supported core is rejected with a
 //! located diagnostic instead of being approximated.
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, rc::Rc};
 
 use hao::{
     Module,
@@ -79,6 +79,7 @@ enum Ty {
     String,
     Null,
     Enum(String, EnumBase),
+    Struct(String),
     Class(String),
     Array(Box<Ty>),
     Generic(String, Vec<Ty>),
@@ -171,7 +172,7 @@ impl EnumBase {
         matches!(self, Self::U1 | Self::U2 | Self::U4 | Self::U8)
     }
 
-    fn from_bits(self, value: u64) -> i128 {
+    fn decode_bits(self, value: u64) -> i128 {
         match self {
             Self::I1 => value as u8 as i8 as i128,
             Self::U1 => value as u8 as i128,
@@ -275,6 +276,7 @@ struct TypeDecl {
     base: Option<String>,
     interfaces: Vec<String>,
     is_interface: bool,
+    is_struct: bool,
     is_static: bool,
     is_public: bool,
     static_ctor: Option<Block>,
@@ -856,14 +858,23 @@ pub fn compile(
         types: Vec::new(),
         enums: externals.enum_values(),
     };
-    // Enums are compile-time constants, so their names must be known before any
-    // file is parsed regardless of declaration order.
+    // Enums and struct types must be known regardless of declaration order.
+    let mut structs = HashMap::new();
+    let empty_structs = HashMap::new();
     for (file, text) in sources {
-        let (_, enums) = parse_file(file, text, &program.enums)?;
+        let (types, enums) = parse_file(file, text, &program.enums, &empty_structs)?;
         program.enums.extend(enums);
+        for decl in types.into_iter().filter(|decl| decl.is_struct) {
+            let full_name = if decl.namespace.is_empty() {
+                decl.name.clone()
+            } else {
+                format!("{}.{}", decl.namespace, decl.name)
+            };
+            structs.insert(full_name, decl.is_public);
+        }
     }
     for (file, text) in sources {
-        let (types, _) = parse_file(file, text, &program.enums)?;
+        let (types, _) = parse_file(file, text, &program.enums, &structs)?;
         program.types.extend(types);
     }
     emit(&program, assembly_name, sources, &externals)
@@ -1035,7 +1046,7 @@ impl Externals {
             if valid {
                 result.insert(
                     full_name.clone(),
-                    Arc::new(EnumInfo {
+                    Rc::new(EnumInfo {
                         file: String::new(),
                         offset: 0,
                         namespace: definition.namespace.clone(),
@@ -1160,6 +1171,7 @@ impl Externals {
 
 struct Parser<'a> {
     enums: EnumValues,
+    structs: &'a HashMap<String, bool>,
     current_namespace: String,
     root_imports: EnumImports,
     scope_imports: EnumImports,
@@ -1169,7 +1181,7 @@ struct Parser<'a> {
     position: usize,
 }
 
-type EnumValues = HashMap<String, Arc<EnumInfo>>;
+type EnumValues = HashMap<String, Rc<EnumInfo>>;
 
 #[derive(Debug, Clone, Default)]
 struct EnumImports {
@@ -1190,7 +1202,7 @@ fn find_enum<'a>(
             Some(rest) => format!("{alias}.{rest}"),
             None => alias.clone(),
         };
-        return enums.get(&expanded).map(Arc::as_ref);
+        return enums.get(&expanded).map(Rc::as_ref);
     }
     let mut scope = namespace;
     while !scope.is_empty() {
@@ -1205,9 +1217,49 @@ fn find_enum<'a>(
     let mut matches = imports
         .namespaces
         .iter()
-        .filter_map(|import| enums.get(&format!("{import}.{name}")).map(Arc::as_ref));
+        .filter_map(|import| enums.get(&format!("{import}.{name}")).map(Rc::as_ref));
     let first = matches.next()?;
     if matches.any(|other| other.full_name() != first.full_name()) {
+        None
+    } else {
+        Some(first)
+    }
+}
+
+fn find_struct<'a>(
+    structs: &'a HashMap<String, bool>,
+    name: &str,
+    namespace: &str,
+    imports: &EnumImports,
+) -> Option<&'a str> {
+    let mut parts = name.splitn(2, '.');
+    let root = parts.next()?;
+    if let Some(alias) = imports.aliases.get(root) {
+        let expanded = match parts.next() {
+            Some(rest) => format!("{alias}.{rest}"),
+            None => alias.clone(),
+        };
+        return structs
+            .get_key_value(&expanded)
+            .map(|(name, _)| name.as_str());
+    }
+    let mut scope = namespace;
+    while !scope.is_empty() {
+        if let Some((found, _)) = structs.get_key_value(&format!("{scope}.{name}")) {
+            return Some(found);
+        }
+        scope = scope.rsplit_once('.').map_or("", |(parent, _)| parent);
+    }
+    if let Some((found, _)) = structs.get_key_value(name) {
+        return Some(found);
+    }
+    let mut matches = imports.namespaces.iter().filter_map(|import| {
+        structs
+            .get_key_value(&format!("{import}.{name}"))
+            .map(|(name, _)| name.as_str())
+    });
+    let first = matches.next()?;
+    if matches.any(|other| other != first) {
         None
     } else {
         Some(first)
@@ -1262,12 +1314,14 @@ fn parse_file(
     file: &str,
     source: &str,
     enums: &EnumValues,
+    structs: &HashMap<String, bool>,
 ) -> Result<(Vec<TypeDecl>, EnumValues), CompileError> {
     let tokens = syntax::lex(source).map_err(|error: SyntaxError| {
         CompileError::new(file, source, error.offset, error.message)
     })?;
     let mut parser = Parser {
         enums: enums.clone(),
+        structs,
         current_namespace: String::new(),
         root_imports: EnumImports::default(),
         scope_imports: EnumImports::default(),
@@ -1495,9 +1549,16 @@ impl<'a> Parser<'a> {
                     )?;
                 }
                 "class" | "struct" | "interface" | "record" => {
-                    if text == "struct" || text == "record" {
+                    if text == "record" {
                         return Err(
                             self.error(format!("'{text}' declarations are not supported yet"))
+                        );
+                    }
+                    if text == "struct"
+                        && (!type_modifiers.is_empty() || !type_attributes.is_empty())
+                    {
+                        return Err(
+                            self.error("struct attributes and modifiers are not supported yet")
                         );
                     }
                     let is_static = type_modifiers.iter().any(|modifier| modifier == "static");
@@ -1563,11 +1624,7 @@ impl<'a> Parser<'a> {
             "bool" => Ty::Bool,
             "string" | "String" => Ty::String,
             "object" => Ty::Object,
-            other if self.enum_info(other).is_some() => {
-                let info = self.enum_info(other).expect("enum was just found");
-                Ty::Enum(info.full_name(), info.base)
-            }
-            other => Ty::Class(other.to_string()),
+            other => self.named_type(other)?,
         })
     }
 
@@ -1578,6 +1635,29 @@ impl<'a> Parser<'a> {
             &self.current_namespace,
             &self.enum_imports(),
         )
+    }
+
+    fn struct_name(&self, name: &str) -> Option<&str> {
+        if self.structs.is_empty() {
+            return None;
+        }
+        find_struct(
+            self.structs,
+            name,
+            &self.current_namespace,
+            &self.enum_imports(),
+        )
+    }
+
+    fn named_type(&self, name: &str) -> Result<Ty, CompileError> {
+        match (self.enum_info(name), self.struct_name(name)) {
+            (Some(_), Some(_)) => Err(self.error(format!(
+                "type name '{name}' resolves to both an enum and a struct"
+            ))),
+            (Some(info), None) => Ok(Ty::Enum(info.full_name(), info.base)),
+            (None, Some(full_name)) => Ok(Ty::Struct(full_name.to_string())),
+            (None, None) => Ok(Ty::Class(name.to_string())),
+        }
     }
 
     fn enum_imports(&self) -> EnumImports {
@@ -1926,7 +2006,7 @@ impl<'a> Parser<'a> {
         }
         self.enums.insert(
             full_name,
-            Arc::new(EnumInfo {
+            Rc::new(EnumInfo {
                 file: self.file.to_string(),
                 offset,
                 namespace: namespace.to_string(),
@@ -1974,6 +2054,7 @@ impl<'a> Parser<'a> {
     ) -> Result<TypeDecl, CompileError> {
         let class_offset = self.token().start;
         let is_interface = self.check("interface");
+        let is_struct = self.check("struct");
         self.bump(); // class / struct / interface / record
         if self.check("record") {
             self.bump();
@@ -1982,6 +2063,9 @@ impl<'a> Parser<'a> {
         let mut base = None;
         let mut interfaces = Vec::new();
         if self.eat(":") {
+            if is_struct {
+                return Err(self.error("struct interfaces are not supported yet"));
+            }
             if is_static {
                 return Err(self.error("static classes cannot declare base types or interfaces"));
             }
@@ -2014,6 +2098,7 @@ impl<'a> Parser<'a> {
             base,
             interfaces,
             is_interface,
+            is_struct,
             is_static,
             is_public,
             static_ctor: None,
@@ -2023,7 +2108,23 @@ impl<'a> Parser<'a> {
         };
         self.expect("{")?;
         while !self.check("}") && !self.at_end() {
-            self.parse_member(&mut decl)?;
+            if is_struct {
+                self.expect("public")?;
+                self.expect("int")?;
+                let name = self.identifier()?;
+                self.expect(";")?;
+                decl.fields.push(FieldDecl {
+                    name,
+                    ty: Ty::Int,
+                    is_static: false,
+                    is_readonly: false,
+                    is_const: false,
+                    visibility: Visibility::Public,
+                    init: None,
+                });
+            } else {
+                self.parse_member(&mut decl)?;
+            }
         }
         self.expect("}")?;
         Ok(decl)
@@ -2450,13 +2551,12 @@ impl<'a> Parser<'a> {
             "bool" => Ty::Bool,
             "string" | "String" => Ty::String,
             "object" => Ty::Object,
-            other if self.enum_info(other).is_some() => {
-                let info = self.enum_info(other).expect("enum was just found");
-                Ty::Enum(info.full_name(), info.base)
-            }
-            other => Ty::Class(other.to_string()),
+            other => self.named_type(other)?,
         };
         if self.check("<") {
+            if matches!(ty, Ty::Struct(_)) {
+                return Err(self.error("generic struct declarations are not supported yet"));
+            }
             self.bump();
             let mut args = Vec::new();
             loop {
@@ -2469,6 +2569,9 @@ impl<'a> Parser<'a> {
             ty = Ty::Generic(name.clone(), args);
         }
         while self.eat("[") {
+            if matches!(ty, Ty::Struct(_)) {
+                return Err(self.error("arrays of struct values are not supported yet"));
+            }
             self.expect("]")?;
             ty = Ty::Array(Box::new(ty.clone()));
         }
@@ -3242,6 +3345,9 @@ impl<'a> Parser<'a> {
             self.bump();
             let element = self.parse_new_type()?;
             if self.eat("[") {
+                if matches!(element, Ty::Struct(_)) {
+                    return Err(self.error("arrays of struct values are not supported yet"));
+                }
                 let size = self.parse_expression()?;
                 self.expect("]")?;
                 return Ok(Expr::NewArray {
@@ -3249,7 +3355,7 @@ impl<'a> Parser<'a> {
                     size: Box::new(size),
                 });
             }
-            if !matches!(element, Ty::Class(_) | Ty::Generic(_, _)) {
+            if !matches!(element, Ty::Class(_) | Ty::Generic(_, _) | Ty::Struct(_)) {
                 return Err(self.error("only classes can be constructed with 'new Type(...)'"));
             }
             let args = if self.check("{") {
@@ -3702,6 +3808,12 @@ fn resolve_type(
         Ty::Null => return Err("null has no type of its own".to_string()),
         Ty::Bool => TypeSig::BOOL,
         Ty::String => TypeSig::STRING,
+        Ty::Struct(name) => {
+            let entry = types
+                .get(name)
+                .ok_or_else(|| format!("unknown struct '{name}'"))?;
+            TypeSig::ValueType(TypeDefOrRef::TypeDef(entry.clone()))
+        }
         Ty::Enum(name, _) => {
             if let Some(entry) = types.get(name) {
                 TypeSig::ValueType(TypeDefOrRef::TypeDef(entry.clone()))
@@ -3729,7 +3841,17 @@ fn resolve_type(
                     "static type '{name}' cannot be used as a value type"
                 ));
             }
-            Some(entry) => TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone())),
+            Some(entry) => {
+                if entry
+                    .get()
+                    .extends
+                    .as_ref()
+                    .is_some_and(|base| base.full_name() == "System.ValueType")
+                {
+                    return Err(format!("struct type '{name}' is not in scope"));
+                }
+                TypeSig::Class(TypeDefOrRef::TypeDef(entry.clone()))
+            }
             None if core_exception_name(name).is_some() && externals.find(name).is_none() => {
                 TypeSig::Class(
                     module
@@ -3782,6 +3904,9 @@ fn resolve_type(
         },
         Ty::Array(element) => TypeSig::sz_array(resolve_type(element, types, externals, module)?),
         Ty::Generic(name, args) => {
+            if args.iter().any(|arg| matches!(arg, Ty::Struct(_))) {
+                return Err("struct generic arguments are not supported yet".to_string());
+            }
             let Some((index, entry)) = externals.find_generic(name, args.len()) else {
                 return Err(format!("unknown generic type '{name}'"));
             };
@@ -3969,6 +4094,22 @@ fn validate_enum_api_accessibility(
                     sources,
                     format!("enum '{name}' is less accessible than {description}"),
                 ))
+            } else if let Ty::Struct(name) = ty
+                && program.types.iter().any(|candidate| {
+                    candidate.is_struct
+                        && !candidate.is_public
+                        && (if candidate.namespace.is_empty() {
+                            candidate.name.clone()
+                        } else {
+                            format!("{}.{}", candidate.namespace, candidate.name)
+                        }) == *name
+                })
+            {
+                Err(type_error(
+                    decl,
+                    sources,
+                    format!("struct '{name}' is less accessible than {description}"),
+                ))
             } else {
                 Ok(())
             }
@@ -4045,6 +4186,15 @@ fn emit(
     let object = module
         .corlib_type("System.Object")
         .map_err(|error| program_error(program, sources, error.to_string()))?;
+    let value_type = if program.types.iter().any(|decl| decl.is_struct) {
+        Some(
+            module
+                .corlib_type("System.ValueType")
+                .map_err(|error| program_error(program, sources, error.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     // Pass 0: declare every type so fields and signatures can reference types
     // that are declared later in the compilation.
@@ -4053,7 +4203,7 @@ fn emit(
         .enums
         .values()
         .filter(|entry| !entry.is_external)
-        .map(Arc::as_ref)
+        .map(Rc::as_ref)
         .collect();
     enums
         .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
@@ -4098,6 +4248,10 @@ fn emit(
                 TypeAttributes::NotPublic
             }) | if decl.is_interface {
                 TypeAttributes::Interface | TypeAttributes::Abstract
+            } else if decl.is_struct {
+                TypeAttributes::Sealed
+                    | TypeAttributes::SequentialLayout
+                    | TypeAttributes::BeforeFieldInit
             } else {
                 (if decl.is_static {
                     TypeAttributes::Abstract | TypeAttributes::Sealed
@@ -4113,11 +4267,16 @@ fn emit(
             &decl.name,
             if decl.is_interface {
                 None
+            } else if decl.is_struct {
+                value_type.clone()
             } else {
                 Some(object.clone())
             },
         ));
-        types.insert(decl.name.clone(), entry);
+        types.insert(decl.name.clone(), entry.clone());
+        if decl.is_struct {
+            types.insert(full_name, entry);
+        }
     }
     for decl in &enums {
         let entry = types
@@ -4202,6 +4361,18 @@ fn emit(
                     format!("cannot derive from static type '{base_name}'"),
                 ));
             }
+            if local
+                .get()
+                .extends
+                .as_ref()
+                .is_some_and(|base| base.full_name() == "System.ValueType")
+            {
+                return Err(type_error(
+                    decl,
+                    sources,
+                    format!("cannot derive from struct '{base_name}'"),
+                ));
+            }
             TypeDefOrRef::TypeDef(local.clone())
         } else if let Some((index, foreign)) = externals.find(base_name) {
             if is_static_type(foreign) {
@@ -4248,6 +4419,18 @@ fn emit(
                         format!("static type '{interface_name}' cannot be an interface"),
                     ));
                 }
+                if local
+                    .get()
+                    .extends
+                    .as_ref()
+                    .is_some_and(|base| base.full_name() == "System.ValueType")
+                {
+                    return Err(type_error(
+                        decl,
+                        sources,
+                        format!("struct '{interface_name}' cannot be an interface"),
+                    ));
+                }
                 TypeDefOrRef::TypeDef(local.clone())
             } else if let Some((index, foreign)) = externals.find(interface_name) {
                 if is_static_type(foreign) {
@@ -4289,7 +4472,7 @@ fn emit(
         };
 
         for field in &decl.fields {
-            let signature = resolve_type(&field.ty, &types, &externals, &mut module)
+            let signature = resolve_type(&field.ty, &types, externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
             let flags = field.visibility.field_flags()
                 | if field.is_const {
@@ -4329,10 +4512,10 @@ fn emit(
             let params: Vec<TypeSig> = method
                 .params
                 .iter()
-                .map(|(ty, _)| resolve_type(ty, &types, &externals, &mut module))
+                .map(|(ty, _)| resolve_type(ty, &types, externals, &mut module))
                 .collect::<Result<Vec<_>, String>>()
                 .map_err(|message| type_error(decl, sources, message))?;
-            let return_signature = resolve_type(&method.ret, &types, &externals, &mut module)
+            let return_signature = resolve_type(&method.ret, &types, externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
             let virtual_flags = if decl.is_interface {
                 MethodFlags::Public
@@ -4416,7 +4599,7 @@ fn emit(
         }
 
         for (property_index, property) in decl.properties.iter().enumerate() {
-            let signature = resolve_type(&property.ty, &types, &externals, &mut module)
+            let signature = resolve_type(&property.ty, &types, externals, &mut module)
                 .map_err(|message| type_error(decl, sources, message))?;
             let auto_getter = property.has_getter && property.getter.is_none();
             let auto_setter = property.has_setter && property.setter.is_none();
@@ -4522,7 +4705,7 @@ fn emit(
                 .insert(property.name.clone(), property_symbol);
         }
 
-        if !decl.is_interface && !decl.is_static && symbol.ctors.is_empty() {
+        if !decl.is_interface && !decl.is_struct && !decl.is_static && symbol.ctors.is_empty() {
             let flags = MethodFlags::Public
                 | MethodFlags::HideBySig
                 | MethodFlags::SpecialName
@@ -4580,7 +4763,7 @@ fn emit(
     for (index, entry, job) in jobs {
         let body = emit_body(
             &mut module,
-            &externals,
+            externals,
             &program.enums,
             effective[index].0.as_ref(),
             &types,
@@ -4641,6 +4824,7 @@ fn emit_body(
         enums,
         base: base.cloned(),
         locals: HashMap::new(),
+        initializing_struct: None,
         int_constant_cache: HashMap::new(),
         params: Vec::new(),
         controls: Vec::new(),
@@ -4810,6 +4994,7 @@ struct FnEmitter<'a> {
     enums: &'a EnumValues,
     base: Option<String>,
     locals: HashMap<String, (u16, Ty)>,
+    initializing_struct: Option<String>,
     int_constant_cache: HashMap<usize, Option<i32>>,
     params: Vec<(String, Ty)>,
     controls: Vec<ControlTarget>,
@@ -4862,11 +5047,13 @@ impl<'a> FnEmitter<'a> {
             (Ty::Bool, ElementType::Boolean) if value.len() == 1 && value[0] <= 1 => {
                 LiteralValue::Bool(value[0] != 0)
             }
-            (Ty::String, ElementType::String) if value.len() % 2 == 0 => LiteralValue::String(
-                constant
-                    .as_string()
-                    .ok_or_else(|| self.error("constant string contains unsupported UTF-16"))?,
-            ),
+            (Ty::String, ElementType::String) if value.len().is_multiple_of(2) => {
+                LiteralValue::String(
+                    constant
+                        .as_string()
+                        .ok_or_else(|| self.error("constant string contains unsupported UTF-16"))?,
+                )
+            }
             (Ty::String | Ty::Object | Ty::Class(_), ElementType::Class)
                 if value.as_slice() == [0, 0, 0, 0] =>
             {
@@ -6288,12 +6475,19 @@ impl<'a> FnEmitter<'a> {
                 Ok(())
             }
             Stmt::Local { ty, name, init } => {
+                if matches!(ty, Ty::Struct(_)) && init.is_none() {
+                    return Err(self.error("struct locals require an initializer for now"));
+                }
                 let signature = resolve_type(ty, self.types, self.externals, &mut *self.module)
                     .map_err(|message| self.error(message))?;
                 let index = self.emitter.declare_local(signature);
                 self.locals.insert(name.clone(), (index, ty.clone()));
                 if let Some(value) = init {
+                    if matches!(ty, Ty::Struct(_)) {
+                        self.initializing_struct = Some(name.clone());
+                    }
                     let actual = self.expr(value)?;
+                    self.initializing_struct = None;
                     self.convert_expression(
                         &actual,
                         ty,
@@ -6616,6 +6810,26 @@ impl<'a> FnEmitter<'a> {
                     .map_err(|message| self.error(message))?;
                     self.emitter
                         .emit(Instruction::new(OpCode::Stsfld, Operand::Token(token)));
+                    return Ok(());
+                }
+                if let Some(type_name) = self.struct_local_address(target) {
+                    let short = type_name.rsplit('.').next().unwrap_or(&type_name);
+                    let field = self.field_symbol(short, name).ok_or_else(|| {
+                        self.error(format!("unknown member '{type_name}.{name}'"))
+                    })?;
+                    self.require_field_access(&field.entry, true, Some(short))?;
+                    let actual = self.expr(value)?;
+                    self.convert_expression(
+                        &actual,
+                        &field.ty,
+                        value,
+                        &format!("assignment to '{name}'"),
+                    )
+                    .map_err(|message| self.error(message))?;
+                    self.emitter.emit(Instruction::new(
+                        OpCode::Stfld,
+                        Operand::Token(MemberToken::Field(field.entry)),
+                    ));
                     return Ok(());
                 }
                 let target_type = self.expr(target)?;
@@ -7065,6 +7279,11 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn load(&mut self, name: &str) -> Result<Ty, CompileError> {
+        if self.initializing_struct.as_deref() == Some(name) {
+            return Err(self.error(format!(
+                "struct local '{name}' is used in its own initializer"
+            )));
+        }
         if name == "this" {
             if self.is_static {
                 return Err(self.error("'this' cannot be used from a static method"));
@@ -7150,6 +7369,44 @@ impl<'a> FnEmitter<'a> {
             Operand::Token(MemberToken::Field(field.entry)),
         ));
         Ok(field.ty)
+    }
+
+    fn struct_local_address(&mut self, target: &Expr) -> Option<String> {
+        let Expr::Name(name) = target else {
+            return None;
+        };
+        if let Some((index, Ty::Struct(type_name))) = self.locals.get(name).cloned() {
+            self.emitter.ldloca(index);
+            return Some(type_name);
+        }
+        let position = self
+            .params
+            .iter()
+            .position(|(parameter, ty)| parameter == name && matches!(ty, Ty::Struct(_)))?;
+        let Ty::Struct(type_name) = self.params[position].1.clone() else {
+            unreachable!()
+        };
+        self.emitter.emit(Instruction::new(
+            OpCode::Ldarga,
+            Operand::Arg(self.argument_index(position)),
+        ));
+        Some(type_name)
+    }
+
+    fn default_struct(&mut self, ty: &Ty) -> Result<(), CompileError> {
+        let signature = resolve_type(ty, self.types, self.externals, &mut *self.module)
+            .map_err(|message| self.error(message))?;
+        let TypeSig::ValueType(TypeDefOrRef::TypeDef(entry)) = &signature else {
+            return Err(self.error("struct must be a local value type"));
+        };
+        let local = self.emitter.declare_local(signature.clone());
+        self.emitter.ldloca(local);
+        self.emitter.emit(Instruction::new(
+            OpCode::Initobj,
+            Operand::Token(MemberToken::TypeDef(entry.clone())),
+        ));
+        self.emitter.ldloc(local);
+        Ok(())
     }
 
     fn call_base_constructor(&mut self, args: Option<&[Expr]>) -> Result<(), CompileError> {
@@ -7636,6 +7893,7 @@ impl<'a> FnEmitter<'a> {
                             self.emitter.ldc_i4(0);
                         }
                     }
+                    Ty::Struct(_) => self.default_struct(ty)?,
                     _ => return Err(self.error("default(T) is not supported for this type")),
                 }
                 Ok(ty.clone())
@@ -7905,6 +8163,14 @@ impl<'a> FnEmitter<'a> {
                 prefix,
             } => self.increment_index(target, index, *delta, *prefix),
             Expr::New { ty, args, fields } => match ty {
+                Ty::Struct(_) => {
+                    if !args.is_empty() || !fields.is_empty() {
+                        return Err(self
+                            .error("struct constructors and initializers are not supported yet"));
+                    }
+                    self.default_struct(ty)?;
+                    Ok(ty.clone())
+                }
                 Ty::Class(type_name) => {
                     if !self.types.contains_key(type_name)
                         && self.externals.find(type_name).is_none()
@@ -8080,7 +8346,7 @@ impl<'a> FnEmitter<'a> {
             }
             Expr::Complement(inner) => {
                 let (info, value) = self.enum_constant(inner)?;
-                Some((info, info.base.from_bits(!(value as u64))))
+                Some((info, info.base.decode_bits(!(value as u64))))
             }
             Expr::Binary(op @ (BinaryOp::Add | BinaryOp::Subtract), left, right) => {
                 let (info, enum_value, number, add) =
@@ -8134,7 +8400,7 @@ impl<'a> FnEmitter<'a> {
                     BinaryOp::BitXor => (left_value as u64) ^ (right_value as u64),
                     _ => unreachable!(),
                 };
-                Some((info, info.base.from_bits(value)))
+                Some((info, info.base.decode_bits(value)))
             }
             _ => None,
         }
@@ -8244,6 +8510,23 @@ impl<'a> FnEmitter<'a> {
             return Err(self.error(format!("unknown static member '{type_name}.{name}'")));
         }
         let target_type = self.expr(target)?;
+        if let Ty::Struct(type_name) = &target_type {
+            let short = type_name.rsplit('.').next().unwrap_or(type_name);
+            let field = self
+                .field_symbol(short, name)
+                .ok_or_else(|| self.error(format!("unknown member '{type_name}.{name}'")))?;
+            self.require_field_access(&field.entry, true, Some(short))?;
+            let signature =
+                resolve_type(&target_type, self.types, self.externals, &mut *self.module)
+                    .map_err(|message| self.error(message))?;
+            let temporary = self.emitter.declare_local(signature);
+            self.emitter.stloc(temporary).ldloca(temporary);
+            self.emitter.emit(Instruction::new(
+                OpCode::Ldfld,
+                Operand::Token(MemberToken::Field(field.entry)),
+            ));
+            return Ok(field.ty);
+        }
         if let Ty::Array(_) = target_type {
             if name == "Length" {
                 self.emitter.op(OpCode::Ldlen);
