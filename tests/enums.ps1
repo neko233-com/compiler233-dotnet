@@ -184,6 +184,22 @@ $bridgeConsumerOutput = Join-Path $work 'FrameworkBridgeConsumer.dll'
 if ($LASTEXITCODE -ne 0) { throw 'Framework enum method signature failed to compile.' }
 & dotnet $enumOracle --invoke $bridgeConsumerOutput 'FrameworkBridgeConsumer' 'Run' '5'
 if ($LASTEXITCODE -ne 0) { throw 'Framework enum method signature failed at runtime.' }
+$baseSource = Join-Path $work 'EnumBaseConsumer.cs'
+$baseOutput = Join-Path $work 'EnumBaseConsumer.dll'
+[IO.File]::WriteAllText($baseSource, 'public static class EnumBaseConsumer { public static System.Enum BoxEnum(System.DayOfWeek value) { return value; } public static System.ValueType BoxValue(System.DayOfWeek value) { return value; } public static System.DayOfWeek FromEnum(System.Enum value) { return (System.DayOfWeek)value; } public static System.DayOfWeek FromValue(System.ValueType value) { return (System.DayOfWeek)value; } public static int Run() { System.Enum e = BoxEnum(System.DayOfWeek.Friday); System.ValueType v = BoxValue(System.DayOfWeek.Friday); if (e.ToString() != "Friday") return -1; if (FromEnum(e) != System.DayOfWeek.Friday || FromValue(v) != System.DayOfWeek.Friday) return -2; System.Enum explicitValue = (System.Enum)System.DayOfWeek.Friday; return (int)FromEnum(explicitValue); } }')
+& $binary csc $baseSource "-reference:$core" "-out:$baseOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Enum base boxing consumer failed to compile.' }
+& dotnet $enumOracle --invoke $baseOutput 'EnumBaseConsumer' 'Run' '5'
+if ($LASTEXITCODE -ne 0) { throw 'Enum base boxing consumer failed at runtime.' }
+$fakeSource = Join-Path $work 'FakeCorlib.cs'
+$fakeOutput = Join-Path $work 'FakeCorlib.dll'
+[IO.File]::WriteAllText($fakeSource, 'namespace System { public class Enum { } }')
+& $binary csc $fakeSource "-out:$fakeOutput"
+if ($LASTEXITCODE -ne 0) { throw 'Fake base type fixture failed to compile.' }
+[IO.File]::WriteAllText($bad, 'enum E { A } class C { public System.Enum Box(E value) { return value; } }')
+$null = & $binary csc $bad "-reference:$fakeOutput" "-out:$output" 2>&1
+if ($LASTEXITCODE -ne 1) { throw 'An unrelated System.Enum type accepted enum boxing.' }
+if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Invalid base conversion changed a previous output.' }
 $valid = Join-Path $work 'InternalVisibility.cs'
 $validOutput = Join-Path $work 'InternalVisibility.dll'
 [IO.File]::WriteAllText($valid, 'enum Hidden { A = 4 } internal class InternalClass { public static Hidden Value() { return Hidden.A; } } public class PublicClass { internal Hidden Field; private protected Hidden Access() { return Hidden.A; } public static int Run() { return (int)InternalClass.Value(); } }')

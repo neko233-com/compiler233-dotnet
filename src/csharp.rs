@@ -209,6 +209,16 @@ struct ExternalEnumIdentity {
     public_key: Vec<u8>,
 }
 
+fn strong_name_token(public_key: &[u8]) -> [u8; 8] {
+    use sha1::Digest;
+    let digest = sha1::Sha1::digest(public_key);
+    let mut token = [0; 8];
+    for (byte, source) in token.iter_mut().zip(digest[12..].iter().rev()) {
+        *byte = *source;
+    }
+    token
+}
+
 impl EnumInfo {
     fn full_name(&self) -> String {
         if self.namespace.is_empty() {
@@ -232,13 +242,8 @@ impl EnumInfo {
                 let assembly = assembly.get();
                 let key_matches =
                     if assembly.public_key_or_token.len() == 8 && !identity.public_key.is_empty() {
-                        use sha1::Digest;
-                        let digest = sha1::Sha1::digest(&identity.public_key);
-                        assembly
-                            .public_key_or_token
-                            .iter()
-                            .copied()
-                            .eq(digest[12..].iter().rev().copied())
+                        assembly.public_key_or_token.as_slice()
+                            == strong_name_token(&identity.public_key)
                     } else {
                         assembly.public_key_or_token == identity.public_key
                     };
@@ -4624,7 +4629,7 @@ impl<'a> FnEmitter<'a> {
 
     /// Convert the value on top of the evaluation stack when C# requires it.
     fn convert_assignable(&mut self, actual: &Ty, expected: &Ty, what: &str) -> Result<(), String> {
-        if matches!(actual, Ty::Enum(_, _)) && *expected == Ty::Object {
+        if matches!(actual, Ty::Enum(_, _)) && self.enum_boxing_cost(expected).is_some() {
             let token = self.enum_type_token(actual)?;
             self.emitter
                 .emit(Instruction::new(OpCode::Box, Operand::Token(token)));
@@ -4635,6 +4640,44 @@ impl<'a> FnEmitter<'a> {
         } else {
             self.require_assignable(actual, expected, what)
         }
+    }
+
+    fn enum_boxing_cost(&self, ty: &Ty) -> Option<u32> {
+        let Ty::Class(name) = ty else {
+            return (*ty == Ty::Object).then_some(3);
+        };
+        let cost = match name.as_str() {
+            "System.Enum" => 1,
+            "System.ValueType" => 2,
+            _ => return None,
+        };
+        let short = name.rsplit('.').next()?;
+        if self
+            .types
+            .get(short)
+            .is_some_and(|entry| entry.get().full_name() == *name)
+        {
+            return None;
+        }
+        let (index, entry) = self.externals.types.get(name)?;
+        if !entry.get().is_visible() {
+            return None;
+        }
+        let assembly = self.externals.modules[*index].assembly.as_ref()?.get();
+        let expected_token: &[u8] = if assembly.name.eq_ignore_ascii_case("System.Private.CoreLib")
+        {
+            &[0x7c, 0xec, 0x85, 0xd7, 0xbe, 0xa7, 0x79, 0x8e]
+        } else if assembly.name.eq_ignore_ascii_case("mscorlib") {
+            &[0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]
+        } else {
+            return None;
+        };
+        if assembly.public_key.is_empty()
+            || strong_name_token(&assembly.public_key) != expected_token
+        {
+            return None;
+        }
+        Some(cost)
     }
 
     fn enum_type_token(&mut self, ty: &Ty) -> Result<MemberToken, String> {
@@ -6660,6 +6703,20 @@ impl<'a> FnEmitter<'a> {
                             .emit(Instruction::new(OpCode::Box, Operand::Token(token)));
                     }
                     (Ty::Object, Ty::Enum(_, _)) => {
+                        let token = self
+                            .enum_type_token(target)
+                            .map_err(|message| self.error(message))?;
+                        self.emitter
+                            .emit(Instruction::new(OpCode::Unbox_Any, Operand::Token(token)));
+                    }
+                    (Ty::Enum(_, _), Ty::Class(_)) if self.enum_boxing_cost(target).is_some() => {
+                        let token = self
+                            .enum_type_token(&source)
+                            .map_err(|message| self.error(message))?;
+                        self.emitter
+                            .emit(Instruction::new(OpCode::Box, Operand::Token(token)));
+                    }
+                    (Ty::Class(_), Ty::Enum(_, _)) if self.enum_boxing_cost(&source).is_some() => {
                         let token = self
                             .enum_type_token(target)
                             .map_err(|message| self.error(message))?;
