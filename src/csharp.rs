@@ -498,6 +498,7 @@ fn switch_section_exits(block: &Block) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum SwitchConstant {
     Int(i32),
+    Enum(i128),
     Bool(bool),
     String(String),
     Null,
@@ -4713,11 +4714,15 @@ impl<'a> FnEmitter<'a> {
         sections: &[SwitchSection],
     ) -> Result<(), CompileError> {
         let value_type = self.expr(value)?;
-        let signature = match value_type {
+        let signature = match &value_type {
             Ty::Int => TypeSig::INT32,
             Ty::Bool => TypeSig::BOOL,
             Ty::String => TypeSig::STRING,
-            _ => return Err(self.error("switch supports int, bool, and string values")),
+            Ty::Enum(_, _) => {
+                resolve_type(&value_type, self.types, self.externals, &mut *self.module)
+                    .map_err(|message| self.error(message))?
+            }
+            _ => return Err(self.error("switch supports int, bool, string, and enum values")),
         };
         let value_local = self.emitter.declare_local(signature);
         self.emitter.stloc(value_local);
@@ -4749,13 +4754,22 @@ impl<'a> FnEmitter<'a> {
                         }
                     }
                     SwitchLabel::Case(expression) => {
-                        let Some(constant) = switch_constant(expression) else {
-                            return Err(self.error("only literal switch case values are supported"));
+                        let constant = if matches!(value_type, Ty::Enum(_, _)) {
+                            self.enum_switch_constant(expression, &value_type)
+                                .map(SwitchConstant::Enum)
+                        } else {
+                            switch_constant(expression)
+                        };
+                        let Some(constant) = constant else {
+                            return Err(
+                                self.error("unsupported or incompatible switch case constant")
+                            );
                         };
                         let compatible = matches!(
                             (&value_type, &constant),
                             (Ty::Int, SwitchConstant::Int(_))
                                 | (Ty::Bool, SwitchConstant::Bool(_))
+                                | (Ty::Enum(_, _), SwitchConstant::Enum(_))
                                 | (Ty::String, SwitchConstant::String(_) | SwitchConstant::Null)
                         );
                         if !compatible {
@@ -4790,11 +4804,18 @@ impl<'a> FnEmitter<'a> {
         } else {
             None
         };
-        let bounds = if value_type == Ty::Int && cases.len() >= 4 {
-            let mut values = cases.iter().filter_map(|(constant, _)| match constant {
-                SwitchConstant::Int(value) => Some(*value),
-                _ => None,
-            });
+        let dense_type = match &value_type {
+            Ty::Int => true,
+            Ty::Enum(_, base) => base.width() <= 4,
+            _ => false,
+        };
+        let case_i4 = |constant: &SwitchConstant| match constant {
+            SwitchConstant::Int(value) => Some(*value),
+            SwitchConstant::Enum(value) => Some(*value as i32),
+            _ => None,
+        };
+        let bounds = if dense_type && cases.len() >= 4 {
+            let mut values = cases.iter().filter_map(|(constant, _)| case_i4(constant));
             values.next().map(|first| {
                 values.fold((first, first), |(min, max), value| {
                     (min.min(value), max.max(value))
@@ -4811,10 +4832,8 @@ impl<'a> FnEmitter<'a> {
             let width = (i64::from(max) - i64::from(min) + 1) as usize;
             let mut table = vec![default.unwrap_or(end); width];
             for (constant, target) in &cases {
-                let SwitchConstant::Int(value) = constant else {
-                    unreachable!()
-                };
-                table[(i64::from(*value) - i64::from(min)) as usize] = *target;
+                let value = case_i4(constant).expect("dense switch has 32-bit constants");
+                table[(i64::from(value) - i64::from(min)) as usize] = *target;
             }
             self.emitter.ldloc(value_local);
             if min != 0 {
@@ -4827,6 +4846,20 @@ impl<'a> FnEmitter<'a> {
                 match constant {
                     SwitchConstant::Int(value) => {
                         self.emitter.ldc_i4(*value).op(OpCode::Ceq);
+                    }
+                    SwitchConstant::Enum(value) => {
+                        let Ty::Enum(_, base) = &value_type else {
+                            unreachable!()
+                        };
+                        if base.width() == 8 {
+                            self.emitter.emit(Instruction::new(
+                                OpCode::Ldc_I8,
+                                Operand::Int64(*value as u64 as i64),
+                            ));
+                        } else {
+                            self.emitter.ldc_i4(*value as i32);
+                        }
+                        self.emitter.op(OpCode::Ceq);
                     }
                     SwitchConstant::Bool(value) => {
                         self.emitter.ldc_i4(i32::from(*value)).op(OpCode::Ceq);
@@ -6456,6 +6489,10 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn enum_constant_value(&self, expression: &Expr) -> Option<i128> {
+        self.enum_constant(expression).map(|(_, value)| value)
+    }
+
+    fn enum_constant(&self, expression: &Expr) -> Option<(&EnumInfo, i128)> {
         let Expr::Member { target, name } = expression else {
             return None;
         };
@@ -6464,10 +6501,30 @@ impl<'a> FnEmitter<'a> {
         if self.locals.contains_key(root) || self.params.iter().any(|(name, _)| name == root) {
             return None;
         }
-        find_enum(self.enums, &type_name, &self.namespace, self.enum_imports)?
-            .values
-            .get(name)
-            .copied()
+        let info = find_enum(self.enums, &type_name, &self.namespace, self.enum_imports)?;
+        Some((info, *info.values.get(name)?))
+    }
+
+    fn enum_switch_constant(&self, expression: &Expr, expected: &Ty) -> Option<i128> {
+        let Ty::Enum(expected_name, base) = expected else {
+            return None;
+        };
+        if let Some((info, value)) = self.enum_constant(expression) {
+            return (info.full_name() == *expected_name).then_some(value);
+        }
+        if let Expr::Cast(target, inner) = expression
+            && target == expected
+        {
+            let value = match inner.as_ref() {
+                Expr::Int(value, _) => i128::from(*value),
+                other => self
+                    .enum_constant_value(other)
+                    .or_else(|| Self::constant_int(other).map(i128::from))?,
+            };
+            let (min, max) = base.bounds();
+            return (min..=max).contains(&value).then_some(value);
+        }
+        Self::is_enum_zero(expression).then_some(0)
     }
 
     fn member_read(&mut self, target: &Expr, name: &str) -> Result<Ty, CompileError> {

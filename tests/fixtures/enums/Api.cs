@@ -11,7 +11,7 @@ namespace EnumFixture {
     public enum SignedShort : short { Minimum = -32768, Maximum = 32767 }
     public enum UnsignedShort : ushort { Zero = 0, Maximum = 65535 }
     public enum SignedInt : int { Minimum = -2147483648, Maximum = 2147483647 }
-    public enum UnsignedInt : uint { Zero = 0, Maximum = 4294967295U }
+    public enum UnsignedInt : uint { Zero = 0, One = 1, Two = 2, Maximum = 4294967295U }
     public enum SignedLong : long { Minimum = -9223372036854775808L, Maximum = 9223372036854775807L }
     public enum UnsignedLong : ulong { Zero = 0, Maximum = 18446744073709551615UL }
     public enum Empty { }
@@ -44,6 +44,60 @@ namespace EnumFixture {
         public static int RoundTrip() { return (int)Echo((Direction)(-2)); }
         public static int FlagConstants() {
             return (int)Bits.AfterFuture + (int)ByteFlags.Both + (int)Bits.Precedence + (int)Bits.Shift;
+        }
+        public static int Classify(Direction value) {
+            switch (value) {
+                case Direction.Negative: return 3;
+                case 0: return 4;
+                case Direction.Positive: return 5;
+                case (Direction)3: return 7;
+                default: return 6;
+            }
+        }
+        public static int SwitchSignedByte(SignedByte value) { switch (value) { case SignedByte.Minimum: return 1; default: return 0; } }
+        public static int SwitchUnsignedByte(UnsignedByte value) { switch (value) { case UnsignedByte.Maximum: return 2; default: return 0; } }
+        public static int SwitchSignedShort(SignedShort value) { switch (value) { case SignedShort.Minimum: return 3; default: return 0; } }
+        public static int SwitchUnsignedShort(UnsignedShort value) { switch (value) { case UnsignedShort.Maximum: return 4; default: return 0; } }
+        public static int SwitchSignedInt(SignedInt value) { switch (value) { case SignedInt.Minimum: return 5; default: return 0; } }
+        public static int SwitchUnsignedInt(UnsignedInt value) { switch (value) { case UnsignedInt.Maximum: return 6; default: return 0; } }
+        public static int SwitchSignedLong(SignedLong value) { switch (value) { case SignedLong.Minimum: return 7; default: return 0; } }
+        public static int SwitchUnsignedLong(UnsignedLong value) { switch (value) { case UnsignedLong.Maximum: return 8; default: return 0; } }
+        public static int SwitchEnums() {
+            return Classify(Direction.Negative) + Classify(Direction.Zero) + Classify(Direction.Positive)
+                + Classify(Direction.Next) + Classify((Direction)8) + Classify((Direction)(-1))
+                + Classify((Direction)1) + Classify((Direction)4);
+        }
+        public static int ClassifyUnsigned(UnsignedInt value) {
+            switch (value) {
+                case UnsignedInt.Maximum: return 1;
+                case UnsignedInt.Zero: return 2;
+                case UnsignedInt.One: return 3;
+                case UnsignedInt.Two: return 4;
+                default: return 5;
+            }
+        }
+        public static int SwitchUnsignedDense() {
+            return ClassifyUnsigned(UnsignedInt.Maximum) + ClassifyUnsigned(UnsignedInt.Zero)
+                + ClassifyUnsigned(UnsignedInt.One) + ClassifyUnsigned(UnsignedInt.Two)
+                + ClassifyUnsigned((UnsignedInt)3);
+        }
+        public static int NoDefault(Direction value) {
+            int result = 7;
+            switch (value) {
+                case Direction.Positive: result = 2; break;
+                case Direction.Zero:
+                case Direction.Negative: result = 4; break;
+            }
+            return result;
+        }
+        public static int SwitchNoDefault() {
+            return NoDefault((Direction)8) + NoDefault(Direction.Positive) + NoDefault(Direction.Negative);
+        }
+        public static int SwitchAll() {
+            return SwitchSignedByte(SignedByte.Minimum) + SwitchUnsignedByte(UnsignedByte.Maximum)
+                + SwitchSignedShort(SignedShort.Minimum) + SwitchUnsignedShort(UnsignedShort.Maximum)
+                + SwitchSignedInt(SignedInt.Minimum) + SwitchUnsignedInt(UnsignedInt.Maximum)
+                + SwitchSignedLong(SignedLong.Minimum) + SwitchUnsignedLong(UnsignedLong.Maximum);
         }
         public static int ZeroConversions() {
             UnsignedLong value = 0;

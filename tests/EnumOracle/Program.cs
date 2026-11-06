@@ -102,7 +102,7 @@ var specs = new (string Name, Type Underlying, bool Public, (string Name, object
     ("EnumFixture.SignedShort", typeof(short), true, [("Minimum", (short)-32768), ("Maximum", (short)32767)]),
     ("EnumFixture.UnsignedShort", typeof(ushort), true, [("Zero", (ushort)0), ("Maximum", (ushort)65535)]),
     ("EnumFixture.SignedInt", typeof(int), true, [("Minimum", int.MinValue), ("Maximum", int.MaxValue)]),
-    ("EnumFixture.UnsignedInt", typeof(uint), true, [("Zero", 0U), ("Maximum", uint.MaxValue)]),
+    ("EnumFixture.UnsignedInt", typeof(uint), true, [("Zero", 0U), ("One", 1U), ("Two", 2U), ("Maximum", uint.MaxValue)]),
     ("EnumFixture.SignedLong", typeof(long), true, [("Minimum", long.MinValue), ("Maximum", long.MaxValue)]),
     ("EnumFixture.UnsignedLong", typeof(ulong), true, [("Zero", 0UL), ("Maximum", ulong.MaxValue)]),
     ("EnumFixture.Empty", typeof(int), true, []),
@@ -182,6 +182,7 @@ if (api.GetField("ZeroField")!.FieldType.FullName != "EnumFixture.UnsignedLong" 
 foreach (var test in new[] {
     ("EnumFixture.Api", "Run", 2), ("EnumFixture.Api", "RoundTrip", -2),
     ("EnumFixture.Api", "Arrays", 9), ("EnumFixture.Api", "ZeroConversions", 4), ("EnumFixture.Api", "FlagConstants", 143),
+    ("EnumFixture.Api", "SwitchEnums", 43), ("EnumFixture.Api", "SwitchAll", 36), ("EnumFixture.Api", "SwitchUnsignedDense", 15), ("EnumFixture.Api", "SwitchNoDefault", 13),
     ("EnumOne.Holder", "Run", 1), ("EnumTwo.OtherHolder", "Run", 2),
     ("EnumImported.ImportedHolder", "Run", 1), ("EnumAliased.AliasHolder", "Run", 2)
 })
