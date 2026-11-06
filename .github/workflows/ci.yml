@@ -37,6 +37,10 @@ jobs:
         shell: pwsh
       - run: ./tests/csc.ps1
         shell: pwsh
+      - run: ./tests/preprocessor.ps1
+        shell: pwsh
+      - run: ./tests/output-safety.ps1
+        shell: pwsh
       - run: ./tests/compile.ps1
         shell: pwsh
       - run: ./tests/differential.ps1

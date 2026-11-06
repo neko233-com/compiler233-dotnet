@@ -28,14 +28,12 @@ Copy-Item (Join-Path $root 'tests/fixtures/Arithmetic.cs') $fixture -Force
 $second = Join-Path $work 'Second.cs'
 Write-Text $second @('class Second { static int F() { return 2; } }')
 
-# Nested response files, quotes around paths with spaces, comments and both
-# output switches, as Unity and HotReload233 generate them.
+# Nested response files, quotes around paths with spaces and comments.
 $output = Join-Path $spacedDir 'patch.dll'
 $refout = Join-Path $spacedDir 'patch.ref.dll'
 $inner = Join-Path $work 'inner.rsp'
 Write-Text $inner @(
     '# inner response file',
-    ('-refout:"' + ($refout.Replace('\', '/')) + '"'),
     '-nologo',
     '-langversion:9.0',
     '-optimize+',
@@ -52,13 +50,20 @@ $reportPath = Join-Path $work 'success-report.json'
 $result = Invoke-Csc @("@$outer", "-report:$reportPath")
 Assert-True ($result.ExitCode -eq 0) "csc invocation failed: $($result.Output)"
 Assert-True (Test-Path $output) 'csc invocation did not write the assembly'
-Assert-True (Test-Path $refout) 'csc invocation did not write the reference assembly'
 $report = Get-Content $reportPath -Raw | ConvertFrom-Json
 Assert-True ($report.outcome -eq 'success') 'report outcome is not success'
 Assert-True ($report.output_bytes -gt 0) 'report did not record output bytes'
 Assert-True ($report.define -contains 'HOTRELOAD233_PATCH') 'report did not record the define'
 Assert-True ($report.ignored_options -contains 'nologo') 'report did not record ignored options'
 Assert-True ($report.ignored_options -contains 'optimize') 'report did not record the optimize modifier'
+
+# A reference assembly is not the implementation assembly: reject the option
+# until a correct reference assembly can be emitted, preserving existing output.
+$beforeRefout = (Get-FileHash -Algorithm SHA256 $output).Hash
+$result = Invoke-Csc @($fixture, "-out:$output", "-refout:$refout")
+Assert-True ($result.ExitCode -eq 1 -and $result.Output -match 'CD2330002') 'unimplemented refout was not rejected'
+Assert-True ((Get-FileHash -Algorithm SHA256 $output).Hash -eq $beforeRefout) 'failed refout compilation modified the implementation assembly'
+Assert-True (-not (Test-Path $refout)) 'failed refout compilation created an artifact'
 
 # A failed compilation must keep the previously produced assembly.
 $before = (Get-FileHash -Algorithm SHA256 $output).Hash

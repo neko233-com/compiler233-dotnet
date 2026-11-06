@@ -16,7 +16,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::csharp;
+use crate::{csharp, syntax};
 
 const MAX_RESPONSE_DEPTH: usize = 16;
 
@@ -29,29 +29,14 @@ const USAGE: &str = concat!(
     "Unsupported constructs report an error and produce no assembly.\n",
 );
 
-/// Switches that are accepted but intentionally not applied. They do not change
-/// the meaning of the assembly this compiler currently produces; the report
-/// records them so a caller can see what was dropped.
+/// Switches accepted but not currently applied. The report records them;
+/// acceptance does not imply Roslyn-compatible diagnostics or metadata.
 const IGNORED_OPTIONS: &[&str] = &[
-    "additionalfile",
-    "analyzer",
-    "analyzerconfig",
     "autoref",
-    "checked",
-    "debug",
-    "debugtype",
-    "define",
-    "deterministic",
-    "doc",
-    "embed",
     "errorendlocation",
-    "errorlog",
-    "features",
     "filealign",
     "fullpaths",
     "highentropyva",
-    "instrument",
-    "lib",
     "main",
     "moduleassemblyname",
     "noconfig",
@@ -59,18 +44,32 @@ const IGNORED_OPTIONS: &[&str] = &[
     "nowarn",
     "optimize",
     "parallel",
-    "pathmap",
-    "platform",
     "preferreduilang",
-    "refonly",
-    "ruleset",
     "simplifiedpaths",
-    "sourcelink",
     "subsystemversion",
     "unsafe",
     "utf8output",
     "warn",
-    "warnaserror",
+];
+
+/// These switches affect program semantics, compiler diagnostics or requested
+/// artifacts; accepting them while ignoring them would claim false success.
+const UNSUPPORTED_OPTIONS: &[&str] = &[
+    "additionalfile",
+    "analyzer",
+    "analyzerconfig",
+    "debugtype",
+    "doc",
+    "embed",
+    "errorlog",
+    "features",
+    "instrument",
+    "lib",
+    "pathmap",
+    "platform",
+    "refonly",
+    "ruleset",
+    "sourcelink",
     "warnnotaserror",
 ];
 
@@ -259,11 +258,22 @@ fn split_option(token: &str) -> Option<(String, String)> {
     Some((name.to_ascii_lowercase(), value.to_string()))
 }
 
-fn expand_arguments(args: &[String], diagnostics: &mut Vec<Diagnostic>) -> Vec<String> {
+fn expand_arguments(
+    args: &[String],
+    diagnostics: &mut Vec<Diagnostic>,
+    response_files: &mut Vec<PathBuf>,
+) -> Vec<String> {
     let mut expanded = Vec::new();
     let mut stack = Vec::new();
     for argument in args {
-        expand_argument(argument, 0, &mut stack, &mut expanded, diagnostics);
+        expand_argument(
+            argument,
+            0,
+            &mut stack,
+            &mut expanded,
+            diagnostics,
+            response_files,
+        );
     }
     expanded
 }
@@ -274,6 +284,7 @@ fn expand_argument(
     stack: &mut Vec<PathBuf>,
     expanded: &mut Vec<String>,
     diagnostics: &mut Vec<Diagnostic>,
+    response_files: &mut Vec<PathBuf>,
 ) {
     let Some(rest) = argument.strip_prefix('@') else {
         expanded.push(argument.to_string());
@@ -316,6 +327,7 @@ fn expand_argument(
         ));
         return;
     };
+    response_files.push(canonical.clone());
     stack.push(canonical);
     for line in text.lines() {
         let line = line.trim_start_matches('\u{feff}');
@@ -324,7 +336,14 @@ fn expand_argument(
             continue;
         }
         for argument in split_arguments(line) {
-            expand_argument(&argument, depth + 1, stack, expanded, diagnostics);
+            expand_argument(
+                &argument,
+                depth + 1,
+                stack,
+                expanded,
+                diagnostics,
+                response_files,
+            );
         }
     }
     stack.pop();
@@ -379,6 +398,13 @@ fn parse_options(tokens: &[String], options: &mut Options, diagnostics: &mut Vec
                 "CD2330002",
                 "-nostdlib is not implemented; no assembly was produced",
             )),
+            "checked-" | "debug-" | "deterministic-" | "warnaserror-" => {}
+            "checked" | "checked+" | "debug" | "debug+" | "deterministic" | "deterministic+"
+            | "warnaserror" | "warnaserror+" => diagnostics.push(Diagnostic::error(
+                "<command line>",
+                "CD2330002",
+                format!("{token} is not implemented; no assembly was produced"),
+            )),
             "resource" | "linkresource" | "win32res" | "win32icon" | "win32manifest"
             | "applicationicon" | "keyfile" | "delaysign" | "publicsign" => {
                 diagnostics.push(Diagnostic::error(
@@ -392,7 +418,13 @@ fn parse_options(tokens: &[String], options: &mut Options, diagnostics: &mut Vec
                     .strip_suffix('+')
                     .or_else(|| other.strip_suffix('-'))
                     .unwrap_or(other);
-                if IGNORED_OPTIONS.contains(&base) {
+                if UNSUPPORTED_OPTIONS.contains(&base) {
+                    diagnostics.push(Diagnostic::error(
+                        "<command line>",
+                        "CD2330002",
+                        format!("{token} is not implemented; no assembly was produced"),
+                    ));
+                } else if IGNORED_OPTIONS.contains(&base) {
                     options.ignored.insert(base.to_string());
                 } else {
                     unknown_option(token, diagnostics);
@@ -456,6 +488,126 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn target_identity(path: &Path) -> std::io::Result<PathBuf> {
+    if let Ok(existing) = path.canonicalize() {
+        return Ok(existing);
+    }
+    let absolute = std::path::absolute(path)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    let mut missing = Vec::new();
+    let mut ancestor = normalized.as_path();
+    loop {
+        if let Ok(mut existing) = ancestor.canonicalize() {
+            for component in missing.iter().rev() {
+                existing.push(component);
+            }
+            return Ok(existing);
+        }
+        let Some(name) = ancestor.file_name() else {
+            return Ok(normalized);
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return Ok(normalized);
+        };
+        ancestor = parent;
+    }
+}
+
+fn same_target(first: &Path, second: &Path) -> std::io::Result<bool> {
+    let first = target_identity(first)?;
+    let second = target_identity(second)?;
+    if cfg!(windows) {
+        Ok(first.to_string_lossy().to_lowercase() == second.to_string_lossy().to_lowercase())
+    } else {
+        Ok(first == second)
+    }
+}
+
+/// Return whether it is safe to write the optional report. All other collisions
+/// add an error before compilation or any output is touched.
+fn validate_output_paths(
+    options: &Options,
+    response_files: &[PathBuf],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    let output = options.output_path();
+    let mut outputs = vec![("output", output)];
+    if let Some(path) = &options.refout {
+        outputs.push(("reference output", PathBuf::from(path)));
+    }
+    if let Some(path) = &options.report {
+        outputs.push(("report", PathBuf::from(path)));
+    }
+    let inputs: Vec<PathBuf> = options
+        .sources
+        .iter()
+        .chain(&options.references)
+        .map(PathBuf::from)
+        .chain(response_files.iter().cloned())
+        .collect();
+    let mut report_safe = true;
+    for (index, (kind, path)) in outputs.iter().enumerate() {
+        for other in inputs
+            .iter()
+            .chain(outputs[..index].iter().map(|(_, path)| path))
+        {
+            match same_target(path, other) {
+                Ok(false) => continue,
+                Ok(true) => diagnostics.push(Diagnostic::error(
+                    "<command line>",
+                    "CD2330022",
+                    format!(
+                        "{kind} '{}' conflicts with input or another output '{}'",
+                        path.display(),
+                        other.display()
+                    ),
+                )),
+                Err(error) => diagnostics.push(Diagnostic::error(
+                    "<command line>",
+                    "CD2330022",
+                    format!("cannot validate {kind} path '{}': {error}", path.display()),
+                )),
+            }
+            if *kind == "report" {
+                report_safe = false;
+            }
+        }
+    }
+    report_safe
+}
+
+/// Select active preprocessor tokens while retaining byte offsets and line
+/// breaks. The compiler's parser lexes this text again, so directives must be
+/// removed after evaluation to prevent a second pass with an empty define set.
+fn preprocess_source(source: &str, defines: &[String]) -> Result<String, syntax::SyntaxError> {
+    let tokens = syntax::lex_with_defines(source, defines)?;
+    let mut result: Vec<u8> = source
+        .bytes()
+        .map(|byte| {
+            if byte == b'\n' || byte == b'\r' {
+                byte
+            } else {
+                b' '
+            }
+        })
+        .collect();
+    for token in tokens {
+        result[token.start..token.end].copy_from_slice(&source.as_bytes()[token.start..token.end]);
+    }
+    // Active token boundaries are UTF-8 boundaries; every other byte is ASCII.
+    Ok(String::from_utf8(result).expect("lexer returned invalid UTF-8 token boundaries"))
+}
+
 fn compile_assembly(
     options: &Options,
     diagnostics: &mut Vec<Diagnostic>,
@@ -480,6 +632,14 @@ fn compile_assembly(
         ));
         return None;
     }
+    if options.refout.is_some() {
+        diagnostics.push(Diagnostic::error(
+            "<command line>",
+            "CD2330002",
+            "-refout is not implemented; no assembly was produced",
+        ));
+        return None;
+    }
     for source in &options.sources {
         if source == "-" {
             diagnostics.push(Diagnostic::error(
@@ -500,9 +660,31 @@ fn compile_assembly(
     }
 
     let mut sources = Vec::with_capacity(options.sources.len());
+    let defines: Vec<String> = options.defines.iter().cloned().collect();
     for source_path in &options.sources {
         match fs::read_to_string(source_path) {
-            Ok(text) => sources.push((source_path.clone(), text)),
+            Ok(text) => {
+                let text = if !defines.is_empty() && text.contains('#') {
+                    match preprocess_source(&text, &defines) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            let (line, column) = error.line_column(&text);
+                            diagnostics.push(Diagnostic::at(
+                                source_path.clone(),
+                                line,
+                                column,
+                                Severity::Error,
+                                "CD2330010",
+                                error.message,
+                            ));
+                            return None;
+                        }
+                    }
+                } else {
+                    text
+                };
+                sources.push((source_path.clone(), text));
+            }
             Err(error) => {
                 diagnostics.push(Diagnostic::error(
                     source_path.clone(),
@@ -548,25 +730,6 @@ fn compile_assembly(
             format!("Cannot open '{}' for writing: {error}", output.display()),
         ));
         return None;
-    }
-    if let Some(refout) = &options.refout {
-        let refout_path = PathBuf::from(refout);
-        // Reference assemblies are a compile-time artifact for downstream
-        // callers; M0 writes the full assembly instead of stripping method
-        // bodies, so the deviation is reported rather than hidden.
-        diagnostics.push(Diagnostic::warning(
-            refout.clone(),
-            "CD2330020",
-            "-refout is not implemented; the full assembly was written instead",
-        ));
-        if let Err(error) = write_atomic(&refout_path, &bytes) {
-            diagnostics.push(Diagnostic::error(
-                refout.clone(),
-                "CS2012",
-                format!("Cannot open '{refout}' for writing: {error}"),
-            ));
-            return None;
-        }
     }
     Some(bytes)
 }
@@ -630,11 +793,13 @@ pub fn run(args: &[String]) -> u8 {
     }
 
     let mut diagnostics = Vec::new();
-    let expanded = expand_arguments(args, &mut diagnostics);
+    let mut response_files = Vec::new();
+    let expanded = expand_arguments(args, &mut diagnostics, &mut response_files);
     let mut options = Options::default();
     if diagnostics.is_empty() {
         parse_options(&expanded, &mut options, &mut diagnostics);
     }
+    let report_safe = validate_output_paths(&options, &response_files, &mut diagnostics);
 
     let mut output_bytes = 0;
     let mut frontend_scan = None;
@@ -648,7 +813,8 @@ pub fn run(args: &[String]) -> u8 {
         println!("{diagnostic}");
     }
 
-    if let Some(report) = &options.report
+    if report_safe
+        && let Some(report) = &options.report
         && let Err(error) = write_report(
             report,
             args,
@@ -682,6 +848,24 @@ mod tests {
 
     fn tokens(line: &str) -> Vec<String> {
         split_arguments(line)
+    }
+
+    #[test]
+    fn defines_select_active_tokens_and_keep_source_offsets() {
+        let source = "// 中文\r\n#if FLAG\r\nclass A { string s = \"# 中文\"; }\r\n#else\r\nclass B {}\r\n#endif\r\n";
+        let prepared = preprocess_source(source, &["FLAG".into()]).unwrap();
+        assert_eq!(prepared.len(), source.len());
+        assert_eq!(prepared.find("class A"), source.find("class A"));
+        assert!(prepared.contains("\"# 中文\""));
+        assert!(!prepared.contains("class B"));
+        assert!(!prepared.contains("#if"));
+    }
+
+    #[test]
+    fn active_error_directive_is_rejected() {
+        let source = "#if FLAG\n#error failure\n#endif\nclass A {}";
+        assert!(preprocess_source(source, &["FLAG".into()]).is_err());
+        assert!(preprocess_source(source, &[]).is_ok());
     }
 
     #[test]
@@ -775,7 +959,11 @@ mod tests {
         )
         .unwrap();
         let mut diagnostics = Vec::new();
-        let expanded = expand_arguments(&[format!("@{}", outer.display())], &mut diagnostics);
+        let expanded = expand_arguments(
+            &[format!("@{}", outer.display())],
+            &mut diagnostics,
+            &mut Vec::new(),
+        );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(
             expanded,
@@ -795,7 +983,11 @@ mod tests {
         fs::write(&first, format!("@{}\n", second.display())).unwrap();
         fs::write(&second, format!("@{}\n", first.display())).unwrap();
         let mut diagnostics = Vec::new();
-        let expanded = expand_arguments(&[format!("@{}", first.display())], &mut diagnostics);
+        let expanded = expand_arguments(
+            &[format!("@{}", first.display())],
+            &mut diagnostics,
+            &mut Vec::new(),
+        );
         assert!(expanded.is_empty());
         assert_eq!(diagnostics[0].code, "CD2330008");
     }
@@ -803,7 +995,11 @@ mod tests {
     #[test]
     fn reports_missing_response_file() {
         let mut diagnostics = Vec::new();
-        let expanded = expand_arguments(&["@does-not-exist.rsp".to_string()], &mut diagnostics);
+        let expanded = expand_arguments(
+            &["@does-not-exist.rsp".to_string()],
+            &mut diagnostics,
+            &mut Vec::new(),
+        );
         assert!(expanded.is_empty());
         assert_eq!(diagnostics[0].code, "CD2330007");
     }

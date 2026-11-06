@@ -375,19 +375,20 @@ impl<'a> Lexer<'a> {
     fn evaluate_condition_with_parent(
         &self,
         words: &[&str],
-        parent_active: bool,
-        taken: bool,
+        _parent_active: bool,
+        _taken: bool,
     ) -> Result<bool, SyntaxError> {
-        if !parent_active || taken {
-            return Ok(false);
-        }
         let joined = words.join(" ");
-        let tokens = split_condition(&joined);
-        if tokens.is_empty() {
-            return Ok(false);
-        }
+        let expression = joined
+            .split_once("//")
+            .map_or(joined.as_str(), |(before, _)| before);
+        let tokens = split_condition(expression);
         let mut position = 0;
-        let value = evaluate_or(&tokens, &mut position, &self.defines);
+        let value = evaluate_or(&tokens, &mut position, &self.defines, 0)
+            .map_err(|message| self.error(self.position, message))?;
+        if position != tokens.len() {
+            return Err(self.error(self.position, "unexpected token in preprocessor expression"));
+        }
         Ok(value)
     }
 
@@ -739,70 +740,97 @@ fn split_condition(text: &str) -> Vec<String> {
     tokens
 }
 
-fn evaluate_or(tokens: &[String], position: &mut usize, defines: &[String]) -> bool {
-    let mut value = evaluate_and(tokens, position, defines);
+fn evaluate_or(
+    tokens: &[String],
+    position: &mut usize,
+    defines: &[String],
+    depth: usize,
+) -> Result<bool, &'static str> {
+    let mut value = evaluate_and(tokens, position, defines, depth)?;
     while tokens.get(*position).map(String::as_str) == Some("||") {
         *position += 1;
-        let right = evaluate_and(tokens, position, defines);
+        let right = evaluate_and(tokens, position, defines, depth)?;
         value = value || right;
     }
-    value
+    Ok(value)
 }
 
-fn evaluate_and(tokens: &[String], position: &mut usize, defines: &[String]) -> bool {
-    let mut value = evaluate_equality(tokens, position, defines);
+fn evaluate_and(
+    tokens: &[String],
+    position: &mut usize,
+    defines: &[String],
+    depth: usize,
+) -> Result<bool, &'static str> {
+    let mut value = evaluate_equality(tokens, position, defines, depth)?;
     while tokens.get(*position).map(String::as_str) == Some("&&") {
         *position += 1;
-        let right = evaluate_equality(tokens, position, defines);
+        let right = evaluate_equality(tokens, position, defines, depth)?;
         value = value && right;
     }
-    value
+    Ok(value)
 }
 
-fn evaluate_equality(tokens: &[String], position: &mut usize, defines: &[String]) -> bool {
-    let mut value = evaluate_unary(tokens, position, defines);
+fn evaluate_equality(
+    tokens: &[String],
+    position: &mut usize,
+    defines: &[String],
+    depth: usize,
+) -> Result<bool, &'static str> {
+    let mut value = evaluate_unary(tokens, position, defines, depth)?;
     loop {
         match tokens.get(*position).map(String::as_str) {
             Some("==") => {
                 *position += 1;
-                value = value == evaluate_unary(tokens, position, defines);
+                value = value == evaluate_unary(tokens, position, defines, depth)?;
             }
             Some("!=") => {
                 *position += 1;
-                value = value != evaluate_unary(tokens, position, defines);
+                value = value != evaluate_unary(tokens, position, defines, depth)?;
             }
-            _ => return value,
+            _ => return Ok(value),
         }
     }
 }
 
-fn evaluate_unary(tokens: &[String], position: &mut usize, defines: &[String]) -> bool {
+fn evaluate_unary(
+    tokens: &[String],
+    position: &mut usize,
+    defines: &[String],
+    depth: usize,
+) -> Result<bool, &'static str> {
+    if depth > 256 {
+        return Err("preprocessor expression nesting exceeds 256");
+    }
     match tokens.get(*position).map(String::as_str) {
         Some("!") => {
             *position += 1;
-            !evaluate_unary(tokens, position, defines)
+            Ok(!evaluate_unary(tokens, position, defines, depth + 1)?)
         }
         Some("(") => {
             *position += 1;
-            let value = evaluate_or(tokens, position, defines);
-            if tokens.get(*position).map(String::as_str) == Some(")") {
-                *position += 1;
+            let value = evaluate_or(tokens, position, defines, depth + 1)?;
+            if tokens.get(*position).map(String::as_str) != Some(")") {
+                return Err("missing ')' in preprocessor expression");
             }
-            value
+            *position += 1;
+            Ok(value)
         }
         Some("true") => {
             *position += 1;
-            true
+            Ok(true)
         }
         Some("false") => {
             *position += 1;
-            false
+            Ok(false)
         }
-        Some(symbol) => {
+        Some(symbol)
+            if symbol.chars().next().is_some_and(is_identifier_start)
+                && symbol.chars().all(is_identifier_part) =>
+        {
             *position += 1;
-            defines.iter().any(|define| define == symbol)
+            Ok(defines.iter().any(|define| define == symbol))
         }
-        None => false,
+        _ => Err("invalid preprocessor expression"),
     }
 }
 
@@ -930,6 +958,29 @@ mod tests {
     fn reports_unterminated_conditional() {
         let error = lex("#if DEBUG\nclass A {}\n").unwrap_err();
         assert!(error.message.contains("unterminated #if"));
+    }
+
+    #[test]
+    fn validates_all_preprocessor_expressions_even_when_inactive() {
+        for source in [
+            "#if FLAG &&\n#endif\nclass C {}",
+            "#if (true\n#endif\nclass C {}",
+            "#if true extra\n#endif\nclass C {}",
+            "#if false\n#if FLAG &&\n#endif\n#endif\nclass C {}",
+            "#if true\n#elif FLAG &&\n#endif\nclass C {}",
+        ] {
+            assert!(lex(source).is_err(), "{source}");
+        }
+        assert!(lex("#if true // comment\nclass C {}\n#endif").is_ok());
+        assert!(
+            lex_with_defines(
+                "#if A && (!B || C == false)\nclass C {}\n#endif",
+                &["A".into()]
+            )
+            .unwrap()
+            .iter()
+            .any(|t| t.kind == TokenKind::Identifier)
+        );
     }
 
     #[test]

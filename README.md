@@ -9,24 +9,24 @@
 - **兼容性**：按明确的 C# / .NET 版本逐步实现语法、绑定、类型检查、诊断、CLR 元数据和 CIL；以 Roslyn 的编译结果和实际运行行为进行差分验证。
 - **性能**：在等价的正确性和功能覆盖下，对标 Roslyn 的冷启动、完整与增量编译、并发吞吐、p50/p95/p99、分配量及峰值内存，目标是在主要工作负载上显著领先。
 - **集成**：逐步覆盖多文件项目、引用解析、CLI/MSBuild、可复现构建及开发工具接口。达到兼容性要求前，不宣称可以替代 `csc`、MSBuild 或 Roslyn API。
-- **替代边界**：可验收的"替代 Roslyn"以 **csc 命令行契约**为定义——参数字典、响应文件、诊断格式、退出码和产物；`Microsoft.CodeAnalysis` 托管 API 兼容不在范围内。HotReload233 的接入点是该契约（见下文"Roslyn 替代边界"），但本仓库当前不改动 HotReload233，接入放在语言覆盖达标之后。
+- **替代目标**：包括 csc 命令行契约、C# 和 Visual Basic、分析器与源生成器，以及 `Microsoft.CodeAnalysis` 托管 API 兼容；这些能力目前只有少量 csc/C# 子集实现。HotReload233 的接入点是 csc 进程契约，待相关能力及实际链路验证后再接入。
 - **平台**：Windows x86-64、Linux x86-64、macOS **ARM64**。macOS Intel 不在支持范围；项目会明确拒绝该编译目标。平台 CI 通过只说明当前已实现功能通过该平台的检查。
 
 ## 当前已实现
 
 | 能力 | 状态和边界 |
 | --- | --- |
-| 原生 C# 语法前端 | 自研词法 + 递归下降解析：预处理指令与条件编译、命名空间、类型、成员、语句与表达式；不支持的构造带偏移报错。对 `tuanjie-project-sf` 全部 8530 个脚本语法层 8530/8530 通过，误接受 0。 |
-| 受限编译与 DLL 生成 | 将支持的单文件子集编译为 .NET 10 DLL；使用 Rust 的 `hao` 库生成 PE、元数据与 CIL。 |
+| 原生 C# 语法前端 | 自研词法 + 递归下降解析：预处理指令与条件编译、命名空间、类型、成员、语句与表达式；不支持的构造带偏移报错。2026-11-06 对 `tuanjie-project-sf/Assets` 的 8534 个脚本做语法层差分，双方全部接受；结果不代表语义或编译覆盖。 |
+| 受限编译与 DLL 生成 | `csc` 支持部分多文件 C# 和外部引用，输出 .NET DLL；`compile` 命令使用更小的独立子集。均使用 Rust 的 `hao` 库生成 PE、元数据与 CIL。 |
 | 语义检查 | 检查重复类型/方法/参数、未定义参数引用、受限整型常量表达式等；尚非完整 C# 类型系统和诊断。 |
 | 运行时对照 | 测试将输出 DLL 由 .NET 实际加载和执行，与 Roslyn 的结果和异常比较；覆盖范围见 `tests/fixtures`。 |
 | 对照工具 | tree-sitter C# 用于独立的语法实验；Roslyn 使用本机 .NET 10 SDK 自带程序集作为参考。 |
-| csc 兼容前端 | 解析 `@响应文件`（引号、`#` 注释、嵌套与环检测）以及 Unity/HotReload233 实际传入的选项；诊断按 `path(line,col): error CODE: message` 输出，退出码 0/1；`-report:<path>` 写出机器可读报告。多文件、非 library 目标、签名与资源等未实现能力明确拒绝，且不产出程序集。 |
+| csc 兼容前端 | 解析 `@响应文件`（引号、`#` 注释、嵌套与环检测）以及部分常用选项；`-define` 参与条件编译。诊断按 `path(line,col): error CODE: message` 输出，退出码 0/1；`-report:<path>` 写出机器可读报告。非 library 目标、签名与资源等未实现能力会拒绝；部分其他选项尚被忽略，不能认为命令行行为完整等价。 |
 | HotReload233 接入 | 接入点已确认为 csc 进程契约；本仓库暂不改动 HotReload233，待语言覆盖达标后再接。 |
 | 真实工程度量 | `benchmarks/compile-survey.ps1` 用 `-reference` 指向工程 `Library/ScriptAssemblies`，抽样编译真实脚本并统计失败原因分布 |
 | 差分门禁 | 以 Roslyn 为 oracle 对同一批 `.cs` 双编译，输出 accept / reject / false_reject / false_accept 分类与覆盖率；false_accept 默认上限为 0。 |
 
-受限编译器只接受 ASCII 源码、顶层 `class`，其中包含 `static int` 方法、`int` 参数，以及每个方法中一条 `return`。表达式支持参数、`int` 范围内的十进制常量、括号和二元 `+ - * /`。输出为库而非可直接启动的程序；不支持预处理、泛型、引用程序集、跨方法调用、调试信息或 VB。语法检查通过不代表程序通过了语义检查。
+独立的 `compile` 子集命令只接受 ASCII 源码、顶层 `class`，其中包含 `static int` 方法、`int` 参数，以及每个方法中一条 `return`。表达式支持参数、`int` 范围内的十进制常量、括号和二元 `+ - * /`。更广的 `csc` 能力见下文，但仍远未覆盖 C#；语法检查通过不代表程序通过了语义检查。
 
 ## 构建与使用
 
@@ -44,7 +44,11 @@ cargo test --locked
 
 `compile` 在完整解析、语义检查和内存生成成功后才替换输出文件；失败时保留已有输出。命令成功返回 0，语法或语义错误返回 1，参数或 I/O 错误返回 2。`check` 使用 tree-sitter 检查更宽的 C# 语法，不会进行语义分析或生成程序集。
 
-`csc` 接受与 Roslyn 相同的调用形态（`@响应文件`、`-选项`、`.cs` 源文件路径），成功返回 0、诊断错误返回 1。诊断代码中，`CS####` 表示与 csc 语义一致的既有错误，`CD233####` 表示本项目尚未实现的边界（例如 `CD2330003` 多文件编译未实现）。
+`csc` 在写入前检查输出、引用输出和报告是否与源文件、引用程序集、响应文件或其他输出指向同一路径；冲突时报错并保留已有文件。
+
+`-refout`、分析器、生成器相关输入、`-checked+`、调试信息、确定性输出、警告转错误、XML 文档等尚未实现；这些选项会报错，不会用普通 DLL 冒充所请求的产物。其他尚被忽略的选项会列入报告，不应将其视为与 Roslyn 等价。
+
+`csc` 接受常见的调用形态（`@响应文件`、`-选项`、`.cs` 源文件路径），成功返回 0、诊断错误返回 1。诊断代码中，`CS####` 表示借用的 csc 错误代码，`CD233####` 表示本项目诊断；具体消息、行为和位置尚未完整对齐 Roslyn。
 
 `frontend` 在一个进程里批量做语法校验，不写任何程序集，只输出（或按 `-report:` 写入）一份 JSON：每个文件是否通过、类型/成员计数与首个错误的行列。这是"超快增量验证"的入口，也是差分门禁 `-Mode frontend` 使用的命令。
 
@@ -52,6 +56,8 @@ cargo test --locked
 
 ```powershell
 ./tests/runtime.ps1
+./tests/preprocessor.ps1
+./tests/output-safety.ps1
 ./benchmarks/run.ps1 -RustMode Subset -Source benchmarks/corpus/Subset.cs -Iterations 500 -Warmup 50
 ./benchmarks/run.ps1 -RustMode Subset -Stage Compile -Source tests/fixtures/Arithmetic.cs -Iterations 100 -Warmup 30
 ./benchmarks/check-subset.ps1
@@ -65,13 +71,13 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 | 层次 | 状态 | 说明 |
 | --- | --- | --- |
-| csc 命令行契约 | M0 已实现 | `@rsp`、项目实际使用的选项、`file(line,col): error CODE: message`、退出码 0/1、`-report` |
+| csc 命令行契约 | 部分实现 | `@rsp`、部分选项、`file(line,col): error CODE: message`、退出码 0/1、`-report`；忽略的选项会记录在报告中，不能视为完整契约 |
 | Unity/Tuanjie 脚本程序集全量编译 | 未实现 | 需要完整语法、绑定、CIL/元数据/PDB 与引用程序集；当前仅支持受限子集 |
-| 多文件与引用解析 | 未实现 | 多文件请求以 `CD2330003` 拒绝，报告中给出前端扫描统计 |
-| 源生成器 / 分析器 | 未承诺 | `-analyzer` 等开关被记录但不执行；源生成器依赖 Roslyn 自身 API，暂不在范围内 |
-| `Microsoft.CodeAnalysis` API 兼容 | 不在范围 | IDE、分析器宿主等托管 API 不属于替代目标 |
+| 多文件与引用解析 | 部分实现 | 支持多文件及部分外部程序集类型和成员，完整引用解析尚未实现 |
+| 源生成器 / 分析器 | 未实现 | `-analyzer` 等开关明确报错，不会忽略分析器并报告编译成功 |
+| `Microsoft.CodeAnalysis` API 兼容 | 未实现 | IDE、分析器宿主等托管 API 需要独立的兼容层及集成测试 |
 
-计划中的接入点（尚未改动 HotReload233）：由 HotReload233.Server 直接启动本编译器并传 `@rsp`，替代 `mono csc.exe @rsp`。本仓库只保证该进程契约，接入留到语言覆盖达标后进行。
+计划中的接入点（尚未改动 HotReload233）：由 HotReload233.Server 直接启动本编译器并传 `@rsp`，替代 `mono csc.exe @rsp`。当前进程契约仍不完整，接入需等待语言覆盖和实际运行链路达标。
 
 在真实项目上量化失败面（不产出程序集，只统计前端覆盖情况）：
 
@@ -103,7 +109,7 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 产物写入 `benchmarks/results/differential/roslyn.json` 与 `differential.json`（逐文件分类、双方首条诊断）；中间文件在结束时删除，`-KeepWork` 可保留。默认语料为 `tests/fixtures/differential`；对真实项目请用 `-Corpus` 指向源目录，`compile` 模式还需用 `-References` 提供引用程序集目录，否则 Roslyn 会因缺少 UnityEngine 等引用而误判。
 
-本机基线（`-Mode frontend`，`tuanjie-project-sf` 全部 8530 个 `.cs`，C# 9）：`accept 8530 / false_reject 0 / false_accept 0`；前端单独处理全量耗时约 0.85 秒，差分端到端约 9 秒（含构建检查与 Roslyn 侧分析），报告约 1.8 MB。语法通过不代表语义或产物正确，产物正确性由 `-Mode compile` 与 `tests/runtime.ps1` 负责。
+本机 2026-11-06 的语法层结果（`-Mode frontend`，`tuanjie-project-sf/Assets` 的 8534 个 `.cs`，C# 9，未额外指定条件编译符号）：`accept 8534 / false_reject 0 / false_accept 0`。这只覆盖当次所选条件分支的语法，不代表语义或程序集正确；产物需要另做编译与运行时验证。
 
 ## 真实编译（M3/M4 起点）
 
@@ -151,12 +157,12 @@ HotReload233 的补丁编译链是：Unity/Tuanjie 的 Bee 生成响应文件 �
 
 ## 后续里程碑
 
-- **M0（已完成）**：csc 兼容命令行前端、诊断与退出码、`-report` 报告、CLI 契约测试、tag 驱动的多平台发布。
+- **M0（进行中）**：csc 命令行前端、诊断与退出码、`-report` 报告、CLI 契约测试、tag 驱动的多平台发布；完整选项语义和产物兼容尚未完成。
 - **M1（已完成）**：Roslyn 差分门禁——同输入双编译，输出 accept / reject / false_reject / false_accept 分类与覆盖率，false_accept 默认上限 0；语料可指向任意 `.cs` 目录。
-- **M2（进行中）**：自研词法 + 递归下降解析已落地，覆盖预处理/条件编译、命名空间、类型、成员、语句与表达式；真实 Unity 脚本语法层 8530/8530 通过，误接受 0。剩余工作：trivia/span 保真、增量解析，以及换更大语料后的长尾构造。
-- **M3（进行中）**：名字/类型检查与 CIL 发射已打通（类、静态/实例字段与方法、控制流、BCL 调用），由 	ests/compile.ps1 与 Roslyn 执行结果对照；待办：
-ew/对象与数组、泛型、接口继承、属性、lambda、异常与 async。
+- **M2（进行中）**：自研词法 + 递归下降解析已落地，覆盖预处理/条件编译、命名空间、类型、成员、语句与表达式；当次语料与条件分支的语法层结果见上文。剩余工作：trivia/span 保真、增量解析，以及更多语料和编译条件下的长尾构造。
+- **M3（进行中）**：部分名字/类型检查与 CIL 发射已打通，由 `tests/compile.ps1` 与 Roslyn 执行结果对照；仍需完整的泛型定义、lambda、异常、async 及其语义验证。
 - **M4**：CIL、元数据、便携 PDB、引用程序集，以及目标框架矩阵（netstandard2.0/2.1、net472、net8/9/10）。
 - **M5**：性能对标（冷启动、全量/增量 p50/p95、峰值内存）与 GitHub tag 发布（win-x64、linux-x64、macos-arm64）。
+- **M6**：Visual Basic、分析器与源生成器，以及 `Microsoft.CodeAnalysis` 托管 API 兼容。
 
 MIT License；依赖项遵循各自许可证。
