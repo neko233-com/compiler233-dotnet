@@ -193,6 +193,8 @@ struct EnumInfo {
     name: String,
     is_public: bool,
     is_flags: bool,
+    flags_name: Option<String>,
+    flags_imports: Vec<String>,
     is_external: bool,
     external_identity: Option<ExternalEnumIdentity>,
     base: EnumBase,
@@ -1032,6 +1034,8 @@ impl Externals {
                         name: definition.name.clone(),
                         is_public: true,
                         is_flags: false,
+                        flags_name: None,
+                        flags_imports: Vec::new(),
                         is_external: true,
                         external_identity: Some(identity),
                         base,
@@ -1425,19 +1429,61 @@ impl<'a> Parser<'a> {
                     if !type_modifiers.is_empty() {
                         return Err(self.error("invalid enum modifier"));
                     }
-                    let is_flags = match type_attributes.as_str() {
-                        "" => false,
+                    let flags_name = match type_attributes.as_str() {
+                        "" => None,
                         "[System.Flags]"
                         | "[System.FlagsAttribute]"
                         | "[System.Flags()]"
-                        | "[System.FlagsAttribute()]" => true,
+                        | "[System.FlagsAttribute()]" => {
+                            if self.enum_imports().aliases.contains_key("System") {
+                                return Err(self.error(
+                                    "System alias prevents resolving the framework Flags attribute",
+                                ));
+                            }
+                            Some("System.Flags".to_string())
+                        }
+                        "[global::System.Flags]"
+                        | "[global::System.FlagsAttribute]"
+                        | "[global::System.Flags()]"
+                        | "[global::System.FlagsAttribute()]" => Some("System.Flags".to_string()),
+                        "[Flags]" | "[Flags()]" | "[FlagsAttribute]" | "[FlagsAttribute()]" => {
+                            let spelling = if type_attributes.starts_with("[FlagsAttribute") {
+                                "FlagsAttribute"
+                            } else {
+                                "Flags"
+                            };
+                            let imports = self.enum_imports();
+                            if let Some(alias) = imports.aliases.get(spelling) {
+                                if !matches!(
+                                    alias.as_str(),
+                                    "System.FlagsAttribute" | "global::System.FlagsAttribute"
+                                ) {
+                                    return Err(self.error(
+                                        "Flags alias does not name the framework attribute",
+                                    ));
+                                }
+                                if alias == "System.FlagsAttribute"
+                                    && imports.aliases.contains_key("System")
+                                {
+                                    return Err(self.error(
+                                        "System alias prevents resolving the framework Flags attribute",
+                                    ));
+                                }
+                            } else if !imports.namespaces.iter().any(|name| name == "System")
+                                && namespace != "System"
+                                && !namespace.starts_with("System.")
+                            {
+                                return Err(self.error("Flags attribute is not in scope"));
+                            }
+                            Some(spelling.to_string())
+                        }
                         _ => return Err(self.error("enum attribute is not supported")),
                     };
                     type_attributes.clear();
                     self.parse_enum_declaration(
                         &namespace,
                         type_access.take().unwrap_or(false),
-                        is_flags,
+                        flags_name,
                     )?;
                 }
                 "class" | "struct" | "interface" | "record" => {
@@ -1767,7 +1813,7 @@ impl<'a> Parser<'a> {
         &mut self,
         namespace: &str,
         is_public: bool,
-        is_flags: bool,
+        flags_name: Option<String>,
     ) -> Result<(), CompileError> {
         let offset = self.token().start;
         self.bump(); // enum
@@ -1839,6 +1885,14 @@ impl<'a> Parser<'a> {
             .map(|(member, value)| (member.name, value.expect("enum member was resolved")))
             .collect();
         let values = members.iter().cloned().collect();
+        let imports = self.enum_imports();
+        let mut flags_imports = imports.namespaces;
+        if flags_name
+            .as_deref()
+            .is_some_and(|name| imports.aliases.contains_key(name))
+        {
+            flags_imports.push("System".to_string());
+        }
         self.enums.insert(
             full_name,
             Arc::new(EnumInfo {
@@ -1847,7 +1901,9 @@ impl<'a> Parser<'a> {
                 namespace: namespace.to_string(),
                 name,
                 is_public,
-                is_flags,
+                is_flags: flags_name.is_some(),
+                flags_name,
+                flags_imports,
                 is_external: false,
                 external_identity: None,
                 base,
@@ -3578,6 +3634,89 @@ fn less_visible_enum<'a>(ty: &'a Ty, enums: &EnumValues) -> Option<&'a str> {
     }
 }
 
+fn trusted_corlib(externals: &Externals, index: usize) -> bool {
+    let Some(assembly) = externals.modules[index].assembly.as_ref() else {
+        return false;
+    };
+    let assembly = assembly.get();
+    let expected: &[u8] = if assembly.name.eq_ignore_ascii_case("System.Private.CoreLib") {
+        &[0x7c, 0xec, 0x85, 0xd7, 0xbe, 0xa7, 0x79, 0x8e]
+    } else if assembly.name.eq_ignore_ascii_case("mscorlib") {
+        &[0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]
+    } else {
+        return false;
+    };
+    !assembly.public_key.is_empty() && strong_name_token(&assembly.public_key) == expected
+}
+
+fn validate_enum_flags(
+    program: &Program,
+    externals: &Externals,
+    sources: &[(String, String)],
+) -> Result<(), CompileError> {
+    for info in program.enums.values().filter(|entry| !entry.is_external) {
+        let Some(name) = info.flags_name.as_deref() else {
+            continue;
+        };
+        let qualified = name == "System.Flags";
+        let short = if qualified { "Flags" } else { name };
+        let suffixed = format!("{short}Attribute");
+        let in_scope = |namespace: &str| {
+            if qualified {
+                return namespace == "System";
+            }
+            namespace.is_empty()
+                || namespace == info.namespace
+                || (!namespace.is_empty() && info.namespace.starts_with(&format!("{namespace}.")))
+                || info.flags_imports.iter().any(|import| import == namespace)
+        };
+        let conflicts_local_type = program
+            .types
+            .iter()
+            .any(|ty| (ty.name == short || ty.name == suffixed) && in_scope(&ty.namespace));
+        let conflicts_local_enum = program.enums.values().any(|other| {
+            !other.is_external
+                && (other.name == short || other.name == suffixed)
+                && in_scope(&other.namespace)
+        });
+        if conflicts_local_type || conflicts_local_enum {
+            return Err(enum_error(
+                info,
+                sources,
+                "Flags attribute name conflicts with a local type",
+            ));
+        }
+        for candidate in [short, suffixed.as_str()] {
+            if let Some(names) = externals.by_short_name.get(candidate) {
+                let mut system_flags = 0;
+                for full_name in names {
+                    let namespace = full_name
+                        .rsplit_once('.')
+                        .map_or("", |(namespace, _)| namespace);
+                    if !in_scope(namespace) {
+                        continue;
+                    }
+                    if full_name == "System.FlagsAttribute" {
+                        system_flags += 1;
+                        if let Some((index, _)) = externals.types.get(full_name)
+                            && trusted_corlib(externals, *index)
+                            && system_flags == 1
+                        {
+                            continue;
+                        }
+                    }
+                    return Err(enum_error(
+                        info,
+                        sources,
+                        "Flags attribute name is ambiguous or is not the framework attribute",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_enum_api_accessibility(
     program: &Program,
     sources: &[(String, String)],
@@ -3635,6 +3774,7 @@ fn emit(
     sources: &[(String, String)],
     externals: &Externals,
 ) -> Result<Vec<u8>, CompileError> {
+    validate_enum_flags(program, externals, sources)?;
     validate_enum_api_accessibility(program, sources)?;
     if program.types.is_empty() && program.enums.values().all(|entry| entry.is_external) {
         return Err(CompileError {
@@ -4663,18 +4803,7 @@ impl<'a> FnEmitter<'a> {
         if !entry.get().is_visible() {
             return None;
         }
-        let assembly = self.externals.modules[*index].assembly.as_ref()?.get();
-        let expected_token: &[u8] = if assembly.name.eq_ignore_ascii_case("System.Private.CoreLib")
-        {
-            &[0x7c, 0xec, 0x85, 0xd7, 0xbe, 0xa7, 0x79, 0x8e]
-        } else if assembly.name.eq_ignore_ascii_case("mscorlib") {
-            &[0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]
-        } else {
-            return None;
-        };
-        if assembly.public_key.is_empty()
-            || strong_name_token(&assembly.public_key) != expected_token
-        {
+        if !trusted_corlib(self.externals, *index) {
             return None;
         }
         Some(cost)

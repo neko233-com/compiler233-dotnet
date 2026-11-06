@@ -139,6 +139,8 @@ var specs = new (string Name, Type Underlying, bool Public, (string Name, object
     ("EnumFixture.InternalCode", typeof(int), false, [("One", 1)]),
     ("EnumFixture.Bits", typeof(int), true, [("Read", 1), ("Write", 2), ("Both", 3), ("Future", 8), ("AfterFuture", 9), ("Last", 8), ("Minus", -1), ("Mask", 2), ("Precedence", 7), ("Shift", -2)]),
     ("EnumFixture.ByteFlags", typeof(byte), true, [("High", (byte)128), ("Low", (byte)1), ("Both", (byte)129), ("Invert", (byte)255), ("Arithmetic", (byte)255)]),
+    ("EnumFixture.GlobalFlags", typeof(int), true, [("A", 1), ("B", 2)]),
+    ("EnumFlagAlias.AliasedFlags", typeof(int), true, [("A", 1)]),
     ("EnumOne.Shared", typeof(int), true, [("Value", 1)]),
     ("EnumTwo.Shared", typeof(int), true, [("Value", 2)])
 };
@@ -157,7 +159,7 @@ foreach (var spec in specs)
     var type = actual.GetType(spec.Name, throwOnError: true)!;
     if (!type.IsEnum || !type.IsSealed || type.IsPublic != spec.Public || Enum.GetUnderlyingType(type) != spec.Underlying)
         throw new Exception($"Invalid enum type: {spec.Name}");
-    if (type.IsDefined(typeof(FlagsAttribute), false) != (spec.Name == "EnumFixture.Bits"))
+    if (type.IsDefined(typeof(FlagsAttribute), false) != (spec.Name is "EnumFixture.Bits" or "EnumFixture.GlobalFlags" or "EnumFlagAlias.AliasedFlags"))
         throw new Exception($"Invalid FlagsAttribute metadata: {spec.Name}");
     var valueField = type.GetField("value__", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
         ?? throw new Exception($"{spec.Name} has no value__ field");
@@ -179,7 +181,7 @@ foreach (var spec in specs)
     if (symbol.TypeKind != TypeKind.Enum || symbol.EnumUnderlyingType?.SpecialType != underlyingTypes[spec.Underlying] ||
         symbol.DeclaredAccessibility != (spec.Public ? Accessibility.Public : Accessibility.Internal))
         throw new Exception($"Invalid reference enum type: {spec.Name}");
-    if (symbol.GetAttributes().Any(attribute => attribute.AttributeClass?.ToDisplayString() == "System.FlagsAttribute") != (spec.Name == "EnumFixture.Bits"))
+    if (symbol.GetAttributes().Any(attribute => attribute.AttributeClass?.ToDisplayString() == "System.FlagsAttribute") != (spec.Name is "EnumFixture.Bits" or "EnumFixture.GlobalFlags" or "EnumFlagAlias.AliasedFlags"))
         throw new Exception($"Invalid reference FlagsAttribute metadata: {spec.Name}");
     var symbolFields = symbol.GetMembers().OfType<IFieldSymbol>().Where(field => field.HasConstantValue).ToArray();
     if (symbolFields.Length != spec.Members.Length) throw new Exception($"Wrong reference member count: {spec.Name}");

@@ -53,6 +53,10 @@ foreach ($invalid in @(
     'class C { float M() { return 1f & 2f; } }',
     'class C { int M() { return 0U | 0; } }',
     'class C { int M() { return ~0U; } }',
+    'using System; class FlagsAttribute { } [Flags] enum E { A }',
+    'namespace Other { public class FlagsAttribute { } } namespace N { using System; using Other; [Flags] enum E { A } }',
+    'using System; using Flags = System.ObsoleteAttribute; [Flags] enum E { A }',
+    'using System = Other; using Flags = System.FlagsAttribute; [Flags] enum E { A }',
     'enum E : byte { Max = 255 } class C { E M() { return E.Max + 1; } }',
     'enum E { Max = 2147483647 } class C { E M() { return E.Max + 1; } }',
     'enum E : long { Max = 9223372036854775807L } class C { E M() { return E.Max + 1; } }',
@@ -91,7 +95,8 @@ foreach ($invalid in @(
 Write-Output 'Invalid enum code rejected; previous outputs preserved.'
 foreach ($unsupported in @(
     '[System.Obsolete] enum E { A }',
-    'enum E { [System.Obsolete] A }'
+    'enum E { [System.Obsolete] A }',
+    '[Flags] enum E { A }'
 )) {
     [IO.File]::WriteAllText($bad, $unsupported)
     $null = & $binary csc $bad "-out:$output" "-refout:$reference" 2>&1
@@ -193,13 +198,21 @@ if ($LASTEXITCODE -ne 0) { throw 'Enum base boxing consumer failed to compile.' 
 if ($LASTEXITCODE -ne 0) { throw 'Enum base boxing consumer failed at runtime.' }
 $fakeSource = Join-Path $work 'FakeCorlib.cs'
 $fakeOutput = Join-Path $work 'FakeCorlib.dll'
-[IO.File]::WriteAllText($fakeSource, 'namespace System { public class Enum { } }')
+[IO.File]::WriteAllText($fakeSource, 'namespace System { public class Enum { } public class FlagsAttribute { } }')
 & $binary csc $fakeSource "-out:$fakeOutput"
 if ($LASTEXITCODE -ne 0) { throw 'Fake base type fixture failed to compile.' }
 [IO.File]::WriteAllText($bad, 'enum E { A } class C { public System.Enum Box(E value) { return value; } }')
 $null = & $binary csc $bad "-reference:$fakeOutput" "-out:$output" 2>&1
 if ($LASTEXITCODE -ne 1) { throw 'An unrelated System.Enum type accepted enum boxing.' }
 if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Invalid base conversion changed a previous output.' }
+[IO.File]::WriteAllText($bad, '[System.Flags] enum E { A }')
+$null = & $binary csc $bad "-reference:$fakeOutput" "-out:$output" 2>&1
+if ($LASTEXITCODE -ne 1) { throw 'An unrelated System.FlagsAttribute was silently replaced by the framework attribute.' }
+if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Invalid attribute resolution changed a previous output.' }
+[IO.File]::WriteAllText($bad, 'using Flags = System.FlagsAttribute; [Flags] enum E { A }')
+$null = & $binary csc $bad "-reference:$fakeOutput" "-out:$output" 2>&1
+if ($LASTEXITCODE -ne 1) { throw 'A Flags alias silently replaced an unrelated attribute with the framework attribute.' }
+if ((Get-FileHash -Algorithm SHA256 $output).Hash -ne $before) { throw 'Invalid attribute alias changed a previous output.' }
 $valid = Join-Path $work 'InternalVisibility.cs'
 $validOutput = Join-Path $work 'InternalVisibility.dll'
 [IO.File]::WriteAllText($valid, 'enum Hidden { A = 4 } internal class InternalClass { public static Hidden Value() { return Hidden.A; } } public class PublicClass { internal Hidden Field; private protected Hidden Access() { return Hidden.A; } public static int Run() { return (int)InternalClass.Value(); } }')

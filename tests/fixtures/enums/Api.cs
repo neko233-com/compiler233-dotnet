@@ -1,4 +1,5 @@
 namespace EnumFixture {
+    using System;
     public enum Direction {
         Negative = -2,
         Zero = 0,
@@ -16,7 +17,7 @@ namespace EnumFixture {
     public enum UnsignedLong : ulong { Zero = 0, Maximum = 18446744073709551615UL }
     public enum Empty { }
     internal enum InternalCode { One = 1 }
-    [System.Flags]
+    [Flags]
     public enum Bits {
         Read = 1 << 0, Write = Read << 1, Both = Read | Write,
         Future = Last, AfterFuture, Last = 1 << 3,
@@ -27,6 +28,8 @@ namespace EnumFixture {
         High = 1 << 7, Low = 1, Both = High | Low, Invert = (~0) & 255,
         Arithmetic = 256 - 1
     }
+    [global::System.FlagsAttribute]
+    public enum GlobalFlags { A = 1, B = 2 }
     public class FlagBox {
         public Bits Field = Bits.Both;
         public Bits Property { get; set; }
@@ -382,4 +385,9 @@ namespace EnumAliased {
         public static Chosen Echo(Chosen value) { return value; }
         public static int Run() { return (int)Echo(Chosen.Value); }
     }
+}
+namespace EnumFlagAlias {
+    using Flags = System.FlagsAttribute;
+    [Flags]
+    public enum AliasedFlags { A = 1 }
 }
